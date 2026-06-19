@@ -1,0 +1,12 @@
+TraceLab
+Copyright 2026 SyFI Lab, University of Washington
+
+This product includes software developed at the SyFI Lab, University of Washington
+(https://tracelab.cs.washington.edu).
+
+The source code in this repository is licensed under the Apache License, Version 2.0
+(see LICENSE).
+
+The public coding-agent trace dataset distributed via GitHub Releases (the normalized
+JSONL trace and the prebuilt DuckDB database) is licensed separately under the
+Creative Commons Attribution 4.0 International License (CC BY 4.0). See LICENSE-DATASET.md.
