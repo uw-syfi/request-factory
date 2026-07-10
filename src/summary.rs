@@ -42,7 +42,29 @@ pub(crate) struct CommonReplaySummary {
     ttft_ms_p50: Option<f64>,
     ttft_ms_p90: Option<f64>,
     ttft_ms_max: Option<f64>,
+    run_duration_ms: Option<f64>,
+    request_throughput_per_s: Option<f64>,
+    output_token_throughput_per_s: Option<f64>,
+    tpot_measured_steps: usize,
+    tpot_ms_avg: Option<f64>,
+    tpot_ms_p50: Option<f64>,
+    tpot_ms_p90: Option<f64>,
+    tpot_ms_max: Option<f64>,
     context_overflow_steps: usize,
+}
+
+/// Raw observations needed for cross-request metrics.
+///
+/// Keep these out of the serialized schema: the summary exposes only stable,
+/// named metrics rather than implementation accumulators or timestamp bounds.
+#[derive(Debug, Default)]
+struct ReplayMeasurements {
+    total_durations_ms: Vec<f64>,
+    ttfts_ms: Vec<f64>,
+    tpots_ms: Vec<f64>,
+    first_submit_timestamp: Option<f64>,
+    last_complete_timestamp: Option<f64>,
+    successful_output_tokens: usize,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -92,11 +114,11 @@ impl ReplaySummary {
         }
     }
 
-    fn finalize(&mut self, total_durations: &mut [f64], ttfts: &mut [f64]) {
+    fn finalize(&mut self, measurements: &mut ReplayMeasurements) {
         let common = match self {
             Self::Sessions { common, .. } | Self::IndependentRequests { common } => common,
         };
-        common.finalize(total_durations, ttfts);
+        common.finalize(measurements);
 
         if let Self::Sessions { prefix_cache, .. } = self {
             prefix_cache.finalize();
@@ -124,22 +146,86 @@ impl CommonReplaySummary {
         self.total_duration_ms_sum += outcome.total_duration_ms;
     }
 
-    fn finalize(&mut self, total_durations: &mut [f64], ttfts: &mut [f64]) {
-        if !total_durations.is_empty() {
-            total_durations.sort_by(|a, b| a.total_cmp(b));
-            self.total_duration_ms_avg = self.total_duration_ms_sum / total_durations.len() as f64;
-            self.total_duration_ms_p50 = percentile_sorted(total_durations, 0.50);
-            self.total_duration_ms_p90 = percentile_sorted(total_durations, 0.90);
-            self.total_duration_ms_max = *total_durations.last().unwrap_or(&0.0);
+    fn finalize(&mut self, measurements: &mut ReplayMeasurements) {
+        if !measurements.total_durations_ms.is_empty() {
+            measurements
+                .total_durations_ms
+                .sort_by(|a, b| a.total_cmp(b));
+            self.total_duration_ms_avg =
+                self.total_duration_ms_sum / measurements.total_durations_ms.len() as f64;
+            self.total_duration_ms_p50 = percentile_sorted(&measurements.total_durations_ms, 0.50);
+            self.total_duration_ms_p90 = percentile_sorted(&measurements.total_durations_ms, 0.90);
+            self.total_duration_ms_max = measurements
+                .total_durations_ms
+                .last()
+                .copied()
+                .unwrap_or(0.0);
         }
 
-        if !ttfts.is_empty() {
-            ttfts.sort_by(|a, b| a.total_cmp(b));
-            let sum: f64 = ttfts.iter().sum();
-            self.ttft_ms_avg = Some(sum / ttfts.len() as f64);
-            self.ttft_ms_p50 = Some(percentile_sorted(ttfts, 0.50));
-            self.ttft_ms_p90 = Some(percentile_sorted(ttfts, 0.90));
-            self.ttft_ms_max = ttfts.last().copied();
+        if !measurements.ttfts_ms.is_empty() {
+            measurements.ttfts_ms.sort_by(|a, b| a.total_cmp(b));
+            let sum: f64 = measurements.ttfts_ms.iter().sum();
+            self.ttft_ms_avg = Some(sum / measurements.ttfts_ms.len() as f64);
+            self.ttft_ms_p50 = Some(percentile_sorted(&measurements.ttfts_ms, 0.50));
+            self.ttft_ms_p90 = Some(percentile_sorted(&measurements.ttfts_ms, 0.90));
+            self.ttft_ms_max = measurements.ttfts_ms.last().copied();
+        }
+
+        if !measurements.tpots_ms.is_empty() {
+            measurements.tpots_ms.sort_by(|a, b| a.total_cmp(b));
+            self.tpot_measured_steps = measurements.tpots_ms.len();
+            let sum: f64 = measurements.tpots_ms.iter().sum();
+            self.tpot_ms_avg = Some(sum / self.tpot_measured_steps as f64);
+            self.tpot_ms_p50 = Some(percentile_sorted(&measurements.tpots_ms, 0.50));
+            self.tpot_ms_p90 = Some(percentile_sorted(&measurements.tpots_ms, 0.90));
+            self.tpot_ms_max = measurements.tpots_ms.last().copied();
+        }
+
+        if let (Some(first_submit), Some(last_complete)) = (
+            measurements.first_submit_timestamp,
+            measurements.last_complete_timestamp,
+        ) {
+            let duration_ms = ((last_complete - first_submit) * 1_000.0).max(0.0);
+            self.run_duration_ms = Some(duration_ms);
+            if duration_ms > 0.0 {
+                let duration_s = duration_ms / 1_000.0;
+                self.request_throughput_per_s = Some(self.success_steps as f64 / duration_s);
+                self.output_token_throughput_per_s =
+                    Some(measurements.successful_output_tokens as f64 / duration_s);
+            }
+        }
+    }
+}
+
+impl ReplayMeasurements {
+    fn add(&mut self, outcome: &GenerationOutcome) {
+        self.total_durations_ms.push(outcome.total_duration_ms);
+        if let Some(ttft_ms) = outcome.first_token_ms {
+            self.ttfts_ms.push(ttft_ms);
+        }
+        self.first_submit_timestamp = Some(
+            self.first_submit_timestamp
+                .map_or(outcome.submit_timestamp, |current| {
+                    current.min(outcome.submit_timestamp)
+                }),
+        );
+        self.last_complete_timestamp = Some(
+            self.last_complete_timestamp
+                .map_or(outcome.complete_timestamp, |current| {
+                    current.max(outcome.complete_timestamp)
+                }),
+        );
+
+        if !outcome.is_success() {
+            return;
+        }
+        self.successful_output_tokens += outcome.output_len_actual;
+        if let Some(ttft_ms) = outcome.first_token_ms {
+            if outcome.output_len_actual > 1 && outcome.total_duration_ms >= ttft_ms {
+                self.tpots_ms.push(
+                    (outcome.total_duration_ms - ttft_ms) / (outcome.output_len_actual - 1) as f64,
+                );
+            }
         }
     }
 }
@@ -196,15 +282,11 @@ pub(crate) async fn write_logs(
 ) -> ReplaySummary {
     let file = File::create(&path).expect("failed to create log file");
     let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
-    let mut total_durations = Vec::new();
-    let mut ttfts = Vec::new();
+    let mut measurements = ReplayMeasurements::default();
 
     while let Some(record) = rx.recv().await {
         summary.add(&record);
-        total_durations.push(record.outcome.total_duration_ms);
-        if let Some(ttft) = record.outcome.first_token_ms {
-            ttfts.push(ttft);
-        }
+        measurements.add(&record.outcome);
         log_server_prefix_hit_rate(&record);
         if let Ok(json) = serde_json::to_string(&record) {
             let _ = writeln!(writer, "{json}");
@@ -212,7 +294,7 @@ pub(crate) async fn write_logs(
         }
     }
     let _ = writer.flush();
-    summary.finalize(&mut total_durations, &mut ttfts);
+    summary.finalize(&mut measurements);
     log_server_prefix_hit_rate_summary(&summary);
     summary
 }
@@ -299,4 +381,98 @@ pub(crate) fn write_summary_if_requested(
     serde_json::to_writer_pretty(file, &summary)
         .with_context(|| format!("failed to write summary: {path}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(
+        request_id: &str,
+        submit_timestamp: f64,
+        complete_timestamp: f64,
+        total_duration_ms: f64,
+        first_token_ms: Option<f64>,
+        output_len_actual: usize,
+        status: &str,
+    ) -> GenerationOutcome {
+        GenerationOutcome {
+            request_id: request_id.to_string(),
+            output_len_actual,
+            output_len_text_tokens: output_len_actual,
+            server_usage: None,
+            finish_reason: None,
+            submit_timestamp,
+            post_timestamp: Some(submit_timestamp),
+            complete_timestamp,
+            first_token_ms,
+            total_duration_ms,
+            chunk_count: output_len_actual,
+            status: status.to_string(),
+            output_preview: String::new(),
+            error: None,
+        }
+    }
+
+    fn assert_close(actual: Option<f64>, expected: f64) {
+        let actual = actual.expect("metric should be measured");
+        assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn overall_metrics_use_wall_clock_and_successful_outputs() {
+        let outcomes = [
+            outcome("r1", 100.0, 102.0, 110.0, Some(10.0), 4, "SUCCESS"),
+            outcome("r2", 101.0, 105.0, 260.0, Some(10.0), 6, "SUCCESS"),
+            // Failed partial output contributes to the attempted-run window and
+            // existing latency counters, but not successful throughput or TPOT.
+            outcome("r3", 102.0, 103.0, 20.0, None, 100, "FAILED"),
+        ];
+        let mut summary = CommonReplaySummary::default();
+        let mut measurements = ReplayMeasurements::default();
+        for outcome in &outcomes {
+            summary.add(10, outcome);
+            measurements.add(outcome);
+        }
+
+        summary.finalize(&mut measurements);
+
+        assert_eq!(summary.success_steps, 2);
+        assert_close(summary.run_duration_ms, 5_000.0);
+        assert_close(summary.request_throughput_per_s, 0.4);
+        assert_close(summary.output_token_throughput_per_s, 2.0);
+        assert_eq!(summary.tpot_measured_steps, 2);
+        assert_close(summary.tpot_ms_avg, 41.66666666666667);
+        assert_close(summary.tpot_ms_p50, 41.66666666666667);
+        assert_close(summary.tpot_ms_p90, 48.333333333333336);
+        assert_close(summary.tpot_ms_max, 50.0);
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["run_duration_ms"], 5_000.0);
+        assert_eq!(json["request_throughput_per_s"], 0.4);
+        assert_eq!(json["output_token_throughput_per_s"], 2.0);
+        assert_eq!(json["tpot_measured_steps"], 2);
+    }
+
+    #[test]
+    fn tpot_is_unavailable_without_two_output_tokens_and_ttft() {
+        let outcomes = [
+            outcome("r1", 10.0, 11.0, 20.0, Some(10.0), 1, "SUCCESS"),
+            outcome("r2", 10.0, 12.0, 20.0, None, 4, "SUCCESS"),
+        ];
+        let mut summary = CommonReplaySummary::default();
+        let mut measurements = ReplayMeasurements::default();
+        for outcome in &outcomes {
+            summary.add(4, outcome);
+            measurements.add(outcome);
+        }
+
+        summary.finalize(&mut measurements);
+
+        assert_eq!(summary.tpot_measured_steps, 0);
+        assert!(summary.tpot_ms_avg.is_none());
+        assert!(summary.tpot_ms_p50.is_none());
+        assert!(summary.tpot_ms_p90.is_none());
+        assert!(summary.tpot_ms_max.is_none());
+    }
 }

@@ -214,6 +214,26 @@ Useful controls:
 --summary-path /tmp/session_runner_summary.json
 ```
 
+## Run Metrics
+
+The typed `replay.*.common` summary reports the same end-to-end metrics for
+session rounds and independent requests:
+
+- `run_duration_ms`: wall-clock time from the earliest request submission to
+  the latest completion, including arrival gaps and tool waits that occur
+  between them.
+- `request_throughput_per_s`: successful requests divided by run duration.
+- `output_token_throughput_per_s`: actual output tokens from successful
+  requests divided by run duration.
+- `tpot_measured_steps` and `tpot_ms_{avg,p50,p90,max}`: per-request time per
+  output token, measured only for successful requests with TTFT and at least two
+  output tokens. For one request, `TPOT = (total_duration_ms - first_token_ms) /
+  (output_len_actual - 1)`.
+
+TPOT describes average decode cadence after the first token. The runner does
+not report inter-token latency because it does not yet retain every streaming
+chunk timestamp; `chunk_count` alone is not enough to reconstruct it.
+
 ## Prefix-Cache Accounting
 
 The JSONL log includes per-round planned-vs-server cache fields:
