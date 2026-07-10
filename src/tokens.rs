@@ -24,7 +24,7 @@ impl TokenProvider {
         })
     }
 
-    fn take(&mut self, len: usize) -> Vec<u32> {
+    pub(crate) fn take(&mut self, len: usize) -> Vec<u32> {
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             out.push(self.pool[self.cursor]);

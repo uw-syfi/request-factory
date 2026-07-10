@@ -1,7 +1,7 @@
 mod backend;
 mod cli;
+mod executor;
 mod record;
-mod session;
 mod summary;
 mod tokens;
 mod trace;
@@ -16,11 +16,11 @@ use tokio::sync::{mpsc, Semaphore};
 
 use backend::GenerationClient;
 use cli::Args;
+use executor::{run_independent_request, run_session, status_task, AppState, Stats};
 use record::StepLog;
-use session::{run_session, status_task, AppState, Stats};
 use summary::{write_logs, write_summary_if_requested, ReplaySummary, RunSummary};
 use tokens::{build_token_pool, load_tokenizer};
-use trace::{apply_session_arrival_rate, load_sessions, session_arrival_rate};
+use trace::{load_workload, ReplayWorkload};
 use workload::WorkloadSummary;
 
 #[tokio::main]
@@ -28,38 +28,43 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     fdlimit::raise_fd_limit().ok();
 
-    if args.max_active_sessions == Some(0) {
-        return Err(anyhow!("--max-active-sessions must be greater than 0"));
+    if args.max_concurrency == Some(0) {
+        return Err(anyhow!("--max-concurrency must be greater than 0"));
     }
     if args.fail_on_context_overflow && args.max_model_len.is_none() {
-        return Err(anyhow!("--fail-on-context-overflow requires --max-model-len"));
+        return Err(anyhow!(
+            "--fail-on-context-overflow requires --max-model-len"
+        ));
     }
 
-    let mut sessions = load_sessions(&args.trace, args.max_sessions)?;
+    let mut workload = load_workload(&args.trace, args.trace_format, args.max_items)?;
+    let unit_label = workload.unit_label();
     if let Some(target_rate) = args.rate {
-        let adjustment = apply_session_arrival_rate(&mut sessions, target_rate)?;
+        let adjustment = workload.apply_arrival_rate(target_rate)?;
         eprintln!(
-            "session arrival rate | trace={:.6} sessions/s target={:.6} sessions/s time_scale={:.6}",
-            adjustment.trace_rate, adjustment.target_rate, adjustment.time_scale,
+            "{} arrival rate | trace={:.6}/s target={:.6}/s time_scale={:.6}",
+            unit_label, adjustment.trace_rate, adjustment.target_rate, adjustment.time_scale,
         );
-    } else if let Some(trace_rate) = session_arrival_rate(&sessions) {
+    } else if let Some(trace_rate) = workload.arrival_rate() {
         eprintln!(
-            "session arrival rate | trace={:.6} sessions/s (unchanged)",
-            trace_rate
+            "{} arrival rate | trace={:.6}/s (unchanged)",
+            unit_label, trace_rate
         );
     } else {
         eprintln!(
-            "session arrival rate | unavailable (need at least two sessions with distinct arrival times)"
+            "{} arrival rate | unavailable (need at least two units with distinct arrival times)",
+            unit_label,
         );
     }
-    let workload_summary = WorkloadSummary::from_sessions(&sessions, args.max_model_len);
+    let replay_summary = ReplaySummary::empty_for(&workload);
+    let workload_summary = WorkloadSummary::from_workload(&workload, args.max_model_len);
     workload_summary.print();
     if args.dry_run {
         write_summary_if_requested(
             args.summary_path.as_deref(),
             RunSummary {
                 workload: workload_summary,
-                replay: ReplaySummary::default(),
+                replay: replay_summary,
             },
         )?;
         return Ok(());
@@ -76,7 +81,7 @@ async fn main() -> Result<()> {
         workload_summary
             .max_prompt_len()
             .saturating_mul(2)
-            .max(sessions.len())
+            .max(workload.unit_count())
             .max(MIN_TOKEN_POOL)
     });
     let token_pool = Arc::new(build_token_pool(
@@ -99,8 +104,8 @@ async fn main() -> Result<()> {
 
     // Fail fast if the server won't report prefix-cache hits: otherwise every measured hit
     // rate would silently read as zero. Dry-run returns earlier and never reaches here.
-    // Probe the TAIL of the pool: session 0 seeds at offset 0, so a head probe would warm its
-    // first round's prefix and fabricate a cache hit there.
+    // Probe the TAIL of the pool: workload unit 0 seeds at offset 0, so a head
+    // probe would warm its first prompt and fabricate a cache hit there.
     let probe_len = token_pool.len().min(512);
     client
         .preflight_cache_check(&token_pool[token_pool.len() - probe_len..])
@@ -113,33 +118,47 @@ async fn main() -> Result<()> {
         token_pool,
         stats: Arc::new(Stats::default()),
         run_start: Instant::now(),
-        session_semaphore: args
-            .max_active_sessions
-            .map(|n| Arc::new(Semaphore::new(n))),
+        concurrency_semaphore: args
+            .max_concurrency
+            .map(|limit| Arc::new(Semaphore::new(limit))),
     });
 
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
-    let log_task = tokio::spawn(write_logs(args.log_path.clone(), log_rx));
+    let log_task = tokio::spawn(write_logs(args.log_path.clone(), log_rx, replay_summary));
     tokio::spawn(status_task(
         state.stats.clone(),
-        sessions.len(),
+        workload.unit_count(),
         total_steps,
+        unit_label,
         state.run_start,
     ));
 
     let mut join_set = tokio::task::JoinSet::new();
-    for (session_ordinal, (session_id, steps)) in sessions.into_iter().enumerate() {
-        let state_ref = state.clone();
-        let log_tx_ref = log_tx.clone();
-        join_set.spawn(async move {
-            run_session(state_ref, log_tx_ref, session_ordinal, session_id, steps).await;
-        });
+    match workload {
+        ReplayWorkload::Sessions(sessions) => {
+            for (session_ordinal, (session_id, steps)) in sessions.into_iter().enumerate() {
+                let state_ref = state.clone();
+                let log_tx_ref = log_tx.clone();
+                join_set.spawn(async move {
+                    run_session(state_ref, log_tx_ref, session_ordinal, session_id, steps).await;
+                });
+            }
+        }
+        ReplayWorkload::IndependentRequests(requests) => {
+            for (request_ordinal, request) in requests.into_iter().enumerate() {
+                let state_ref = state.clone();
+                let log_tx_ref = log_tx.clone();
+                join_set.spawn(async move {
+                    run_independent_request(state_ref, log_tx_ref, request_ordinal, request).await;
+                });
+            }
+        }
     }
     drop(log_tx);
 
     while let Some(result) = join_set.join_next().await {
         if let Err(err) = result {
-            eprintln!("session task join error: {err}");
+            eprintln!("workload task join error: {err}");
         }
     }
 

@@ -1,5 +1,7 @@
 use clap::{Parser, ValueEnum};
 
+use crate::trace::TraceFormat;
+
 /// Inference-server wire protocol selected with `--backend`.
 #[derive(ValueEnum, Clone, Copy, Debug)]
 pub(crate) enum BackendKind {
@@ -11,12 +13,17 @@ pub(crate) enum BackendKind {
 #[command(
     author,
     version,
-    about = "Session-aware closed-loop workload runner for vLLM"
+    about = "Typed trace workload runner for OpenAI-compatible inference servers"
 )]
 pub(crate) struct Args {
-    /// CSV with session_id/id,round_idx,prefix_len,input_len,output_len,tool_wait_after_ms.
+    /// Source trace CSV interpreted by --trace-format.
     #[arg(long)]
     pub(crate) trace: String,
+
+    /// Input schema frontend. New source formats are separate typed frontends,
+    /// not sparse variants of the session CSV row.
+    #[arg(long, value_enum, default_value = "session")]
+    pub(crate) trace_format: TraceFormat,
 
     /// Text corpus used to build synthetic prompt/input/output token pools.
     #[arg(long)]
@@ -40,11 +47,11 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 0.0)]
     pub(crate) temperature: f64,
 
-    #[arg(long)]
-    pub(crate) max_sessions: Option<usize>,
+    /// Limit top-level workload units (sessions or independent requests).
+    #[arg(long, alias = "max-sessions")]
+    pub(crate) max_items: Option<usize>,
 
-    /// Target session arrival rate in sessions/s. Arrival offsets from the trace are scaled while
-    /// preserving their relative timing and burst pattern.
+    /// Target top-level arrival rate: sessions/s for session traces, requests/s for VibeSim.
     #[arg(long)]
     pub(crate) rate: Option<f64>,
 
@@ -64,9 +71,9 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = true)]
     pub(crate) stop_session_on_error: bool,
 
-    /// Maximum number of sessions allowed to actively run at once.
+    /// Maximum number of top-level workload units active at once.
     #[arg(long)]
-    pub(crate) max_active_sessions: Option<usize>,
+    pub(crate) max_concurrency: Option<usize>,
 
     /// Validate and summarize the workload without contacting vLLM.
     #[arg(long, default_value_t = false)]

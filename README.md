@@ -1,22 +1,33 @@
-# Session Runner
+# Replay Runner
 
-`session_runner` is a session-aware closed-loop workload runner for OpenAI-compatible inference servers (vLLM today, SGLang and others via the pluggable backend). It replays trace-derived sessions as ordered chains of rounds instead of independent requests:
+`session_runner` replays typed workloads against OpenAI-compatible inference servers
+(vLLM today, SGLang and others via the pluggable backend). The source schema is
+selected explicitly with `--trace-format`; each frontend produces its own workload
+variant instead of filling a universal row with zero/null placeholders.
+
+## Trace Frontends
+
+### `--trace-format session` (default)
+
+Session-aware closed-loop replay preserves ordered chains of rounds:
 
 ```text
 send round i -> wait for full LLM response -> sleep tool_wait_after_ms -> send round i+1
 ```
 
-The runner preserves the serving-side shape of a coding-agent trace: `prefix_len`, appended input length, target decode length, session order, session arrival, and tool/user waits. It uses a synthetic text corpus to construct prompt content, so it does not replay raw private prompts.
+The session frontend preserves `prefix_len`, appended input length, target decode
+length, round order, arrival, and tool/user waits. The VibeSim frontend preserves
+independent request input/output shapes and arrivals. Both use a synthetic text
+corpus, so raw private prompts are never replayed.
 
-## Input CSV
-
-Supported headers:
+Supported session headers:
 
 ```csv
 session_id,round_idx,prefix_len,input_len,output_len,tool_wait_after_ms
 ```
 
-It also supports the canonical simulator form emitted by `artifacts/trace_facts/csv_export`:
+It also supports the canonical TraceLab export emitted by
+`artifacts/trace_facts/csv_export`:
 
 ```csv
 id,input_len,output_len,arrival_time,round_idx,tool_wait_after_ms,prefix_len
@@ -31,10 +42,48 @@ Fields:
 - `output_len`: `max_tokens` sent to vLLM.
 - `tool_wait_after_ms`: sleep after this round completes before the next round in the same session.
 
-## Session Arrival Rate (`--rate`)
+### `--trace-format vibesim`
 
-By default, the runner releases sessions at the `arrival_time` offsets stored in the CSV. Pass
-`--rate N` to replay the same arrival pattern at a target rate of `N` sessions/s:
+VibeSim's L7 trace is an independent-request workload:
+
+```csv
+id,input_len,output_len,arrival_time
+```
+
+Each row remains a `VibeSimRequest`; it is not converted into a fake session with
+round/prefix/tool-wait fields. `arrival_time` is interpreted in milliseconds,
+matching VibeSim's trace frontend.
+
+Frontend layout:
+
+```text
+src/trace/mod.rs       format dispatch + ReplayWorkload enum
+src/trace/session.rs   session CSV → Sessions(...)
+src/trace/vibesim.rs   VibeSim CSV → IndependentRequests(...)
+```
+
+Adding a source format means adding a parser module and a typed
+`ReplayWorkload` variant. Adding a future modality should likewise add a typed
+request/workload variant and backend capability; do not extend the session row
+with unrelated optional fields.
+
+Executor layout mirrors the workload variants:
+
+```text
+src/executor/mod.rs           shared run state, progress, and concurrency gate
+src/executor/session.rs       ordered closed-loop session replay
+src/executor/independent.rs   one-shot independent-request replay
+```
+
+Both executors call the same source-agnostic text-generation backend, but each
+owns its source semantics and constructs its own typed log record. Adding a
+frontend does not add imports or nullable source fields to `backend.rs`.
+
+## Arrival Rate (`--rate`)
+
+By default, the runner releases top-level workload units at the `arrival_time`
+offsets stored in the CSV. Pass `--rate N` for a target of `N` sessions/s in
+`session` mode or `N` requests/s in `vibesim` mode:
 
 ```bash
 --rate 8
@@ -46,8 +95,9 @@ The runner measures the trace rate from the mean inter-session interval,
 2 sessions/s divides every arrival time by 4. Relative gaps and simultaneous-arrival bursts are
 preserved. The measured rate, target rate, and applied time scale are printed at startup.
 
-Rate scaling requires at least two selected sessions with distinct arrival times. `--rate` is
-applied after `--max-sessions`, so the measured trace rate describes exactly the selected sessions.
+Rate scaling requires at least two selected workload units with distinct arrival
+times. `--rate` is applied after `--max-items`, so the measured trace rate
+describes exactly the selected workload.
 
 Examples live at `examples/session_workload_example.csv` (single session),
 `examples/multi_session_example.csv` (3 sessions with arrival times, for a quick multi-session
@@ -77,7 +127,33 @@ The runner targets an OpenAI-compatible completions endpoint:
 POST {base_url}/completions
 ```
 
-Pass `--base-url http://HOST:PORT/v1`. The wire protocol is selected with `--backend` (default `openai`, which covers vLLM and SGLang's OpenAI endpoint); the endpoint path, request body, and response parsing all live behind a `Backend` adapter in `src/backend.rs`, so adding a server (e.g. SGLang's native `/generate`) is a new adapter, not a rewrite. The runner submits the exact prompt **token ids** directly (OpenAI's `prompt` accepts an integer array), so there is no client-side decode and the server's prefix-cache keys match the ids we built. With recent vLLM it also sets `return_token_ids` to carry the model's exact output tokens forward across rounds; servers that ignore the flag fall back to re-encoding the output text (a few tokens of drift).
+Pass `--base-url http://HOST:PORT/v1`. The wire protocol is selected with `--backend` (default `openai`, which covers vLLM and SGLang's OpenAI endpoint); the endpoint path, request body, and response parsing all live behind a `Backend` adapter in `src/backend.rs`, so adding a server (e.g. SGLang's native `/generate`) is a new adapter, not a rewrite. The backend accepts only normalized generation inputs and returns a common `GenerationOutcome`; it does not know `SessionStep`, `VibeSimRequest`, or future frontend types. The runner submits the exact prompt **token ids** directly (OpenAI's `prompt` accepts an integer array), so there is no client-side decode and the server's prefix-cache keys match the ids we built. With recent vLLM it also sets `return_token_ids` to carry the model's exact output tokens forward across rounds; servers that ignore the flag fall back to re-encoding the output text (a few tokens of drift).
+
+## Typed Log Contract
+
+Each JSONL line is a versioned envelope containing a tagged source record and a
+source-agnostic generation outcome:
+
+```json
+{
+  "schema_version": 2,
+  "source": {
+    "type": "vibe_sim_request",
+    "data": {"id": "req-1", "input_len": 16, "prompt_len": 16,
+             "output_len_target": 4, "arrival_time_ms": 12.5}
+  },
+  "outcome": {"request_id": "vibesim_req-1", "status": "SUCCESS", "...": "..."}
+}
+```
+
+Session-only fields (`session_id`, `round_idx`, `prefix_len`, tool wait, planned
+cache rate) exist only inside the `session_round` variant. They are not emitted
+as null/zero fields on VibeSim requests. Optional fields inside `outcome` mean a
+server observation was unavailable, not that the selected source lacks that
+concept.
+
+The run summary follows the same rule: `replay.kind` is `sessions` with a real
+`prefix_cache` block, or `independent_requests` without that block.
 
 ## Build
 
@@ -92,6 +168,7 @@ Dry-run mode validates and summarizes the CSV without contacting vLLM:
 ```bash
 cargo run --manifest-path replay/Cargo.toml --bin session_runner -- \
   --trace replay/examples/session_workload_example.csv \
+  --trace-format session \
   --text-file /path/to/text-corpus \
   --tokenizer /path/to/tokenizer.json \
   --model qwen3.6-35b-a3b-fp8 \
@@ -106,13 +183,14 @@ cargo run --manifest-path replay/Cargo.toml --bin session_runner -- \
 ```bash
 cargo run --release --manifest-path replay/Cargo.toml --bin session_runner -- \
   --trace replay/examples/session_workload_example.csv \
+  --trace-format session \
   --text-file /path/to/text-corpus \
   --tokenizer /path/to/tokenizer.json \
   --model qwen3.6-35b-a3b-fp8 \
   --base-url http://127.0.0.1:60995/v1 \
   --stream-idle-timeout-secs 7200 \
   --max-model-len 65536 \
-  --max-active-sessions 1 \
+  --max-concurrency 1 \
   --summary-path /tmp/session_runner_summary.json \
   --log-path /tmp/session_runner.jsonl
 ```
@@ -123,8 +201,8 @@ Useful controls:
 # Validate against a model context limit and report the first overflowing round.
 --dry-run --max-model-len 131072
 
-# Bound active closed-loop sessions while still respecting arrival_time.
---max-active-sessions 128
+# Bound concurrent top-level workload units while still respecting arrival_time.
+--max-concurrency 128
 
 # Scale trace arrival offsets to a target of 8 sessions per second.
 --rate 8
@@ -159,13 +237,14 @@ If the Qwen model is not already present locally, starting vLLM may download a l
 
 Implemented:
 
-- session trace parsing
+- typed `session` and `vibesim` trace frontends
+- distinct session and independent-request workload variants (no sparse universal row)
 - both `session_id` and canonical `id` CSV schemas
 - workload summary and dry-run validation
 - per-session ordered replay
 - optional session-start scheduling from `arrival_time`
-- optional target session arrival-rate scaling with `--rate`
-- optional active-session concurrency limit
+- optional target workload arrival-rate scaling with `--rate`
+- optional top-level workload concurrency limit
 - optional model-context validation and overflow skipping
 - session-internal closed-loop timing
 - `prefix_len + input_len` prompt construction
@@ -175,7 +254,7 @@ Implemented:
 - startup prefix-cache preflight that aborts when the server reports no cached tokens
 - TTFT and total latency logging
 - JSON run summary output
-- JSONL per-round output
+- versioned JSONL output with tagged source records and a common generation outcome
 - planned vs. server-reported prefix cache hit-rate logging
 
 Not implemented yet:

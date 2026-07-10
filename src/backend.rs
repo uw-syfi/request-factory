@@ -8,9 +8,8 @@ use tokenizers::Tokenizer;
 use tokio::time::timeout;
 
 use crate::cli::{Args, BackendKind};
-use crate::record::StepLog;
-use crate::trace::SessionStep;
-use crate::util::{elapsed_ms, prefix_hit_rate, ratio, unix_seconds_now};
+use crate::record::{GenerationOutcome, ServerUsageLog};
+use crate::util::{elapsed_ms, ratio, unix_seconds_now};
 
 /// Normalized, backend-agnostic description of one generation request.
 pub(crate) struct GenRequest<'a> {
@@ -126,16 +125,47 @@ impl Backend for OpenAiCompletionsBackend {
     }
 }
 
-/// Result of replaying one round: the log record plus the model's output token ids. The caller
-/// carries the output ids forward as the next round's context so the previous-output region of
-/// the next prefix matches what the server cached and stays prefix-cache-hittable.
-pub(crate) struct StepOutcome {
-    pub(crate) log: StepLog,
+/// Backend result shared by every text-generation source. Source identity stays
+/// with the executor; session executors alone carry `output_ids` to the next round.
+pub(crate) struct GenerationResult {
+    pub(crate) outcome: GenerationOutcome,
     pub(crate) output_ids: Vec<u32>,
 }
 
-/// Shared streaming engine. Owns the HTTP client, tokenizer, and a pluggable `Backend`, and
-/// turns each trace round into a `StepOutcome`. All wire-format specifics live in the backend.
+pub(crate) fn context_overflow_result(
+    request_id: String,
+    prompt_len: usize,
+    max_model_len: Option<usize>,
+) -> GenerationResult {
+    let limit = max_model_len
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    GenerationResult {
+        outcome: GenerationOutcome {
+            request_id,
+            output_len_actual: 0,
+            output_len_text_tokens: 0,
+            server_usage: None,
+            finish_reason: None,
+            submit_timestamp: unix_seconds_now(),
+            post_timestamp: None,
+            complete_timestamp: unix_seconds_now(),
+            first_token_ms: None,
+            total_duration_ms: 0.0,
+            chunk_count: 0,
+            status: "SKIPPED_CONTEXT_OVERFLOW".to_string(),
+            output_preview: String::new(),
+            error: Some(format!(
+                "prompt_len {} exceeds max_model_len {}",
+                prompt_len, limit
+            )),
+        },
+        output_ids: Vec::new(),
+    }
+}
+
+/// Shared streaming engine. It knows only normalized text-generation inputs and
+/// outcomes; frontend/source identity remains in the executor layer.
 pub(crate) struct GenerationClient {
     endpoint: String,
     client: reqwest::Client,
@@ -172,10 +202,10 @@ impl GenerationClient {
 
     pub(crate) async fn run_step(
         &self,
-        step: &SessionStep,
         request_id: String,
         prompt_ids: &[u32],
-    ) -> StepOutcome {
+        max_tokens: usize,
+    ) -> GenerationResult {
         let submit_timestamp = unix_seconds_now();
         let start = SystemTime::now();
 
@@ -184,7 +214,7 @@ impl GenerationClient {
         let payload = self.backend.build_payload(&GenRequest {
             model: &self.model,
             prompt_ids,
-            max_tokens: step.output_len,
+            max_tokens,
             temperature: self.temperature,
             stream: true,
         });
@@ -203,6 +233,7 @@ impl GenerationClient {
         let mut server_completion_tokens = None;
         let mut server_total_tokens = None;
         let mut server_cached_prompt_tokens = None;
+        let mut saw_server_usage = false;
 
         let response = self
             .client
@@ -256,14 +287,16 @@ impl GenerationClient {
                                         finish_reason = Some(reason);
                                     }
                                     if let Some(usage) = event.usage {
+                                        saw_server_usage = true;
                                         server_prompt_tokens =
                                             usage.prompt_tokens.or(server_prompt_tokens);
                                         server_completion_tokens =
                                             usage.completion_tokens.or(server_completion_tokens);
                                         server_total_tokens =
                                             usage.total_tokens.or(server_total_tokens);
-                                        server_cached_prompt_tokens =
-                                            usage.cached_prompt_tokens.or(server_cached_prompt_tokens);
+                                        server_cached_prompt_tokens = usage
+                                            .cached_prompt_tokens
+                                            .or(server_cached_prompt_tokens);
                                     }
                                     chunk_count += 1;
                                 }
@@ -320,8 +353,6 @@ impl GenerationClient {
         if server_cached_prompt_tokens.is_none() && server_prompt_tokens.is_some() {
             server_cached_prompt_tokens = Some(0);
         }
-        let prompt_len = prompt_ids.len();
-        let planned_prefix_hit_rate = prefix_hit_rate(step.prefix_len, prompt_len);
         let server_uncached_prompt_tokens =
             match (server_prompt_tokens, server_cached_prompt_tokens) {
                 (Some(prompt), Some(cached)) => Some(prompt.saturating_sub(cached)),
@@ -331,40 +362,32 @@ impl GenerationClient {
             (Some(cached), Some(prompt)) => ratio(cached, prompt),
             _ => None,
         };
-        let server_prefix_hit_rate_delta =
-            server_prefix_hit_rate.map(|actual| actual - planned_prefix_hit_rate);
 
-        StepOutcome {
-            log: StepLog {
-            session_id: step.session_id.clone(),
-            round_idx: step.round_idx,
-            request_id,
-            prefix_len: step.prefix_len,
-            input_len: step.input_len,
-            prompt_len,
-            planned_prefix_hit_rate,
-            output_len_target: step.output_len,
-            output_len_actual,
-            output_len_text_tokens,
-            server_prompt_tokens,
-            server_completion_tokens,
-            server_total_tokens,
-            server_cached_prompt_tokens,
-            server_uncached_prompt_tokens,
-            server_prefix_hit_rate,
-            server_prefix_hit_rate_delta,
-            finish_reason,
-            tool_wait_after_ms: step.tool_wait_after_ms,
-            arrival_time_ms: step.arrival_time,
-            submit_timestamp,
-            post_timestamp,
-            complete_timestamp: unix_seconds_now(),
-            first_token_ms,
-            total_duration_ms: elapsed_ms(start),
-            chunk_count,
-            status,
-            output_preview: output_text.chars().take(100).collect(),
-            error,
+        let server_usage = saw_server_usage.then_some(ServerUsageLog {
+            prompt_tokens: server_prompt_tokens,
+            completion_tokens: server_completion_tokens,
+            total_tokens: server_total_tokens,
+            cached_prompt_tokens: server_cached_prompt_tokens,
+            uncached_prompt_tokens: server_uncached_prompt_tokens,
+            prefix_hit_rate: server_prefix_hit_rate,
+        });
+
+        GenerationResult {
+            outcome: GenerationOutcome {
+                request_id,
+                output_len_actual,
+                output_len_text_tokens,
+                server_usage,
+                finish_reason,
+                submit_timestamp,
+                post_timestamp,
+                complete_timestamp: unix_seconds_now(),
+                first_token_ms,
+                total_duration_ms: elapsed_ms(start),
+                chunk_count,
+                status,
+                output_preview: output_text.chars().take(100).collect(),
+                error,
             },
             output_ids,
         }
