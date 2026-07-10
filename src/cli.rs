@@ -43,6 +43,11 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) max_sessions: Option<usize>,
 
+    /// Target session arrival rate in sessions/s. Arrival offsets from the trace are scaled while
+    /// preserving their relative timing and burst pattern.
+    #[arg(long)]
+    pub(crate) rate: Option<f64>,
+
     #[arg(long, default_value = "session_runner_output.jsonl")]
     pub(crate) log_path: String,
 

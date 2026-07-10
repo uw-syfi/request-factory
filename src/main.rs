@@ -20,7 +20,7 @@ use record::StepLog;
 use session::{run_session, status_task, AppState, Stats};
 use summary::{write_logs, write_summary_if_requested, ReplaySummary, RunSummary};
 use tokens::{build_token_pool, load_tokenizer};
-use trace::load_sessions;
+use trace::{apply_session_arrival_rate, load_sessions, session_arrival_rate};
 use workload::WorkloadSummary;
 
 #[tokio::main]
@@ -35,7 +35,23 @@ async fn main() -> Result<()> {
         return Err(anyhow!("--fail-on-context-overflow requires --max-model-len"));
     }
 
-    let sessions = load_sessions(&args.trace, args.max_sessions)?;
+    let mut sessions = load_sessions(&args.trace, args.max_sessions)?;
+    if let Some(target_rate) = args.rate {
+        let adjustment = apply_session_arrival_rate(&mut sessions, target_rate)?;
+        eprintln!(
+            "session arrival rate | trace={:.6} sessions/s target={:.6} sessions/s time_scale={:.6}",
+            adjustment.trace_rate, adjustment.target_rate, adjustment.time_scale,
+        );
+    } else if let Some(trace_rate) = session_arrival_rate(&sessions) {
+        eprintln!(
+            "session arrival rate | trace={:.6} sessions/s (unchanged)",
+            trace_rate
+        );
+    } else {
+        eprintln!(
+            "session arrival rate | unavailable (need at least two sessions with distinct arrival times)"
+        );
+    }
     let workload_summary = WorkloadSummary::from_sessions(&sessions, args.max_model_len);
     workload_summary.print();
     if args.dry_run {

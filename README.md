@@ -31,6 +31,24 @@ Fields:
 - `output_len`: `max_tokens` sent to vLLM.
 - `tool_wait_after_ms`: sleep after this round completes before the next round in the same session.
 
+## Session Arrival Rate (`--rate`)
+
+By default, the runner releases sessions at the `arrival_time` offsets stored in the CSV. Pass
+`--rate N` to replay the same arrival pattern at a target rate of `N` sessions/s:
+
+```bash
+--rate 8
+```
+
+The runner measures the trace rate from the mean inter-session interval,
+`(session_count - 1) / (last_arrival - first_arrival)`, then multiplies every arrival offset by
+`trace_rate / requested_rate`. For example, requesting 8 sessions/s for a trace measured at
+2 sessions/s divides every arrival time by 4. Relative gaps and simultaneous-arrival bursts are
+preserved. The measured rate, target rate, and applied time scale are printed at startup.
+
+Rate scaling requires at least two selected sessions with distinct arrival times. `--rate` is
+applied after `--max-sessions`, so the measured trace rate describes exactly the selected sessions.
+
 Examples live at `examples/session_workload_example.csv` (single session),
 `examples/multi_session_example.csv` (3 sessions with arrival times, for a quick multi-session
 run), and `examples/multi_session_large.csv` (48 sessions / 303 rounds with cumulative-consistent
@@ -108,6 +126,9 @@ Useful controls:
 # Bound active closed-loop sessions while still respecting arrival_time.
 --max-active-sessions 128
 
+# Scale trace arrival offsets to a target of 8 sessions per second.
+--rate 8
+
 # Skip rounds that exceed a known model context limit instead of sending them to vLLM.
 --max-model-len 131072 --fail-on-context-overflow
 
@@ -143,6 +164,7 @@ Implemented:
 - workload summary and dry-run validation
 - per-session ordered replay
 - optional session-start scheduling from `arrival_time`
+- optional target session arrival-rate scaling with `--rate`
 - optional active-session concurrency limit
 - optional model-context validation and overflow skipping
 - session-internal closed-loop timing
