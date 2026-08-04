@@ -435,6 +435,11 @@ impl GenerationClient {
         let response = self
             .client
             .post(&self.endpoint)
+            // vLLM DP ranks own independent prefix caches. Pin both preflight
+            // requests to one rank so the second request tests the feature
+            // instead of accidentally probing a different cache shard.
+            // Servers that do not implement this vLLM routing header ignore it.
+            .header("X-data-parallel-rank", "0")
             .json(&payload)
             .send()
             .await

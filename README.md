@@ -249,7 +249,7 @@ The runner always requests streaming usage and treats usage-present-but-cache-de
 ENABLE_PROMPT_TOKENS_DETAILS=1 ENABLE_PREFIX_CACHING=1 web/ai_infra/serve_qwen36_35b_a3b_fp8_vllm.sh
 ```
 
-Before replaying, the runner sends a two-request probe that forces a guaranteed prefix-cache hit and **aborts the run** if the server does not report cached prompt tokens. This fails fast on a server launched without prompt-token details (vLLM: `--enable-prompt-tokens-details`) or without prefix caching, instead of silently logging 0% hit rates. Dry-run mode skips the probe.
+Before replaying, the runner sends a two-request probe that forces a guaranteed prefix-cache hit and **aborts the run** if the server does not report cached prompt tokens. Both probe requests carry vLLM's `X-data-parallel-rank: 0` routing header because data-parallel ranks own independent prefix-cache shards; without rank affinity, a healthy DP deployment can route the two probes to different caches and produce a false failure. Servers that do not recognize the header ignore it. This fails fast on a server launched without prompt-token details (vLLM: `--enable-prompt-tokens-details`) or without prefix caching, instead of silently logging 0% hit rates. Dry-run mode skips the probe.
 
 If the Qwen model is not already present locally, starting vLLM may download a large Hugging Face model and may execute model repository code depending on the serve flags.
 
