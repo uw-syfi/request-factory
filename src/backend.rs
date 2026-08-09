@@ -55,6 +55,7 @@ pub(crate) fn build_backend(kind: BackendKind) -> Box<dyn Backend> {
     match kind {
         BackendKind::Openai => Box::new(OpenAiCompletionsBackend),
         BackendKind::VllmTokens => Box::new(VllmTokensBackend),
+        BackendKind::SglangTokens => Box::new(SglangTokensBackend),
     }
 }
 
@@ -191,6 +192,156 @@ impl Backend for VllmTokensBackend {
     }
 }
 
+/// SGLang native token-in/token-out `/generate` protocol.
+///
+/// The server must be launched with two flags. `--skip-tokenizer-init` is the
+/// counterpart of vLLM's `--tokens-only`: it accepts `input_ids` and returns
+/// `output_ids` without ever detokenizing. `--stream-output` (renamed
+/// `--incremental-streaming-output` in newer builds) makes streamed chunks
+/// disjoint deltas; SGLang's default resends the whole output every chunk,
+/// which is O(n^2) on the wire and inflates late-token latency.
+/// [`restates_accumulated_output`] fails the round if that default is still in
+/// effect rather than silently reporting the polluted timings.
+///
+/// Verified against SGLang 0.5.9: `output_ids` arrives as a top-level per-chunk
+/// delta, `meta_info` carries running `prompt_tokens`/`completion_tokens`/
+/// `cached_tokens`, `finish_reason` is an object, and no `text` field is sent.
+pub(crate) struct SglangTokensBackend;
+
+impl Backend for SglangTokensBackend {
+    fn endpoint_suffix(&self) -> &str {
+        "/generate"
+    }
+
+    fn build_payload(&self, req: &GenRequest) -> Value {
+        // No `model` field: an SGLang server hosts exactly one model. No
+        // `return_logprob` either — `output_ids` is a native top-level response
+        // field, so recovering ids out of per-token logprobs would only add
+        // compute and serialization to the path we are timing.
+        serde_json::json!({
+            "input_ids": req.prompt_ids,
+            "sampling_params": {
+                "max_new_tokens": req.max_tokens,
+                "temperature": req.temperature,
+                // Always decode to the trace's target length; synthetic prompts
+                // otherwise emit EOS immediately and collapse the workload.
+                "ignore_eos": true,
+            },
+            "stream": req.stream,
+        })
+    }
+
+    fn parse_event(&self, value: &Value) -> StreamEvent {
+        let token_ids = value
+            .get("output_ids")
+            .and_then(Value::as_array)
+            .map(|output_ids| {
+                output_ids
+                    .iter()
+                    .filter_map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+                    .collect::<Vec<u32>>()
+            });
+        let meta_info = value.get("meta_info");
+        StreamEvent {
+            // Under --skip-tokenizer-init the server never produces text.
+            text_delta: None,
+            token_ids,
+            finish_reason: meta_info.and_then(sglang_finish_reason),
+            usage: meta_info.and_then(sglang_usage),
+        }
+    }
+}
+
+/// SGLang reports `finish_reason` as an object (`{"type": "length"}`) rather
+/// than the bare string the OpenAI schema uses. Accept both.
+fn sglang_finish_reason(meta_info: &Value) -> Option<String> {
+    let reason = meta_info.get("finish_reason")?;
+    if let Some(reason) = reason.as_str() {
+        return Some(reason.to_string());
+    }
+    reason.get("type")?.as_str().map(str::to_string)
+}
+
+/// SGLang carries token accounting in `meta_info`, not in an OpenAI `usage`
+/// object. Its schema is fixed, so read the exact keys instead of searching the
+/// provider alias list [`usage_cached_prompt_tokens`] needs.
+///
+/// `meta_info` rides on every streamed chunk with running counts. The shared
+/// engine keeps the newest value for each field, so the final chunk's totals win.
+fn sglang_usage(meta_info: &Value) -> Option<Usage> {
+    let prompt_tokens = usage_usize(meta_info, "prompt_tokens");
+    let completion_tokens = usage_usize(meta_info, "completion_tokens")
+        .or_else(|| usage_usize(meta_info, "output_tokens"));
+    let cached_prompt_tokens = usage_usize(meta_info, "cached_tokens");
+    if prompt_tokens.is_none() && completion_tokens.is_none() && cached_prompt_tokens.is_none() {
+        return None;
+    }
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        // SGLang does not report a combined total; derive it only when both
+        // halves are present rather than reporting a partial sum.
+        total_tokens: match (prompt_tokens, completion_tokens) {
+            (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
+            _ => None,
+        },
+        cached_prompt_tokens,
+    })
+}
+
+/// Whether a streamed chunk restates the whole output so far instead of
+/// carrying only new tokens.
+///
+/// Every supported backend is expected to stream disjoint deltas. Folding a
+/// cumulative chunk as if it were a delta would multiply the output and wreck
+/// the TPOT denominator, so the shared engine treats this as a hard failure.
+/// The first chunk is exempt because an empty accumulator prefixes anything.
+fn restates_accumulated_output(accumulated: &[u32], incoming: &[u32]) -> bool {
+    !accumulated.is_empty() && incoming.len() > accumulated.len() && incoming.starts_with(accumulated)
+}
+
+/// Verdict on generated token ids that outnumber the server's completion count.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptEcho {
+    /// The counts agree; nothing was echoed.
+    None,
+    /// The leading `n` ids provably repeat the prompt's tail and can be dropped.
+    Leading(usize),
+    /// There are more ids than completion tokens, but the excess does not match
+    /// the prompt tail, so what it represents is unknown.
+    Unexplained,
+}
+
+/// Classify a leading prompt echo in the collected generated token ids.
+///
+/// SGLang has been reported to prepend a suffix of `input_ids` to `output_ids`
+/// (sgl-project/sglang#10896). That was filed against the offline Engine API
+/// rather than this streaming HTTP path, so the guard is cheap insurance:
+/// it trims only what it can prove came from the prompt, and refuses to guess
+/// otherwise. Carrying an echoed prefix forward would corrupt the next round's
+/// context and every prefix-cache number derived from it.
+fn classify_prompt_echo(
+    output_ids: &[u32],
+    prompt_ids: &[u32],
+    completion_tokens: usize,
+) -> PromptEcho {
+    let Some(echoed) = output_ids.len().checked_sub(completion_tokens) else {
+        return PromptEcho::None;
+    };
+    if echoed == 0 {
+        return PromptEcho::None;
+    }
+    let matches_prompt_tail = prompt_ids
+        .len()
+        .checked_sub(echoed)
+        .is_some_and(|start| prompt_ids[start..] == output_ids[..echoed]);
+    if matches_prompt_tail {
+        PromptEcho::Leading(echoed)
+    } else {
+        PromptEcho::Unexplained
+    }
+}
+
 /// Backend result shared by every text-generation source. Source identity stays
 /// with the executor; session executors alone carry `output_ids` to the next round.
 pub(crate) struct GenerationResult {
@@ -215,6 +366,7 @@ pub(crate) fn context_limit_skip_result(
             request_id,
             output_len_actual: 0,
             output_len_text_tokens: 0,
+            echoed_prompt_tokens: 0,
             server_usage: None,
             finish_reason: None,
             submit_timestamp: unix_seconds_now(),
@@ -361,6 +513,18 @@ impl GenerationClient {
                                     let event = self.backend.parse_event(&value);
                                     let event_elapsed_ms = elapsed_ms(send_instant);
                                     let token_ids = event.token_ids.unwrap_or_default();
+                                    if restates_accumulated_output(&output_token_ids, &token_ids) {
+                                        status = "FAILED".to_string();
+                                        error = Some(format!(
+                                            "server streamed cumulative output: a chunk repeated all {} \
+                                             tokens delivered so far. Launch SGLang with \
+                                             --stream-output (renamed --incremental-streaming-output \
+                                             in newer builds) so chunks are disjoint deltas.",
+                                            output_token_ids.len(),
+                                        ));
+                                        done = true;
+                                        break;
+                                    }
                                     if !token_ids.is_empty() {
                                         if first_token_id_ms.is_none() {
                                             first_token_id_ms = Some(event_elapsed_ms);
@@ -451,6 +615,32 @@ impl GenerationClient {
             .map(|encoding| encoding.get_ids().to_vec())
             .unwrap_or_default();
         let output_len_text_tokens = reencoded_output_ids.len();
+        // Drop a leading echo of the prompt when the server streamed more ids
+        // than it counted as completion tokens. Proven echoes are trimmed, an
+        // unexplained excess fails the round: carrying either one forward would
+        // corrupt the next prompt and every cache number derived from it.
+        let mut echoed_prompt_tokens = 0usize;
+        if status == "SUCCESS" {
+            if let Some(completion_tokens) = server_completion_tokens {
+                match classify_prompt_echo(&output_token_ids, prompt_ids, completion_tokens) {
+                    PromptEcho::None => {}
+                    PromptEcho::Leading(echoed) => {
+                        output_token_ids.drain(..echoed);
+                        echoed_prompt_tokens = echoed;
+                    }
+                    PromptEcho::Unexplained => {
+                        error = Some(format!(
+                            "server streamed {} generated token ids but reported {} completion \
+                             tokens, and the {} extra leading ids do not match the prompt tail",
+                            output_token_ids.len(),
+                            completion_tokens,
+                            output_token_ids.len().saturating_sub(completion_tokens),
+                        ));
+                        status = "FAILED".to_string();
+                    }
+                }
+            }
+        }
         let output_len_actual = server_completion_tokens.unwrap_or_else(|| {
             if output_token_ids.is_empty() {
                 output_len_text_tokens
@@ -500,6 +690,7 @@ impl GenerationClient {
                 request_id,
                 output_len_actual,
                 output_len_text_tokens,
+                echoed_prompt_tokens,
                 server_usage,
                 finish_reason,
                 submit_timestamp,
@@ -700,6 +891,125 @@ mod tests {
         assert_eq!(usage.completion_tokens, Some(2));
         assert_eq!(usage.total_tokens, Some(5));
         assert_eq!(usage.cached_prompt_tokens, Some(1));
+    }
+
+    #[test]
+    fn sglang_backend_sends_input_ids_without_model_or_logprobs() {
+        let backend = SglangTokensBackend;
+        let payload = backend.build_payload(&GenRequest {
+            model: "ignored-by-sglang",
+            prompt_ids: &[7, 8, 9],
+            max_tokens: 16,
+            temperature: 0.0,
+            stream: true,
+        });
+
+        assert_eq!(backend.endpoint_suffix(), "/generate");
+        assert_eq!(payload["input_ids"], serde_json::json!([7, 8, 9]));
+        assert_eq!(payload["sampling_params"]["max_new_tokens"], 16);
+        assert_eq!(payload["sampling_params"]["temperature"], 0.0);
+        assert_eq!(payload["sampling_params"]["ignore_eos"], true);
+        assert_eq!(payload["stream"], true);
+        // An SGLang server hosts one model, and output_ids is native: neither a
+        // model field nor the logprob recovery path belongs in this payload.
+        assert!(payload.get("model").is_none());
+        assert!(payload.get("return_logprob").is_none());
+        assert!(payload.get("prompt").is_none());
+    }
+
+    #[test]
+    fn sglang_backend_normalizes_meta_info_into_usage() {
+        let backend = SglangTokensBackend;
+        let event = backend.parse_event(&serde_json::json!({
+            "output_ids": [101, 102],
+            "meta_info": {
+                "prompt_tokens": 512,
+                "completion_tokens": 2,
+                "cached_tokens": 496,
+                "finish_reason": {"type": "length"}
+            }
+        }));
+
+        assert_eq!(event.token_ids, Some(vec![101, 102]));
+        // Under --skip-tokenizer-init there is no text to carry.
+        assert!(event.text_delta.is_none());
+        assert_eq!(event.finish_reason.as_deref(), Some("length"));
+        let usage = event.usage.expect("meta_info must normalize into usage");
+        assert_eq!(usage.prompt_tokens, Some(512));
+        assert_eq!(usage.completion_tokens, Some(2));
+        assert_eq!(usage.cached_prompt_tokens, Some(496));
+        assert_eq!(usage.total_tokens, Some(514));
+    }
+
+    #[test]
+    fn sglang_usage_falls_back_to_output_tokens_and_plain_finish_reason() {
+        let backend = SglangTokensBackend;
+        let event = backend.parse_event(&serde_json::json!({
+            "output_ids": [5],
+            "meta_info": {"prompt_tokens": 4, "output_tokens": 1, "finish_reason": "stop"}
+        }));
+
+        let usage = event.usage.expect("usage");
+        assert_eq!(usage.completion_tokens, Some(1));
+        assert_eq!(usage.cached_prompt_tokens, None);
+        assert_eq!(event.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn sglang_chunk_without_meta_info_reports_no_usage() {
+        let backend = SglangTokensBackend;
+        let event = backend.parse_event(&serde_json::json!({"output_ids": [1, 2]}));
+
+        assert_eq!(event.token_ids, Some(vec![1, 2]));
+        assert!(event.usage.is_none());
+        assert!(event.finish_reason.is_none());
+    }
+
+    #[test]
+    fn cumulative_streaming_is_detected_but_real_deltas_are_not() {
+        // A cumulative chunk repeats everything delivered so far and then adds.
+        assert!(restates_accumulated_output(&[1, 2, 3], &[1, 2, 3, 4]));
+        // A disjoint delta does not, even when it happens to start with the
+        // same id the accumulator did.
+        assert!(!restates_accumulated_output(&[1, 2, 3], &[4, 5]));
+        assert!(!restates_accumulated_output(&[1, 2, 3], &[1, 9]));
+        // Re-sending the identical array without growing is not the cumulative
+        // pattern this guard is for, and must not be misread as one.
+        assert!(!restates_accumulated_output(&[1, 2, 3], &[1, 2, 3]));
+        // The first chunk is exempt: an empty accumulator prefixes anything.
+        assert!(!restates_accumulated_output(&[], &[1, 2, 3]));
+    }
+
+    #[test]
+    fn prompt_echo_is_trimmed_only_when_it_matches_the_prompt_tail() {
+        let prompt_ids = [10, 11, 12, 13];
+
+        // Counts agree: nothing echoed.
+        assert_eq!(
+            classify_prompt_echo(&[90, 91], &prompt_ids, 2),
+            PromptEcho::None
+        );
+        // Two extra leading ids that are exactly the prompt's last two tokens.
+        assert_eq!(
+            classify_prompt_echo(&[12, 13, 90, 91], &prompt_ids, 2),
+            PromptEcho::Leading(2)
+        );
+        // Extra ids that are not the prompt tail: meaning unknown, never guess.
+        assert_eq!(
+            classify_prompt_echo(&[77, 78, 90, 91], &prompt_ids, 2),
+            PromptEcho::Unexplained
+        );
+        // More excess than the prompt has tokens cannot be a prompt echo.
+        assert_eq!(
+            classify_prompt_echo(&[1, 2, 3, 4, 5, 90], &[10, 11], 1),
+            PromptEcho::Unexplained
+        );
+        // Fewer ids than completion tokens is a different problem, and is left
+        // to the existing output_ids_exact check rather than handled here.
+        assert_eq!(
+            classify_prompt_echo(&[90], &prompt_ids, 4),
+            PromptEcho::None
+        );
     }
 
     #[test]

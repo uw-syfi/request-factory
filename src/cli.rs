@@ -9,6 +9,8 @@ pub(crate) enum BackendKind {
     Openai,
     /// vLLM native token-in/token-out `/inference/v1/generate` endpoint.
     VllmTokens,
+    /// SGLang native token-in/token-out `/generate` endpoint.
+    SglangTokens,
 }
 
 /// How session rounds turn trace lengths into the next prompt token sequence.
@@ -16,8 +18,8 @@ pub(crate) enum BackendKind {
 pub(crate) enum SessionContextPolicy {
     /// Reproduce the trace-reported prefix/new-append split exactly.
     TraceReported,
-    /// Retain the full prior prompt plus exact output IDs, grow to the trace's
-    /// total input length, and reset only for a major compaction.
+    /// Reuse the prior prompt plus exact output IDs up to the trace's total
+    /// input length, append when it grows, and reset only for a major compaction.
     Monotonic,
 }
 
@@ -55,14 +57,19 @@ pub(crate) struct Args {
     pub(crate) tokenizer: String,
 
     /// Protocol base URL. Use http://host:port/v1 for openai and
-    /// http://host:port for vllm-tokens.
+    /// http://host:port for the native token endpoints.
     #[arg(long, default_value = "http://127.0.0.1:8000/v1")]
     pub(crate) base_url: String,
 
+    /// Model name sent in the request payload. Ignored by `sglang-tokens`,
+    /// whose server hosts exactly one model and takes no model field.
     #[arg(long)]
     pub(crate) model: String,
 
-    /// Inference-server wire protocol. `vllm-tokens` requires vLLM --tokens-only.
+    /// Inference-server wire protocol. `vllm-tokens` requires vLLM
+    /// --tokens-only; `sglang-tokens` requires SGLang --skip-tokenizer-init
+    /// and --stream-output (renamed --incremental-streaming-output in newer
+    /// builds).
     #[arg(long, value_enum, default_value = "openai")]
     pub(crate) backend: BackendKind,
 

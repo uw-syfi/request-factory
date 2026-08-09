@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::trace::{IndependentRequest, SessionStep};
 use crate::util::prefix_hit_rate;
 
-const STEP_LOG_SCHEMA_VERSION: u32 = 6;
+const STEP_LOG_SCHEMA_VERSION: u32 = 7;
 
 /// One JSONL record: a typed source plus measurements shared by text generation.
 ///
@@ -65,6 +65,10 @@ pub(crate) struct GenerationOutcome {
     pub(crate) request_id: String,
     pub(crate) output_len_actual: usize,
     pub(crate) output_len_text_tokens: usize,
+    /// Leading generated ids that repeated the prompt tail and were dropped
+    /// before carry-forward. Non-zero only on servers that echo part of the
+    /// prompt into their generated ids; see `classify_prompt_echo`.
+    pub(crate) echoed_prompt_tokens: usize,
     /// `None` means the server returned no usage object. Fields inside a present
     /// usage object remain optional when that server does not expose the metric.
     pub(crate) server_usage: Option<ServerUsageLog>,
@@ -188,6 +192,7 @@ mod tests {
             request_id: "request-1".to_string(),
             output_len_actual: 4,
             output_len_text_tokens: 4,
+            echoed_prompt_tokens: 0,
             server_usage: None,
             finish_reason: Some("length".to_string()),
             submit_timestamp: 1.0,
@@ -233,7 +238,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(value["source"]["type"], "session_round");
-        assert_eq!(value["schema_version"], 6);
+        assert_eq!(value["schema_version"], 7);
         assert_eq!(value["source"]["data"]["prefix_len"], 8);
         assert_eq!(value["source"]["data"]["derived_prefix_len"], 8);
         assert_eq!(value["source"]["data"]["derived_append_len"], 4);

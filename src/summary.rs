@@ -456,6 +456,7 @@ mod tests {
             request_id: request_id.to_string(),
             output_len_actual,
             output_len_text_tokens: output_len_actual,
+            echoed_prompt_tokens: 0,
             server_usage: None,
             finish_reason: None,
             submit_timestamp,
