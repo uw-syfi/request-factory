@@ -39,7 +39,7 @@ per axis.
 | 1 | **Trace format** — what a CSV row is, and whether requests chain | `--trace-format` | `session`, `independent` |
 | 2 | **Session context policy** — how a round's prompt reuses the previous one, i.e. the prefix-cache assumption | `--session-context-policy` | `trace-reported` (default), `monotonic` |
 | 3 | **Arrival and load control** — when top-level units are released, how many run at once | CSV `arrival_time`, `--rate`, `--max-concurrency`, `--max-items` | Trace-as-recorded (default), or any subset of the three flags |
-| 4 | **Wire backend** — endpoint and output representation | `--backend` | `openai` (default), `vllm-tokens` |
+| 4 | **Wire backend** — endpoint and output representation | `--backend` | `openai` (default), `vllm-tokens`, `sglang-tokens` |
 
 ### Axis 1 — trace format
 
@@ -63,7 +63,7 @@ rejected at startup rather than silently ignored.
 | Value | Next prompt is | Planned reuse |
 |---|---|---|
 | `trace-reported` | `previous_context[0:prefix_len] + fresh_ids(input_len)` | Exactly the split the trace reported |
-| `monotonic` | Full prior prompt + exact model output IDs, grown to `prefix_len + input_len`, reset only on major compaction | Everything the model has already seen |
+| `monotonic` | Prior prompt + exact model output IDs, truncated or grown to `prefix_len + input_len`, reset only on major compaction | The longest available prefix up to the trace target |
 
 ### Axis 3 — arrival and load control
 
@@ -86,6 +86,10 @@ workload shape.
 |---|---|---|
 | `openai` | `POST {base_url}/completions` | Text plus vLLM's optional `return_token_ids` extension |
 | `vllm-tokens` | `POST {base_url}/inference/v1/generate` | Native token-ID deltas; server must run with `--tokens-only` |
+| `sglang-tokens` | `POST {base_url}/generate` | Native `output_ids` deltas; server must run with `--skip-tokenizer-init` and `--stream-output` |
+
+All three send the prompt as token IDs; they differ only in whether the server
+detokenizes. See [Request backends](#request-backends) for the comparison.
 
 ### Cross-axis constraints
 
@@ -94,12 +98,17 @@ runner:
 
 - `monotonic` (axis 2) requires `--trace-format session` (axis 1). The
   combination is rejected before the trace is even loaded.
-- `monotonic` (axis 2) requires exact generated token IDs, so axis 4 must be
-  `vllm-tokens` or an `openai` endpoint that honours `return_token_ids`. A
-  server that ignores the extension can still serve `trace-reported`. This one
-  fails per round at replay time, not at startup.
+- `monotonic` (axis 2) requires exact generated token IDs, so axis 4 must be a
+  native token endpoint (`vllm-tokens`, `sglang-tokens`) or an `openai`
+  endpoint that honours `return_token_ids`. A server that ignores the extension
+  can still serve `trace-reported`. This one fails per round at replay time,
+  not at startup.
 - `--rate` (axis 3) needs a trace with at least two distinct arrival times,
   after `--max-items` has been applied.
+
+Each native token endpoint additionally requires its own server launch flags,
+listed with the backend in [Request backends](#request-backends). Those are
+server-side prerequisites rather than constraints between axes.
 
 ### Always on, not configurable
 
@@ -158,10 +167,10 @@ Dry-run performs static inspection only. It:
 
 It does **not** check duplicate round indices, cumulative session consistency,
 the synthetic corpus, tokenizer/server identity, backend capabilities,
-prefix-cache telemetry, exact output IDs, or the actual retained prompt length
-of a monotonic replay. Live replay loads the corpus and checks cache telemetry,
-output IDs, and actual prompt overflow. Duplicate indices, cumulative
-consistency, and tokenizer/server identity are not automatically proven today.
+prefix-cache telemetry, exact output IDs, or live server behavior. Live replay
+loads the corpus and checks cache telemetry, output IDs, and actual prompt
+overflow. Duplicate indices, cumulative consistency, and tokenizer/server
+identity are not automatically proven today.
 
 ### 3. Replay through the OpenAI-compatible backend
 
@@ -233,6 +242,29 @@ and use `--base-url http://127.0.0.1:8000 --backend vllm-tokens`.
 | `--stream-interval 1` | Requests one-token streaming cadence. It does not guarantee one SSE event per token if the API process falls behind. |
 | `--api-server-count N` | Adds independent HTTP API **processes**, not threads, for request parsing and streamed-output drain. |
 | `--tokens-only` | Enables `/inference/v1/generate` and removes server-side detokenization from the native-token path. |
+
+### Recommended SGLang launch
+
+```bash
+python -m sglang.launch_server \
+  --model-path meta-llama/Meta-Llama-3-8B \
+  --tp 4 \
+  --host 0.0.0.0 --port 30000 \
+  --skip-tokenizer-init \
+  --stream-output
+```
+
+Use `--base-url http://127.0.0.1:30000 --backend sglang-tokens` on the
+TraceLab side — no `/v1` suffix, because `/generate` is a native route.
+
+| Server setting | Why TraceLab needs it |
+|---|---|
+| `--skip-tokenizer-init` | Accepts `input_ids` and returns `output_ids` with no detokenization. The counterpart of vLLM's `--tokens-only`. OpenAI-compatible routes stop working on this server. |
+| `--stream-output` | Streams disjoint deltas. Without it SGLang resends the full output every chunk, which distorts late-token latency; TraceLab detects this and fails rather than reporting it. Newer SGLang renames it `--incremental-streaming-output`. |
+
+SGLang's radix prefix cache is on by default and reports `cached_tokens` in
+`meta_info`, so the preflight needs no extra flag — unlike vLLM, which needs
+`--enable-prompt-tokens-details`.
 
 ### API process sizing
 
@@ -351,7 +383,7 @@ Select a policy with `--session-context-policy`. It is used only by the
 | Policy | CLI value | Trace fields control | Small target reduction | Output-ID requirement |
 |---|---|---|---|---|
 | Trace-reported, default | `trace-reported` | Exact prefix/append split | Truncate to `prefix_len` | Exact IDs preferred; text fallback remains for backward compatibility |
-| Monotonic | `monotonic` | Target total `prefix_len + input_len` | Retain the full current context | Exact server IDs required |
+| Monotonic | `monotonic` | Target total `prefix_len + input_len` | Truncate to the target while retaining its exact prefix | Exact server IDs required |
 
 ### `trace-reported` — reproduce the trace split
 
@@ -372,7 +404,7 @@ where every reported prefix is available from the preceding prompt and output.
 Dry-run parses the row types and summarizes their lengths but does not currently
 reject this semantic inconsistency.
 
-### `monotonic` — retain model context unless compaction is major
+### `monotonic` — preserve the longest reusable prefix at the trace target
 
 Let:
 
@@ -392,17 +424,18 @@ if major_compaction:
     derived_prefix_len = 0
     derived_append_len = T
 else:
-    prompt = C + fresh_ids(max(0, T - C.len))
-    derived_prefix_len = C.len
-    derived_append_len = max(0, T - C.len)
+    derived_prefix_len = min(C.len, T)
+    derived_append_len = T - derived_prefix_len
+    prompt = C[0:derived_prefix_len] + fresh_ids(derived_append_len)
 ```
 
 Consequences:
 
 - Normal growth reuses the entire preceding prompt and model output.
 - A micro-compaction, or any reduction that misses either major threshold,
-  retains all of `C`; the actual prompt may therefore be longer than `T`.
+  truncates `C` to `T` while preserving the longest exact reusable prefix.
 - A major compaction starts an unrelated target-length context.
+- The actual prompt length is always exactly `T`.
 - The raw trace fields remain in the log, alongside the actual derived
   prefix/append decision.
 
@@ -411,9 +444,9 @@ Examples:
 | Current `C` | Trace target `T` | Decision | Actual prompt | Derived prefix | Fresh append |
 |---:|---:|---|---:|---:|---:|
 | 576 | 704 | Grow | 704 | 576 | 128 |
-| 100,000 | 90,000 | Retain small reduction | 100,000 | 100,000 | 0 |
+| 100,000 | 90,000 | Truncate small reduction | 90,000 | 90,000 | 0 |
 | 140,000 | 70,000 | Major compaction | 70,000 | 0 | 70,000 |
-| 200,000 | 130,000 | Retain: drop is under 50% | 200,000 | 200,000 | 0 |
+| 200,000 | 130,000 | Truncate: drop is under 50% | 130,000 | 130,000 | 0 |
 
 ### Token-ID fidelity
 
@@ -458,6 +491,29 @@ Every flag, including the ones outside this axis, is listed in the
 
 ## Request backends
 
+All three backends submit the prompt as explicit token IDs, so they are
+**identical on the input side**: the server's prefix-cache keys are the exact
+ids TraceLab constructed. They differ only in what comes back, and the
+difference is not whether generated token IDs are available — they are, on all
+three — but whether the server performs detokenization at all.
+
+| `--backend` | Endpoint | Prompt on the wire | Output on the wire | Detokenization in the measured path |
+|---|---|---|---|---|
+| `openai` | `POST {base_url}/completions` | Token-ID array | Text, plus echoed IDs via `return_token_ids` | **Yes** (output side) |
+| `vllm-tokens` | `POST {base_url}/inference/v1/generate` | `token_ids` | Token-ID deltas | No |
+| `sglang-tokens` | `POST {base_url}/generate` | `input_ids` | `output_ids` deltas | No |
+
+So `openai` is **token-in, but not token-out**: the server still decodes, and
+the echoed IDs ride alongside the text rather than replacing it. In vLLM only
+the tokens-only path disables decoding —
+`sampling_params.detokenize = False` appears exactly once in the tree, behind
+the `--tokens-only` flag that serves `/inference/v1/generate`. The OpenAI
+completions path never sets it.
+
+Pick accordingly: `vllm-tokens` and `sglang-tokens` are the two comparable
+high-fidelity paths, and `openai` is the portable fallback whose TTFT/TPOT
+include decode cost.
+
 ### OpenAI-compatible completions
 
 ```text
@@ -484,6 +540,46 @@ The server must be launched with `--tokens-only`. Requests contain `token_ids`
 and nested `sampling_params`; streamed responses contain token-ID deltas. This
 path forces `SamplingParams.detokenize = false` and removes detokenization from
 the measured response path.
+
+### Native SGLang tokens
+
+```text
+--backend sglang-tokens
+--base-url http://HOST:PORT
+POST {base_url}/generate
+```
+
+The server must be launched with **two** flags:
+
+| Server flag | Why TraceLab requires it |
+|---|---|
+| `--skip-tokenizer-init` | The counterpart of vLLM's `--tokens-only`. The server accepts `input_ids` and returns `output_ids` without ever detokenizing. OpenAI-compatible endpoints stop working on that server, so use `/generate`. |
+| `--stream-output` | Makes streamed chunks disjoint deltas. SGLang's default resends the entire output in every chunk, which is O(n²) bytes over the stream and inflates late-token latency — a measurement artifact, not just a parsing inconvenience. Newer SGLang renames this to `--incremental-streaming-output` and keeps `--stream-output` as a deprecated alias. |
+
+The request carries `input_ids` and nested `sampling_params`
+(`max_new_tokens`, `temperature`, `ignore_eos`). It deliberately omits two
+fields:
+
+- **no `model`** — an SGLang server hosts exactly one model, so `--model` is
+  accepted but unused by this backend;
+- **no `return_logprob`** — `output_ids` is a native top-level response field.
+  Recovering IDs out of per-token logprobs instead would add compute and
+  serialization to the very path being timed.
+
+Token accounting is read from `meta_info` (`prompt_tokens`,
+`completion_tokens` or `output_tokens`, `cached_tokens`) rather than an OpenAI
+`usage` object, and `finish_reason` is accepted as either a string or a
+`{"type": ...}` object.
+
+Two guards fail the round rather than report a polluted number:
+
+- a chunk that repeats every token delivered so far means the server is still
+  in cumulative mode, and names the missing flag in the error;
+- if the server streams more generated IDs than its own `completion_tokens`
+  count, the excess is dropped **only** when it provably equals the prompt's
+  tail (an echo reported in sgl-project/sglang#10896); anything else is an
+  unexplained mismatch and fails. Trimmed tokens are recorded as
+  `echoed_prompt_tokens`.
 
 ### Alignment profile configuration
 
@@ -522,9 +618,8 @@ The 100M-token floor consumes about 400 MB for the `u32` ID pool and generally
 requires roughly 400–600 MB or more of source text. `--token-pool-limit` can
 reduce it. If the corpus produces fewer IDs than the longest prompt, TraceLab
 warns that content will repeat within a request and may distort prefix-cache
-measurements. Default sizing uses trace-reported prompt targets; for a monotonic
-run that retains substantially more context, set an explicit limit large enough
-for the expected actual prompt.
+measurements. Monotonic construction also keeps every actual prompt at the
+trace-reported target `prefix_len + input_len`.
 
 The corpus is tokenized line by line, so concatenated pool IDs need not equal a
 single tokenizer call over the original whole file. This creates synthetic
@@ -555,12 +650,10 @@ missing model output makes subsequent context continuation untrustworthy.
 `--skip-on-context-limit` and the older `--fail-on-context-overflow` are
 compatibility aliases for the same behavior.
 
-For `trace-reported`, the static requested context is
-`prefix_len + input_len + output_len`. For `monotonic`, retained context can
-make the actual prompt longer than the trace target. The dry-run workload
-summary reports trace-target requested context; the live guard uses the actual
-constructed prompt plus target output. Use `--skip-when-reaching-limit` for
-monotonic runs near the context limit.
+For both policies, the requested context length is
+`prefix_len + input_len + output_len`. The policies differ in token identity
+and the derived prefix/append split, not total prompt length. The live guard
+still uses the actually constructed prompt plus target output.
 
 ### Prefix-cache preflight
 
@@ -590,11 +683,18 @@ this zero-fill cannot mean "the server never reports cache detail at all".
 
 ## Output contracts
 
-### Per-request JSONL — schema v6
+### Per-request JSONL — schema v7
 
 `--log-path` receives one typed record per attempted request. Session and
 independent-request source data are tagged variants rather than one sparse
 object.
+
+v7 adds `outcome.echoed_prompt_tokens`: leading generated IDs that repeated the
+prompt tail and were dropped before carry-forward. It is `0` on every server
+that does not echo, which is all of them today apart from the SGLang case
+described under [Request backends](#request-backends). The addition is purely
+additive; consumers reading `outcome.status` or `outcome.request_id` are
+unaffected.
 
 Abbreviated session example:
 
@@ -603,7 +703,7 @@ Abbreviated session example:
 
 ```json
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "source": {
     "type": "session_round",
     "data": {
@@ -746,6 +846,8 @@ token-level plan.
 |---|---|
 | `prefix-cache preflight failed` | Enable prefix caching and prompt-token usage details — for vLLM, `--enable-prompt-tokens-details` (or `ENABLE_PROMPT_TOKENS_DETAILS=1`) with prefix caching left on. Confirm both probe requests reach the same server/cache shard. |
 | `monotonic session context requires exact generated token IDs` | The endpoint omitted token IDs or their count disagreed with `completion_tokens`. Use a vLLM endpoint supporting `return_token_ids`, or use `vllm-tokens`. Do not work around this with text re-tokenization. |
+| `server streamed cumulative output` | The SGLang server is in its default cumulative streaming mode. Relaunch it with `--stream-output` (named `--incremental-streaming-output` in newer builds). |
+| `the extra leading ids do not match the prompt tail` | The server streamed more generated IDs than its own `completion_tokens` count, and the excess is not an echo of the prompt. TraceLab refuses to guess what those IDs are; inspect the raw response before trusting the run. |
 | `cannot apply --rate` | The selected workload has fewer than two distinct top-level arrival times. |
 | Token-pool repetition warning | Supply a larger corpus or increase `--token-pool-limit`. |
 | `SKIPPED_CONTEXT_OVERFLOW` | Compatibility status name: actual prompt plus target output reached `--max-model-len` while `--skip-when-reaching-limit` was enabled. The request was not sent. |
@@ -766,7 +868,7 @@ Every flag `session_runner` accepts. The axis columns map back to
 | `--trace` | Path | Source CSV, interpreted by `--trace-format` |
 | `--text-file` | Path | Synthetic token corpus. Required even for `--dry-run`, which never opens it |
 | `--tokenizer` | Path or HF repo id | `tokenizer.json`, a directory containing one, or a repo id to download. Must match the served model |
-| `--model` | String | Model name placed in the request payload |
+| `--model` | String | Model name placed in the request payload. Accepted but unused by `sglang-tokens`, whose server hosts one model and takes no model field |
 
 ### Axis selection
 
@@ -774,8 +876,8 @@ Every flag `session_runner` accepts. The axis columns map back to
 |---|---|---|
 | `--trace-format` | `session` | `session`, `independent` — axis 1 |
 | `--session-context-policy` | `trace-reported` | `trace-reported`, `monotonic` — axis 2. `monotonic` requires `--trace-format session` |
-| `--backend` | `openai` | `openai`, `vllm-tokens` — axis 4 |
-| `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for `openai`, omit it for `vllm-tokens` |
+| `--backend` | `openai` | `openai`, `vllm-tokens`, `sglang-tokens` — axis 4 |
+| `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for `openai`, omit it for the native token endpoints |
 
 ### Load control (axis 3)
 
@@ -862,7 +964,7 @@ metrics described above.
 
 Not currently provided:
 
-- SGLang's native `/generate` adapter;
+- an OpenAI Chat Completions backend;
 - raw private prompt/tool-result reconstruction;
 - per-token timestamp dumps;
 - TTFT/TPOT SLO pass/fail policy;
