@@ -20,7 +20,7 @@ hf-hub = "0.3"
 reqwest = { version = "0.11", features = ["json", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokenizers = "0.19"
+tokenizers = "0.21"
 tokio = { version = "1.36", features = ["full"] }
 
 # TraceLab is also vendored as a submodule below larger Rust workspaces. Keep
