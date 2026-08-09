@@ -1,25 +1,25 @@
+mod independent;
 mod session;
-mod vibesim;
 
 use anyhow::{anyhow, Result};
 use clap::ValueEnum;
 use std::collections::BTreeMap;
 
+pub(crate) use independent::IndependentRequest;
 pub(crate) use session::SessionStep;
-pub(crate) use vibesim::VibeSimRequest;
 
 /// Source schema selector. Each frontend retains its own typed workload rather
 /// than filling absent fields in a universal row with zeros or nulls.
-#[derive(ValueEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TraceFormat {
+    Independent,
     Session,
-    Vibesim,
 }
 
 /// Typed replay plans produced by the trace frontends.
 pub(crate) enum ReplayWorkload {
     Sessions(BTreeMap<String, Vec<SessionStep>>),
-    IndependentRequests(Vec<VibeSimRequest>),
+    IndependentRequests(Vec<IndependentRequest>),
 }
 
 /// The result of rescaling trace arrival offsets to a requested session rate.
@@ -37,10 +37,10 @@ pub(crate) fn load_workload(
     max_items: Option<usize>,
 ) -> Result<ReplayWorkload> {
     match format {
-        TraceFormat::Session => session::load(path, max_items).map(ReplayWorkload::Sessions),
-        TraceFormat::Vibesim => {
-            vibesim::load(path, max_items).map(ReplayWorkload::IndependentRequests)
+        TraceFormat::Independent => {
+            independent::load(path, max_items).map(ReplayWorkload::IndependentRequests)
         }
+        TraceFormat::Session => session::load(path, max_items).map(ReplayWorkload::Sessions),
     }
 }
 
@@ -229,9 +229,9 @@ mod tests {
     }
 
     #[test]
-    fn vibesim_frontend_keeps_independent_request_type() {
+    fn independent_frontend_keeps_independent_request_type() {
         let path = std::env::temp_dir().join(format!(
-            "tracelab_vibesim_frontend_{}.csv",
+            "tracelab_independent_frontend_{}.csv",
             std::process::id()
         ));
         fs::write(
@@ -239,11 +239,12 @@ mod tests {
             "id,input_len,output_len,arrival_time\nreq-1,16,4,12.5\n",
         )
         .unwrap();
-        let workload = load_workload(path.to_str().unwrap(), TraceFormat::Vibesim, None).unwrap();
+        let workload =
+            load_workload(path.to_str().unwrap(), TraceFormat::Independent, None).unwrap();
         fs::remove_file(path).unwrap();
 
         let ReplayWorkload::IndependentRequests(requests) = workload else {
-            panic!("VibeSim frontend must not coerce requests into session rounds")
+            panic!("independent frontend must not coerce requests into session rounds")
         };
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].id, "req-1");

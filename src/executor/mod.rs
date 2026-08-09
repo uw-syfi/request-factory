@@ -30,6 +30,7 @@ pub(crate) struct Stats {
     completed: AtomicUsize,
     failed: AtomicUsize,
     finished_units: AtomicUsize,
+    runtime_global_queue_depth_peak: AtomicUsize,
 }
 
 impl Stats {
@@ -47,6 +48,10 @@ impl Stats {
 
     pub(crate) fn record_unit_done(&self) {
         self.finished_units.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn runtime_global_queue_depth_peak(&self) -> usize {
+        self.runtime_global_queue_depth_peak.load(Ordering::Relaxed)
     }
 }
 
@@ -66,9 +71,15 @@ pub(crate) async fn status_task(
         let finished_units = stats.finished_units.load(Ordering::Relaxed);
         let active = submitted.saturating_sub(completed + failed);
         let finished_steps = completed + failed;
+        let runtime_global_queue_depth = tokio::runtime::Handle::current()
+            .metrics()
+            .global_queue_depth();
+        stats
+            .runtime_global_queue_depth_peak
+            .fetch_max(runtime_global_queue_depth, Ordering::Relaxed);
 
         eprintln!(
-            "{} {}/{} | steps {}/{} completed={} submitted={} active={} failed={} | elapsed={:.1}s",
+            "{} {}/{} | steps {}/{} completed={} submitted={} active={} failed={} runtime_global_queue_depth={} | elapsed={:.1}s",
             unit_label,
             finished_units,
             total_units,
@@ -78,6 +89,7 @@ pub(crate) async fn status_task(
             submitted,
             active,
             failed,
+            runtime_global_queue_depth,
             start.elapsed().as_secs_f64(),
         );
 

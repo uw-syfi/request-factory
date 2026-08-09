@@ -15,12 +15,14 @@ use std::time::Instant;
 use tokio::sync::{mpsc, Semaphore};
 
 use backend::GenerationClient;
-use cli::Args;
+use cli::{Args, SessionContextPolicy};
 use executor::{run_independent_request, run_session, status_task, AppState, Stats};
 use record::StepLog;
-use summary::{write_logs, write_summary_if_requested, ReplaySummary, RunSummary};
+use summary::{
+    write_logs, write_summary_if_requested, ClientRuntimeSummary, ReplaySummary, RunSummary,
+};
 use tokens::{build_token_pool, load_tokenizer};
-use trace::{load_workload, ReplayWorkload};
+use trace::{load_workload, ReplayWorkload, TraceFormat};
 use workload::WorkloadSummary;
 
 #[tokio::main]
@@ -31,10 +33,17 @@ async fn main() -> Result<()> {
     if args.max_concurrency == Some(0) {
         return Err(anyhow!("--max-concurrency must be greater than 0"));
     }
-    if args.fail_on_context_overflow && args.max_model_len.is_none() {
+    if args.skip_when_reaching_limit && args.max_model_len.is_none() {
         return Err(anyhow!(
-            "--fail-on-context-overflow requires --max-model-len"
+            "--skip-when-reaching-limit requires --max-model-len"
         ));
+    }
+    if args.session_context_policy == SessionContextPolicy::Monotonic {
+        if args.trace_format != TraceFormat::Session {
+            return Err(anyhow!(
+                "--session-context-policy monotonic requires --trace-format session"
+            ));
+        }
     }
 
     let mut workload = load_workload(&args.trace, args.trace_format, args.max_items)?;
@@ -65,6 +74,7 @@ async fn main() -> Result<()> {
             RunSummary {
                 workload: workload_summary,
                 replay: replay_summary,
+                client_runtime: client_runtime_summary(0),
             },
         )?;
         return Ok(());
@@ -125,7 +135,7 @@ async fn main() -> Result<()> {
 
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
     let log_task = tokio::spawn(write_logs(args.log_path.clone(), log_rx, replay_summary));
-    tokio::spawn(status_task(
+    let status_handle = tokio::spawn(status_task(
         state.stats.clone(),
         workload.unit_count(),
         total_steps,
@@ -163,13 +173,22 @@ async fn main() -> Result<()> {
     }
 
     let replay_summary = log_task.await?;
+    status_handle.await?;
     write_summary_if_requested(
         args.summary_path.as_deref(),
         RunSummary {
             workload: workload_summary,
             replay: replay_summary,
+            client_runtime: client_runtime_summary(state.stats.runtime_global_queue_depth_peak()),
         },
     )?;
 
     Ok(())
+}
+
+fn client_runtime_summary(sampled_global_queue_depth_peak: usize) -> ClientRuntimeSummary {
+    ClientRuntimeSummary {
+        tokio_worker_threads: tokio::runtime::Handle::current().metrics().num_workers(),
+        sampled_global_queue_depth_peak,
+    }
 }

@@ -3,7 +3,7 @@ use bytes::BytesMut;
 use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use tokio::time::timeout;
 
@@ -54,6 +54,7 @@ pub(crate) trait Backend: Send + Sync {
 pub(crate) fn build_backend(kind: BackendKind) -> Box<dyn Backend> {
     match kind {
         BackendKind::Openai => Box::new(OpenAiCompletionsBackend),
+        BackendKind::VllmTokens => Box::new(VllmTokensBackend),
     }
 }
 
@@ -110,14 +111,79 @@ impl Backend for OpenAiCompletionsBackend {
             .and_then(|c| c.get("finish_reason"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let usage = value.get("usage").map(|usage| Usage {
-            prompt_tokens: usage_usize(usage, "prompt_tokens"),
-            completion_tokens: usage_usize(usage, "completion_tokens"),
-            total_tokens: usage_usize(usage, "total_tokens"),
-            cached_prompt_tokens: usage_cached_prompt_tokens(usage),
-        });
+        let usage = value
+            .get("usage")
+            .filter(|usage| !usage.is_null())
+            .map(|usage| Usage {
+                prompt_tokens: usage_usize(usage, "prompt_tokens"),
+                completion_tokens: usage_usize(usage, "completion_tokens"),
+                total_tokens: usage_usize(usage, "total_tokens"),
+                cached_prompt_tokens: usage_cached_prompt_tokens(usage),
+            });
         StreamEvent {
             text_delta,
+            token_ids,
+            finish_reason,
+            usage,
+        }
+    }
+}
+
+/// vLLM native token-in/token-out protocol. The server must be launched with
+/// `--tokens-only`, which forces `SamplingParams.detokenize = false` for this endpoint.
+pub(crate) struct VllmTokensBackend;
+
+impl Backend for VllmTokensBackend {
+    fn endpoint_suffix(&self) -> &str {
+        "/inference/v1/generate"
+    }
+
+    fn build_payload(&self, req: &GenRequest) -> Value {
+        let mut payload = serde_json::json!({
+            "model": req.model,
+            "token_ids": req.prompt_ids,
+            "sampling_params": {
+                "max_tokens": req.max_tokens,
+                "temperature": req.temperature,
+                "ignore_eos": true,
+            },
+            "stream": req.stream,
+        });
+        if req.stream {
+            payload["stream_options"] = serde_json::json!({"include_usage": true});
+        }
+        payload
+    }
+
+    fn parse_event(&self, value: &Value) -> StreamEvent {
+        let choice = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first());
+        let token_ids = choice
+            .and_then(|choice| choice.get("token_ids"))
+            .and_then(Value::as_array)
+            .map(|token_ids| {
+                token_ids
+                    .iter()
+                    .filter_map(|value| value.as_u64().and_then(|id| u32::try_from(id).ok()))
+                    .collect::<Vec<u32>>()
+            });
+        let finish_reason = choice
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let usage = value
+            .get("usage")
+            .filter(|usage| !usage.is_null())
+            .map(|usage| Usage {
+                prompt_tokens: usage_usize(usage, "prompt_tokens"),
+                completion_tokens: usage_usize(usage, "completion_tokens"),
+                total_tokens: usage_usize(usage, "total_tokens"),
+                cached_prompt_tokens: usage_cached_prompt_tokens(usage),
+            });
+        StreamEvent {
+            text_delta: None,
             token_ids,
             finish_reason,
             usage,
@@ -130,11 +196,15 @@ impl Backend for OpenAiCompletionsBackend {
 pub(crate) struct GenerationResult {
     pub(crate) outcome: GenerationOutcome,
     pub(crate) output_ids: Vec<u32>,
+    /// True only when `output_ids` came directly from server token-id events and
+    /// agree with the server's completion-token count when that count is present.
+    pub(crate) output_ids_exact: bool,
 }
 
-pub(crate) fn context_overflow_result(
+pub(crate) fn context_limit_skip_result(
     request_id: String,
     prompt_len: usize,
+    output_len_target: usize,
     max_model_len: Option<usize>,
 ) -> GenerationResult {
     let limit = max_model_len
@@ -151,16 +221,28 @@ pub(crate) fn context_overflow_result(
             post_timestamp: None,
             complete_timestamp: unix_seconds_now(),
             first_token_ms: None,
+            first_token_id_ms: None,
+            last_token_id_ms: None,
+            first_token_event_tokens: 0,
+            token_event_count: 0,
+            usage_event_count: 0,
+            token_delivery_tpot_ms: None,
+            response_complete_ms: None,
+            terminal_tail_ms: None,
             total_duration_ms: 0.0,
             chunk_count: 0,
             status: "SKIPPED_CONTEXT_OVERFLOW".to_string(),
             output_preview: String::new(),
             error: Some(format!(
-                "prompt_len {} exceeds max_model_len {}",
-                prompt_len, limit
+                "requested context {} (prompt_len {} + output_len_target {}) reaches max_model_len {}; one token of headroom is required",
+                prompt_len.saturating_add(output_len_target),
+                prompt_len,
+                output_len_target,
+                limit,
             )),
         },
         output_ids: Vec::new(),
+        output_ids_exact: false,
     }
 }
 
@@ -207,7 +289,7 @@ impl GenerationClient {
         max_tokens: usize,
     ) -> GenerationResult {
         let submit_timestamp = unix_seconds_now();
-        let start = SystemTime::now();
+        let start = Instant::now();
 
         // Submit raw token ids: no client-side decode, so even million-token prompts cost nothing
         // here and the server's prefix-cache keys match the exact ids we built.
@@ -221,8 +303,13 @@ impl GenerationClient {
 
         let post_timestamp = Some(unix_seconds_now());
         // Monotonic anchor at the send instant: TTFT is measured from here.
-        let send_instant = SystemTime::now();
+        let send_instant = Instant::now();
         let mut first_token_ms = None;
+        let mut first_token_id_ms = None;
+        let mut last_token_id_ms = None;
+        let mut first_token_event_tokens = 0usize;
+        let mut token_event_count = 0usize;
+        let mut usage_event_count = 0usize;
         let mut chunk_count = 0usize;
         let mut output_text = String::new();
         let mut output_token_ids: Vec<u32> = Vec::new();
@@ -272,21 +359,30 @@ impl GenerationClient {
                                 }
                                 if let Ok(value) = serde_json::from_str::<Value>(data) {
                                     let event = self.backend.parse_event(&value);
+                                    let event_elapsed_ms = elapsed_ms(send_instant);
+                                    let token_ids = event.token_ids.unwrap_or_default();
+                                    if !token_ids.is_empty() {
+                                        if first_token_id_ms.is_none() {
+                                            first_token_id_ms = Some(event_elapsed_ms);
+                                            first_token_event_tokens = token_ids.len();
+                                        }
+                                        last_token_id_ms = Some(event_elapsed_ms);
+                                        token_event_count += 1;
+                                        output_token_ids.extend(token_ids);
+                                    }
                                     if let Some(delta) = event.text_delta {
                                         if !delta.is_empty() {
                                             if first_token_ms.is_none() {
-                                                first_token_ms = Some(elapsed_ms(send_instant));
+                                                first_token_ms = Some(event_elapsed_ms);
                                             }
                                             output_text.push_str(&delta);
                                         }
-                                    }
-                                    if let Some(ids) = event.token_ids {
-                                        output_token_ids.extend(ids);
                                     }
                                     if let Some(reason) = event.finish_reason {
                                         finish_reason = Some(reason);
                                     }
                                     if let Some(usage) = event.usage {
+                                        usage_event_count += 1;
                                         saw_server_usage = true;
                                         server_prompt_tokens =
                                             usage.prompt_tokens.or(server_prompt_tokens);
@@ -329,6 +425,25 @@ impl GenerationClient {
             }
         }
 
+        // Stop the wire-response clock before output re-tokenization and log shaping.
+        let response_complete_ms = post_timestamp.map(|_| elapsed_ms(send_instant));
+        let token_delivery_tpot_ms = match (
+            first_token_id_ms,
+            last_token_id_ms,
+            output_token_ids.len().checked_sub(first_token_event_tokens),
+        ) {
+            (Some(first), Some(last), Some(delivered_after_first_event))
+                if delivered_after_first_event > 0 && last >= first =>
+            {
+                Some((last - first) / delivered_after_first_event as f64)
+            }
+            _ => None,
+        };
+        let terminal_tail_ms = match (last_token_id_ms, response_complete_ms) {
+            (Some(last), Some(complete)) if complete >= last => Some(complete - last),
+            _ => None,
+        };
+
         // Re-encode the output text for a diagnostic token count and as a carry-forward fallback.
         let reencoded_output_ids: Vec<u32> = self
             .tokenizer
@@ -336,13 +451,21 @@ impl GenerationClient {
             .map(|encoding| encoding.get_ids().to_vec())
             .unwrap_or_default();
         let output_len_text_tokens = reencoded_output_ids.len();
-        let output_len_actual = server_completion_tokens.unwrap_or(output_len_text_tokens);
+        let output_len_actual = server_completion_tokens.unwrap_or_else(|| {
+            if output_token_ids.is_empty() {
+                output_len_text_tokens
+            } else {
+                output_token_ids.len()
+            }
+        });
         // Prefer the server's exact generated token ids (return_token_ids) for carry-forward, but
         // trust them only when their count matches the server's completion_tokens. Otherwise (an
         // older server that ignored the flag, or a shape mismatch) fall back to the re-encoded ids.
-        let output_ids: Vec<u32> = if !output_token_ids.is_empty()
-            && server_completion_tokens.is_none_or(|n| output_token_ids.len() == n)
-        {
+        let output_ids_exact = server_completion_tokens.map_or_else(
+            || !output_token_ids.is_empty(),
+            |count| output_token_ids.len() == count,
+        );
+        let output_ids: Vec<u32> = if output_ids_exact {
             output_token_ids
         } else {
             reencoded_output_ids
@@ -383,6 +506,14 @@ impl GenerationClient {
                 post_timestamp,
                 complete_timestamp: unix_seconds_now(),
                 first_token_ms,
+                first_token_id_ms,
+                last_token_id_ms,
+                first_token_event_tokens,
+                token_event_count,
+                usage_event_count,
+                token_delivery_tpot_ms,
+                response_complete_ms,
+                terminal_tail_ms,
                 total_duration_ms: elapsed_ms(start),
                 chunk_count,
                 status,
@@ -390,6 +521,7 @@ impl GenerationClient {
                 error,
             },
             output_ids,
+            output_ids_exact,
         }
     }
 
@@ -423,14 +555,18 @@ impl GenerationClient {
         }
     }
 
-    /// Send one non-streaming completion and return its normalized usage, if present.
+    /// Send one streaming completion and return its final normalized usage, if present.
+    ///
+    /// Both supported backends expose prompt-cache details in the final SSE usage
+    /// chunk. Keeping preflight on that same wire path also avoids depending on a
+    /// backend's optional non-streaming response schema.
     async fn post_probe(&self, prompt_ids: &[u32]) -> Result<Option<Usage>> {
         let payload = self.backend.build_payload(&GenRequest {
             model: &self.model,
             prompt_ids,
             max_tokens: 1,
             temperature: 0.0,
-            stream: false,
+            stream: true,
         });
         let response = self
             .client
@@ -452,12 +588,31 @@ impl GenerationClient {
                 body.chars().take(200).collect::<String>()
             ));
         }
-        let body: Value = response
-            .json()
+        let body = response
+            .text()
             .await
-            .map_err(|err| anyhow!("invalid JSON response: {err}"))?;
-        Ok(self.backend.parse_event(&body).usage)
+            .map_err(|err| anyhow!("invalid streaming response: {err}"))?;
+        Ok(final_usage_from_sse(self.backend.as_ref(), &body))
     }
+}
+
+fn final_usage_from_sse(backend: &dyn Backend, body: &str) -> Option<Usage> {
+    let mut final_usage = None;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if let Some(usage) = backend.parse_event(&value).usage {
+            final_usage = Some(usage);
+        }
+    }
+    final_usage
 }
 
 fn usage_usize(usage: &Value, key: &str) -> Option<usize> {
@@ -486,4 +641,80 @@ fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
         cursor = cursor.get(*key)?;
     }
     Some(cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vllm_tokens_backend_uses_native_token_protocol() {
+        let backend = VllmTokensBackend;
+        let payload = backend.build_payload(&GenRequest {
+            model: "meta-llama/Meta-Llama-3-8B",
+            prompt_ids: &[11, 22, 33],
+            max_tokens: 4,
+            temperature: 0.0,
+            stream: true,
+        });
+
+        assert_eq!(backend.endpoint_suffix(), "/inference/v1/generate");
+        assert_eq!(payload["token_ids"], serde_json::json!([11, 22, 33]));
+        assert_eq!(payload["sampling_params"]["max_tokens"], 4);
+        assert_eq!(payload["sampling_params"]["temperature"], 0.0);
+        assert_eq!(payload["sampling_params"]["ignore_eos"], true);
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["stream_options"]["include_usage"], true);
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("return_token_ids").is_none());
+    }
+
+    #[test]
+    fn vllm_tokens_backend_normalizes_stream_and_usage_events() {
+        let backend = VllmTokensBackend;
+        let token_event = backend.parse_event(&serde_json::json!({
+            "request_id": "generate-tokens-request-1",
+            "usage": null,
+            "choices": [{
+                "index": 0,
+                "finish_reason": "length",
+                "token_ids": [101, 102]
+            }]
+        }));
+        assert_eq!(token_event.token_ids, Some(vec![101, 102]));
+        assert_eq!(token_event.finish_reason.as_deref(), Some("length"));
+        assert!(token_event.text_delta.is_none());
+        assert!(token_event.usage.is_none());
+
+        let usage_event = backend.parse_event(&serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 1}
+            }
+        }));
+        let usage = usage_event.usage.expect("usage event");
+        assert_eq!(usage.prompt_tokens, Some(3));
+        assert_eq!(usage.completion_tokens, Some(2));
+        assert_eq!(usage.total_tokens, Some(5));
+        assert_eq!(usage.cached_prompt_tokens, Some(1));
+    }
+
+    #[test]
+    fn vllm_tokens_backend_reads_final_streaming_usage_for_preflight() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"token_ids\":[101]}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":512,",
+            "\"completion_tokens\":1,\"total_tokens\":513,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":496}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let usage = final_usage_from_sse(&VllmTokensBackend, body).expect("final usage");
+        assert_eq!(usage.prompt_tokens, Some(512));
+        assert_eq!(usage.completion_tokens, Some(1));
+        assert_eq!(usage.cached_prompt_tokens, Some(496));
+    }
 }

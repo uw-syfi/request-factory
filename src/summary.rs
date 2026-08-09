@@ -42,6 +42,8 @@ pub(crate) struct CommonReplaySummary {
     ttft_ms_p50: Option<f64>,
     ttft_ms_p90: Option<f64>,
     ttft_ms_max: Option<f64>,
+    ttft_token_id_steps: usize,
+    ttft_text_fallback_steps: usize,
     run_duration_ms: Option<f64>,
     request_throughput_per_s: Option<f64>,
     output_token_throughput_per_s: Option<f64>,
@@ -50,6 +52,11 @@ pub(crate) struct CommonReplaySummary {
     tpot_ms_p50: Option<f64>,
     tpot_ms_p90: Option<f64>,
     tpot_ms_max: Option<f64>,
+    completion_amortized_tpot_measured_steps: usize,
+    completion_amortized_tpot_ms_avg: Option<f64>,
+    completion_amortized_tpot_ms_p50: Option<f64>,
+    completion_amortized_tpot_ms_p90: Option<f64>,
+    completion_amortized_tpot_ms_max: Option<f64>,
     context_overflow_steps: usize,
 }
 
@@ -62,6 +69,7 @@ struct ReplayMeasurements {
     total_durations_ms: Vec<f64>,
     ttfts_ms: Vec<f64>,
     tpots_ms: Vec<f64>,
+    completion_amortized_tpots_ms: Vec<f64>,
     first_submit_timestamp: Option<f64>,
     last_complete_timestamp: Option<f64>,
     successful_output_tokens: usize,
@@ -107,7 +115,7 @@ impl ReplaySummary {
                 common.add(source.output_len_target, &record.outcome);
                 prefix_cache.add(source, &record.outcome);
             }
-            (Self::IndependentRequests { common }, SourceRecord::VibeSimRequest(source)) => {
+            (Self::IndependentRequests { common }, SourceRecord::IndependentRequest(source)) => {
                 common.add(source.output_len_target, &record.outcome)
             }
             _ => unreachable!("log source must match the selected replay workload"),
@@ -144,6 +152,11 @@ impl CommonReplaySummary {
             self.output_token_delta += outcome.output_len_actual as i64 - output_len_target as i64;
         }
         self.total_duration_ms_sum += outcome.total_duration_ms;
+        if outcome.first_token_id_ms.is_some() {
+            self.ttft_token_id_steps += 1;
+        } else if outcome.first_token_ms.is_some() {
+            self.ttft_text_fallback_steps += 1;
+        }
     }
 
     fn finalize(&mut self, measurements: &mut ReplayMeasurements) {
@@ -181,6 +194,27 @@ impl CommonReplaySummary {
             self.tpot_ms_max = measurements.tpots_ms.last().copied();
         }
 
+        if !measurements.completion_amortized_tpots_ms.is_empty() {
+            measurements
+                .completion_amortized_tpots_ms
+                .sort_by(|left, right| left.total_cmp(right));
+            self.completion_amortized_tpot_measured_steps =
+                measurements.completion_amortized_tpots_ms.len();
+            let sum: f64 = measurements.completion_amortized_tpots_ms.iter().sum();
+            self.completion_amortized_tpot_ms_avg =
+                Some(sum / self.completion_amortized_tpot_measured_steps as f64);
+            self.completion_amortized_tpot_ms_p50 = Some(percentile_sorted(
+                &measurements.completion_amortized_tpots_ms,
+                0.50,
+            ));
+            self.completion_amortized_tpot_ms_p90 = Some(percentile_sorted(
+                &measurements.completion_amortized_tpots_ms,
+                0.90,
+            ));
+            self.completion_amortized_tpot_ms_max =
+                measurements.completion_amortized_tpots_ms.last().copied();
+        }
+
         if let (Some(first_submit), Some(last_complete)) = (
             measurements.first_submit_timestamp,
             measurements.last_complete_timestamp,
@@ -200,7 +234,9 @@ impl CommonReplaySummary {
 impl ReplayMeasurements {
     fn add(&mut self, outcome: &GenerationOutcome) {
         self.total_durations_ms.push(outcome.total_duration_ms);
-        if let Some(ttft_ms) = outcome.first_token_ms {
+        if let Some(ttft_ms) = outcome.first_token_id_ms {
+            self.ttfts_ms.push(ttft_ms);
+        } else if let Some(ttft_ms) = outcome.first_token_ms {
             self.ttfts_ms.push(ttft_ms);
         }
         self.first_submit_timestamp = Some(
@@ -220,9 +256,12 @@ impl ReplayMeasurements {
             return;
         }
         self.successful_output_tokens += outcome.output_len_actual;
-        if let Some(ttft_ms) = outcome.first_token_ms {
+        if let Some(tpot_ms) = outcome.token_delivery_tpot_ms {
+            self.tpots_ms.push(tpot_ms);
+        }
+        if let Some(ttft_ms) = outcome.first_token_ms.or(outcome.first_token_id_ms) {
             if outcome.output_len_actual > 1 && outcome.total_duration_ms >= ttft_ms {
-                self.tpots_ms.push(
+                self.completion_amortized_tpots_ms.push(
                     (outcome.total_duration_ms - ttft_ms) / (outcome.output_len_actual - 1) as f64,
                 );
             }
@@ -232,7 +271,7 @@ impl ReplayMeasurements {
 
 impl PrefixCacheSummary {
     fn add(&mut self, source: &SessionRoundSource, outcome: &GenerationOutcome) {
-        self.planned_prefix_tokens += source.prefix_len;
+        self.planned_prefix_tokens += source.derived_prefix_len;
         self.planned_prompt_tokens += source.prompt_len;
         if let Some(usage) = &outcome.server_usage {
             if let (Some(cached), Some(prompt)) = (usage.cached_prompt_tokens, usage.prompt_tokens)
@@ -240,7 +279,7 @@ impl PrefixCacheSummary {
                 self.measured_cache_steps += 1;
                 self.measured_server_cached_prompt_tokens += cached;
                 self.measured_server_prompt_tokens += prompt;
-                self.planned_prefix_tokens_for_measured_cache_steps += source.prefix_len;
+                self.planned_prefix_tokens_for_measured_cache_steps += source.derived_prefix_len;
                 self.planned_prompt_tokens_for_measured_cache_steps += source.prompt_len;
             }
         }
@@ -272,6 +311,17 @@ impl PrefixCacheSummary {
 pub(crate) struct RunSummary {
     pub(crate) workload: WorkloadSummary,
     pub(crate) replay: ReplaySummary,
+    pub(crate) client_runtime: ClientRuntimeSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ClientRuntimeSummary {
+    /// Actual Tokio worker population of this process, not a CPU-count guess.
+    pub(crate) tokio_worker_threads: usize,
+    /// Peak sampled depth of Tokio's global injection queue. Worker-local
+    /// queues are not included, so this is one backlog signal rather than a
+    /// claim that every runnable task is counted.
+    pub(crate) sampled_global_queue_depth_peak: usize,
 }
 
 /// Drain logged requests to JSONL on disk and fold them into a typed replay summary.
@@ -396,6 +446,12 @@ mod tests {
         output_len_actual: usize,
         status: &str,
     ) -> GenerationOutcome {
+        let token_delivery_tpot_ms = match first_token_ms {
+            Some(first) if output_len_actual > 1 && total_duration_ms >= first => {
+                Some((total_duration_ms - first) / (output_len_actual - 1) as f64)
+            }
+            _ => None,
+        };
         GenerationOutcome {
             request_id: request_id.to_string(),
             output_len_actual,
@@ -406,6 +462,14 @@ mod tests {
             post_timestamp: Some(submit_timestamp),
             complete_timestamp,
             first_token_ms,
+            first_token_id_ms: first_token_ms,
+            last_token_id_ms: None,
+            first_token_event_tokens: 0,
+            token_event_count: 0,
+            usage_event_count: 0,
+            token_delivery_tpot_ms,
+            response_complete_ms: None,
+            terminal_tail_ms: None,
             total_duration_ms,
             chunk_count: output_len_actual,
             status: status.to_string(),
@@ -474,5 +538,79 @@ mod tests {
         assert!(summary.tpot_ms_p50.is_none());
         assert!(summary.tpot_ms_p90.is_none());
         assert!(summary.tpot_ms_max.is_none());
+    }
+
+    #[test]
+    fn canonical_metrics_use_token_events_and_retain_completion_audit() {
+        let mut measured_outcome = outcome("r1", 100.0, 101.0, 110.0, Some(10.0), 4, "SUCCESS");
+        measured_outcome.first_token_id_ms = Some(12.0);
+        measured_outcome.token_delivery_tpot_ms = Some(3.0);
+
+        let mut summary = CommonReplaySummary::default();
+        let mut measurements = ReplayMeasurements::default();
+        summary.add(4, &measured_outcome);
+        measurements.add(&measured_outcome);
+        summary.finalize(&mut measurements);
+
+        assert_close(summary.ttft_ms_avg, 12.0);
+        assert_eq!(summary.ttft_token_id_steps, 1);
+        assert_eq!(summary.ttft_text_fallback_steps, 0);
+        assert_close(summary.tpot_ms_avg, 3.0);
+        assert_close(summary.completion_amortized_tpot_ms_avg, 100.0 / 3.0);
+    }
+
+    #[test]
+    fn token_only_outcome_keeps_completion_amortized_audit() {
+        let mut measured_outcome = outcome("r1", 100.0, 101.0, 110.0, None, 4, "SUCCESS");
+        measured_outcome.first_token_id_ms = Some(10.0);
+        measured_outcome.token_delivery_tpot_ms = Some(3.0);
+
+        let mut summary = CommonReplaySummary::default();
+        let mut measurements = ReplayMeasurements::default();
+        summary.add(4, &measured_outcome);
+        measurements.add(&measured_outcome);
+        summary.finalize(&mut measurements);
+
+        assert_close(summary.completion_amortized_tpot_ms_avg, 100.0 / 3.0);
+    }
+
+    #[test]
+    fn prefix_summary_uses_policy_derived_prefix_not_raw_trace_prefix() {
+        let source = SessionRoundSource {
+            session_id: "session".to_string(),
+            round_idx: 1,
+            prefix_len: 10,
+            input_len: 90,
+            target_prompt_len: 100,
+            prompt_len: 100,
+            session_context_policy: "monotonic".to_string(),
+            derived_prefix_len: 80,
+            derived_append_len: 20,
+            major_compaction: false,
+            planned_prefix_hit_rate: Some(0.8),
+            output_len_target: 4,
+            tool_wait_after_ms: 0.0,
+            arrival_time_ms: 0.0,
+        };
+        let mut measured_outcome = outcome("r1", 0.0, 1.0, 10.0, Some(1.0), 4, "SUCCESS");
+        measured_outcome.server_usage = Some(crate::record::ServerUsageLog {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(4),
+            total_tokens: Some(104),
+            cached_prompt_tokens: Some(80),
+            uncached_prompt_tokens: Some(20),
+            prefix_hit_rate: Some(0.8),
+        });
+
+        let mut summary = PrefixCacheSummary::default();
+        summary.add(&source, &measured_outcome);
+        summary.finalize();
+
+        assert_close(summary.planned_prefix_hit_rate, 0.8);
+        assert_close(
+            summary.planned_prefix_hit_rate_for_measured_cache_steps,
+            0.8,
+        );
+        assert_close(summary.server_prefix_hit_rate_delta, 0.0);
     }
 }

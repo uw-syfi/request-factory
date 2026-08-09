@@ -3,10 +3,31 @@ use clap::{Parser, ValueEnum};
 use crate::trace::TraceFormat;
 
 /// Inference-server wire protocol selected with `--backend`.
-#[derive(ValueEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackendKind {
     /// OpenAI-compatible `/completions` (vLLM, and SGLang's OpenAI endpoint).
     Openai,
+    /// vLLM native token-in/token-out `/inference/v1/generate` endpoint.
+    VllmTokens,
+}
+
+/// How session rounds turn trace lengths into the next prompt token sequence.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionContextPolicy {
+    /// Reproduce the trace-reported prefix/new-append split exactly.
+    TraceReported,
+    /// Retain the full prior prompt plus exact output IDs, grow to the trace's
+    /// total input length, and reset only for a major compaction.
+    Monotonic,
+}
+
+impl SessionContextPolicy {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::TraceReported => "trace_reported",
+            Self::Monotonic => "monotonic",
+        }
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -33,16 +54,22 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) tokenizer: String,
 
-    /// vLLM OpenAI-compatible base URL, normally http://host:port/v1.
+    /// Protocol base URL. Use http://host:port/v1 for openai and
+    /// http://host:port for vllm-tokens.
     #[arg(long, default_value = "http://127.0.0.1:8000/v1")]
     pub(crate) base_url: String,
 
     #[arg(long)]
     pub(crate) model: String,
 
-    /// Inference-server wire protocol. `openai` covers vLLM and SGLang OpenAI endpoints.
+    /// Inference-server wire protocol. `vllm-tokens` requires vLLM --tokens-only.
     #[arg(long, value_enum, default_value = "openai")]
     pub(crate) backend: BackendKind,
+
+    /// Session prompt construction. `monotonic` requires exact generated token
+    /// IDs at runtime and never accepts text re-encoding for carry-forward.
+    #[arg(long, value_enum, default_value = "trace-reported")]
+    pub(crate) session_context_policy: SessionContextPolicy,
 
     #[arg(long, default_value_t = 0.0)]
     pub(crate) temperature: f64,
@@ -51,7 +78,7 @@ pub(crate) struct Args {
     #[arg(long, alias = "max-sessions")]
     pub(crate) max_items: Option<usize>,
 
-    /// Target top-level arrival rate: sessions/s for session traces, requests/s for VibeSim.
+    /// Target top-level arrival rate: sessions/s or independent requests/s.
     #[arg(long)]
     pub(crate) rate: Option<f64>,
 
@@ -75,17 +102,22 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) max_concurrency: Option<usize>,
 
-    /// Validate and summarize the workload without contacting vLLM.
+    /// Parse and statically summarize the workload without loading tokens or contacting a server.
     #[arg(long, default_value_t = false)]
     pub(crate) dry_run: bool,
 
-    /// Optional model context limit used for workload validation.
+    /// Optional model context limit used for static trace-target overflow reporting.
     #[arg(long)]
     pub(crate) max_model_len: Option<usize>,
 
-    /// If set with --max-model-len, skip rounds whose prompt length exceeds the limit.
-    #[arg(long, default_value_t = false)]
-    pub(crate) fail_on_context_overflow: bool,
+    /// Skip a request when prompt plus target output reaches the model limit,
+    /// reserving at least one token of context headroom.
+    #[arg(
+        long,
+        visible_aliases = ["skip-on-context-limit", "fail-on-context-overflow"],
+        default_value_t = false
+    )]
+    pub(crate) skip_when_reaching_limit: bool,
 
     /// Optional JSON summary path for one run.
     #[arg(long)]

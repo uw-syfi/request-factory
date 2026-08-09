@@ -1,10 +1,11 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-use crate::trace::{ReplayWorkload, SessionStep, VibeSimRequest};
+use crate::trace::{IndependentRequest, ReplayWorkload, SessionStep};
+use crate::util::reaches_context_limit;
 
 /// Source-specific dry-run summaries. Variants intentionally retain different
-/// fields: independent VibeSim requests do not have session prefix/tool metrics.
+/// fields: independent requests do not have session prefix/tool metrics.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum WorkloadSummary {
@@ -18,6 +19,7 @@ pub(crate) struct SessionWorkloadSummary {
     rounds: usize,
     first_context_overflow_round_idx: Option<usize>,
     first_context_overflow_prompt_len: Option<usize>,
+    first_context_overflow_requested_total_len: Option<usize>,
     max_prompt_len: usize,
     max_prefix_len: usize,
     max_input_len: usize,
@@ -32,6 +34,7 @@ pub(crate) struct IndependentRequestSummary {
     requests: usize,
     first_context_overflow_request_id: Option<String>,
     first_context_overflow_input_len: Option<usize>,
+    first_context_overflow_requested_total_len: Option<usize>,
     max_input_len: usize,
     max_output_len: usize,
     total_output_len: usize,
@@ -82,6 +85,7 @@ impl SessionWorkloadSummary {
             rounds: 0,
             first_context_overflow_round_idx: None,
             first_context_overflow_prompt_len: None,
+            first_context_overflow_requested_total_len: None,
             max_prompt_len: 0,
             max_prefix_len: 0,
             max_input_len: 0,
@@ -101,11 +105,14 @@ impl SessionWorkloadSummary {
                 summary.total_output_len += step.output_len;
                 summary.max_arrival_time_ms = summary.max_arrival_time_ms.max(step.arrival_time);
                 summary.total_tool_wait_after_ms += step.tool_wait_after_ms;
-                if max_model_len.is_some_and(|limit| prompt_len > limit)
+                if max_model_len
+                    .is_some_and(|limit| reaches_context_limit(prompt_len, step.output_len, limit))
                     && summary.first_context_overflow_round_idx.is_none()
                 {
                     summary.first_context_overflow_round_idx = Some(step.round_idx);
                     summary.first_context_overflow_prompt_len = Some(prompt_len);
+                    summary.first_context_overflow_requested_total_len =
+                        Some(prompt_len.saturating_add(step.output_len));
                 }
             }
         }
@@ -129,11 +136,12 @@ impl SessionWorkloadSummary {
 }
 
 impl IndependentRequestSummary {
-    fn from_requests(requests: &[VibeSimRequest], max_model_len: Option<usize>) -> Self {
+    fn from_requests(requests: &[IndependentRequest], max_model_len: Option<usize>) -> Self {
         let mut summary = Self {
             requests: requests.len(),
             first_context_overflow_request_id: None,
             first_context_overflow_input_len: None,
+            first_context_overflow_requested_total_len: None,
             max_input_len: 0,
             max_output_len: 0,
             total_output_len: 0,
@@ -144,11 +152,14 @@ impl IndependentRequestSummary {
             summary.max_output_len = summary.max_output_len.max(request.output_len);
             summary.total_output_len += request.output_len;
             summary.max_arrival_time_ms = summary.max_arrival_time_ms.max(request.arrival_time);
-            if max_model_len.is_some_and(|limit| request.input_len > limit)
-                && summary.first_context_overflow_request_id.is_none()
+            if max_model_len.is_some_and(|limit| {
+                reaches_context_limit(request.input_len, request.output_len, limit)
+            }) && summary.first_context_overflow_request_id.is_none()
             {
                 summary.first_context_overflow_request_id = Some(request.id.clone());
                 summary.first_context_overflow_input_len = Some(request.input_len);
+                summary.first_context_overflow_requested_total_len =
+                    Some(request.input_len.saturating_add(request.output_len));
             }
         }
         summary
@@ -163,5 +174,48 @@ impl IndependentRequestSummary {
             self.total_output_len,
             self.max_arrival_time_ms,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_static_limit_check_includes_output_and_reserves_headroom() {
+        let step = SessionStep {
+            session_id: "session".to_string(),
+            arrival_time: 0.0,
+            round_idx: 3,
+            prefix_len: 80,
+            input_len: 10,
+            output_len: 10,
+            tool_wait_after_ms: 0.0,
+        };
+        let sessions = BTreeMap::from([("session".to_string(), vec![step])]);
+
+        let summary = SessionWorkloadSummary::from_sessions(&sessions, Some(100));
+
+        assert_eq!(summary.first_context_overflow_round_idx, Some(3));
+        assert_eq!(summary.first_context_overflow_prompt_len, Some(90));
+        assert_eq!(
+            summary.first_context_overflow_requested_total_len,
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn independent_static_limit_check_allows_one_token_of_headroom() {
+        let request = IndependentRequest {
+            id: "request".to_string(),
+            input_len: 90,
+            output_len: 9,
+            arrival_time: 0.0,
+        };
+
+        let summary = IndependentRequestSummary::from_requests(&[request], Some(100));
+
+        assert!(summary.first_context_overflow_request_id.is_none());
+        assert!(summary.first_context_overflow_requested_total_len.is_none());
     }
 }

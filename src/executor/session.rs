@@ -2,12 +2,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use crate::backend::{context_overflow_result, GenerationResult};
-use crate::cli::Args;
+use crate::backend::{context_limit_skip_result, GenerationResult};
+use crate::cli::{Args, SessionContextPolicy};
 use crate::executor::AppState;
 use crate::record::StepLog;
-use crate::tokens::{PromptBuilder, TokenProvider};
+use crate::tokens::{PromptBuild, PromptBuilder, TokenProvider};
 use crate::trace::SessionStep;
+use crate::util::reaches_context_limit;
 
 /// Replay one session as an ordered, closed-loop chain of rounds.
 pub(crate) async fn run_session(
@@ -37,11 +38,23 @@ pub(crate) async fn run_session(
     let mut prompt_builder = PromptBuilder::new(token_provider);
 
     for step in steps {
-        let prompt_ids = prompt_builder.build_prompt(&step);
+        let PromptBuild {
+            prompt_ids,
+            derived_prefix_len,
+            derived_append_len,
+            major_compaction,
+        } = prompt_builder.build_prompt(&step, state.args.session_context_policy);
         let request_id = format!("{}_round_{:06}", session_id, step.round_idx);
         state.stats.record_submit();
-        let result = if should_skip_context_overflow(&state.args, prompt_ids.len()) {
-            context_overflow_result(request_id, prompt_ids.len(), state.args.max_model_len)
+        let context_limit_skipped =
+            should_skip_at_context_limit(&state.args, prompt_ids.len(), step.output_len);
+        let result = if context_limit_skipped {
+            context_limit_skip_result(
+                request_id,
+                prompt_ids.len(),
+                step.output_len,
+                state.args.max_model_len,
+            )
         } else {
             state
                 .client
@@ -49,15 +62,37 @@ pub(crate) async fn run_session(
                 .await
         };
         let GenerationResult {
-            outcome,
+            mut outcome,
             output_ids,
+            output_ids_exact,
         } = result;
-        let log = StepLog::session_round(&step, prompt_ids.len(), outcome);
+        let exact_context_failure = outcome.is_success()
+            && state.args.session_context_policy == SessionContextPolicy::Monotonic
+            && !output_ids_exact;
+        if exact_context_failure {
+            outcome.status = "FAILED".to_string();
+            outcome.error = Some(
+                "monotonic session context requires exact generated token IDs, but the server response supplied none or a count inconsistent with completion_tokens"
+                    .to_string(),
+            );
+        }
+        let log = StepLog::session_round(
+            &step,
+            prompt_ids.len(),
+            state.args.session_context_policy.label(),
+            derived_prefix_len,
+            derived_append_len,
+            major_compaction,
+            outcome,
+        );
         let success = log.outcome.is_success();
         let _ = log_tx.send(log).await;
 
         state.stats.record_result(success);
-        if !success && state.args.stop_session_on_error {
+        if context_limit_skipped
+            || exact_context_failure
+            || (!success && state.args.stop_session_on_error)
+        {
             break;
         }
 
@@ -73,12 +108,11 @@ pub(crate) async fn run_session(
     state.stats.record_unit_done();
 }
 
-fn should_skip_context_overflow(args: &Args, prompt_len: usize) -> bool {
-    args.fail_on_context_overflow
+fn should_skip_at_context_limit(args: &Args, prompt_len: usize, output_len_target: usize) -> bool {
+    args.skip_when_reaching_limit
         && args
             .max_model_len
-            .map(|limit| prompt_len > limit)
-            .unwrap_or(false)
+            .is_some_and(|limit| reaches_context_limit(prompt_len, output_len_target, limit))
 }
 
 async fn wait_for_session_arrival(state: &AppState, steps: &[SessionStep]) {
