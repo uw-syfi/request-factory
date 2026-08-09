@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::backend::{context_limit_skip_result, GenerationResult};
-use crate::cli::{Args, SessionContextPolicy};
+use crate::cli::Args;
+use tracelab_replay::policy::SessionContextPolicy;
 use crate::executor::AppState;
 use crate::record::StepLog;
 use crate::tokens::{PromptBuild, PromptBuilder, TokenProvider};
@@ -42,9 +43,11 @@ pub(crate) async fn run_session(
             prompt_ids,
             derived_prefix_len,
             derived_append_len,
+            prefix_shortfall_len,
+            folded_tokens,
             major_compaction,
         } = prompt_builder.build_prompt(&step, state.args.session_context_policy);
-        let request_id = format!("{}_round_{:06}", session_id, step.round_idx);
+        let request_id = step.request_id.clone();
         state.stats.record_submit();
         let context_limit_skipped =
             should_skip_at_context_limit(&state.args, prompt_ids.len(), step.output_len);
@@ -67,7 +70,7 @@ pub(crate) async fn run_session(
             output_ids_exact,
         } = result;
         let exact_context_failure = outcome.is_success()
-            && state.args.session_context_policy == SessionContextPolicy::Monotonic
+            && state.args.session_context_policy == SessionContextPolicy::PrefixPreserving
             && !output_ids_exact;
         if exact_context_failure {
             outcome.status = "FAILED".to_string();
@@ -82,6 +85,8 @@ pub(crate) async fn run_session(
             state.args.session_context_policy.label(),
             derived_prefix_len,
             derived_append_len,
+            prefix_shortfall_len,
+            folded_tokens,
             major_compaction,
             outcome,
         );

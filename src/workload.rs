@@ -1,7 +1,6 @@
 use serde::Serialize;
-use std::collections::BTreeMap;
 
-use crate::trace::{IndependentRequest, ReplayWorkload, SessionStep};
+use crate::trace::{IndependentRequest, ReplayWorkload, SessionPlans};
 use crate::util::reaches_context_limit;
 
 /// Source-specific dry-run summaries. Variants intentionally retain different
@@ -77,7 +76,7 @@ impl WorkloadSummary {
 
 impl SessionWorkloadSummary {
     fn from_sessions(
-        sessions: &BTreeMap<String, Vec<SessionStep>>,
+        sessions: &SessionPlans,
         max_model_len: Option<usize>,
     ) -> Self {
         let mut summary = Self {
@@ -94,7 +93,7 @@ impl SessionWorkloadSummary {
             max_arrival_time_ms: 0.0,
             total_tool_wait_after_ms: 0.0,
         };
-        for steps in sessions.values() {
+        for (_, steps) in sessions.iter() {
             for step in steps {
                 let prompt_len = step.prefix_len.saturating_add(step.input_len);
                 summary.rounds += 1;
@@ -180,10 +179,12 @@ impl IndependentRequestSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::SessionStep;
 
     #[test]
     fn session_static_limit_check_includes_output_and_reserves_headroom() {
         let step = SessionStep {
+            request_id: "session_round_000000".to_string(),
             session_id: "session".to_string(),
             arrival_time: 0.0,
             round_idx: 3,
@@ -192,7 +193,7 @@ mod tests {
             output_len: 10,
             tool_wait_after_ms: 0.0,
         };
-        let sessions = BTreeMap::from([("session".to_string(), vec![step])]);
+        let sessions: SessionPlans = vec![("session".to_string(), vec![step])];
 
         let summary = SessionWorkloadSummary::from_sessions(&sessions, Some(100));
 

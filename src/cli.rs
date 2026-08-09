@@ -1,5 +1,7 @@
 use clap::{Parser, ValueEnum};
 
+use tracelab_replay::policy::SessionContextPolicy;
+
 use crate::trace::TraceFormat;
 
 /// Inference-server wire protocol selected with `--backend`.
@@ -11,25 +13,6 @@ pub(crate) enum BackendKind {
     VllmTokens,
     /// SGLang native token-in/token-out `/generate` endpoint.
     SglangTokens,
-}
-
-/// How session rounds turn trace lengths into the next prompt token sequence.
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SessionContextPolicy {
-    /// Reproduce the trace-reported prefix/new-append split exactly.
-    TraceReported,
-    /// Reuse the prior prompt plus exact output IDs up to the trace's total
-    /// input length, append when it grows, and reset only for a major compaction.
-    Monotonic,
-}
-
-impl SessionContextPolicy {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::TraceReported => "trace_reported",
-            Self::Monotonic => "monotonic",
-        }
-    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -73,8 +56,9 @@ pub(crate) struct Args {
     #[arg(long, value_enum, default_value = "openai")]
     pub(crate) backend: BackendKind,
 
-    /// Session prompt construction. `monotonic` requires exact generated token
-    /// IDs at runtime and never accepts text re-encoding for carry-forward.
+    /// How a raw session trace's reported prefix becomes a replayable one.
+    /// Rejected with `--trace-format session-execution-v2`, whose policy was
+    /// already resolved when the trace was generated.
     #[arg(long, value_enum, default_value = "trace-reported")]
     pub(crate) session_context_policy: SessionContextPolicy,
 

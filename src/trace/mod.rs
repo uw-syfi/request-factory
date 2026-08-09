@@ -3,22 +3,27 @@ mod session;
 
 use anyhow::{anyhow, Result};
 use clap::ValueEnum;
-use std::collections::BTreeMap;
 
 pub(crate) use independent::IndependentRequest;
-pub(crate) use session::SessionStep;
+pub(crate) use session::{SessionPlans, SessionStep};
 
 /// Source schema selector. Each frontend retains its own typed workload rather
 /// than filling absent fields in a universal row with zeros or nulls.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TraceFormat {
     Independent,
+    /// Legacy raw session rounds, whose `prefix_len` is what the source
+    /// reported. Needs a runtime context policy to become replayable.
     Session,
+    /// Canonical, already-materialized execution trace shared with the
+    /// simulator. Carries no policy switch.
+    #[value(name = "session-execution-v2")]
+    SessionExecutionV2,
 }
 
 /// Typed replay plans produced by the trace frontends.
 pub(crate) enum ReplayWorkload {
-    Sessions(BTreeMap<String, Vec<SessionStep>>),
+    Sessions(SessionPlans),
     IndependentRequests(Vec<IndependentRequest>),
 }
 
@@ -41,6 +46,9 @@ pub(crate) fn load_workload(
             independent::load(path, max_items).map(ReplayWorkload::IndependentRequests)
         }
         TraceFormat::Session => session::load(path, max_items).map(ReplayWorkload::Sessions),
+        TraceFormat::SessionExecutionV2 => {
+            session::load_execution_v2(path, max_items).map(ReplayWorkload::Sessions)
+        }
     }
 }
 
@@ -63,8 +71,8 @@ impl ReplayWorkload {
         match self {
             Self::Sessions(sessions) => arrival_rate(
                 sessions
-                    .values()
-                    .filter_map(|steps| steps.first())
+                    .iter()
+                    .filter_map(|(_, steps)| steps.first())
                     .map(|step| step.arrival_time),
             ),
             Self::IndependentRequests(requests) => {
@@ -88,7 +96,7 @@ impl ReplayWorkload {
         }
         match self {
             Self::Sessions(sessions) => {
-                for step in sessions.values_mut().flatten() {
+                for step in sessions.iter_mut().flat_map(|(_, steps)| steps) {
                     step.arrival_time *= time_scale;
                 }
             }
@@ -151,6 +159,7 @@ mod tests {
 
     fn step(session_id: &str, arrival_time: f64, round_idx: usize) -> SessionStep {
         SessionStep {
+            request_id: tracelab_replay::v2::request_id(session_id, round_idx),
             session_id: session_id.to_string(),
             arrival_time,
             round_idx,
@@ -195,8 +204,8 @@ mod tests {
         let ReplayWorkload::Sessions(sessions) = sessions else {
             panic!()
         };
-        assert!(sessions["1"].iter().all(|step| step.arrival_time == 250.0));
-        assert!(sessions["2"].iter().all(|step| step.arrival_time == 500.0));
+        assert!(sessions[1].1.iter().all(|step| step.arrival_time == 250.0));
+        assert!(sessions[2].1.iter().all(|step| step.arrival_time == 500.0));
     }
 
     #[test]
@@ -209,7 +218,8 @@ mod tests {
             panic!()
         };
         let scaled: Vec<f64> = sessions
-            .values()
+            .iter()
+            .map(|(_, steps)| steps)
             .map(|steps| steps[0].arrival_time)
             .collect();
         assert_eq!(scaled, vec![37.5, 37.5, 112.5, 337.5]);

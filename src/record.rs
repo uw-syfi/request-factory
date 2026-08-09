@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::trace::{IndependentRequest, SessionStep};
 use crate::util::prefix_hit_rate;
 
-const STEP_LOG_SCHEMA_VERSION: u32 = 7;
+const STEP_LOG_SCHEMA_VERSION: u32 = 8;
 
 /// One JSONL record: a typed source plus measurements shared by text generation.
 ///
@@ -39,6 +39,15 @@ pub(crate) struct SessionRoundSource {
     /// planned cache hit rate.
     pub(crate) derived_prefix_len: usize,
     pub(crate) derived_append_len: usize,
+    /// Raw trace prefix tokens the context policy moved into fresh input because
+    /// the replayed conversation had not produced them. Large and expected on a
+    /// session's first round, where a real trace usually reports a prefix that
+    /// the published data does not contain.
+    pub(crate) folded_prefix_tokens: usize,
+    /// Planned prefix tokens the *live* conversation could not supply, filled
+    /// with fresh ids instead. Nonzero only after a short or failed round; this
+    /// is the one place a live run departs from its materialized plan.
+    pub(crate) prefix_shortfall_tokens: usize,
     pub(crate) major_compaction: bool,
     pub(crate) planned_prefix_hit_rate: Option<f64>,
     pub(crate) output_len_target: usize,
@@ -127,6 +136,8 @@ impl StepLog {
         session_context_policy: &str,
         derived_prefix_len: usize,
         derived_append_len: usize,
+        folded_prefix_tokens: usize,
+        prefix_shortfall_tokens: usize,
         major_compaction: bool,
         outcome: GenerationOutcome,
     ) -> Self {
@@ -142,6 +153,8 @@ impl StepLog {
                 session_context_policy: session_context_policy.to_string(),
                 derived_prefix_len,
                 derived_append_len,
+                folded_prefix_tokens,
+                prefix_shortfall_tokens,
                 major_compaction,
                 planned_prefix_hit_rate: Some(prefix_hit_rate(derived_prefix_len, prompt_len)),
                 output_len_target: step.output_len,
@@ -218,6 +231,7 @@ mod tests {
     #[test]
     fn session_record_keeps_session_fields_inside_tagged_source() {
         let step = SessionStep {
+            request_id: "s1_round_000002".to_string(),
             session_id: "s1".to_string(),
             arrival_time: 0.0,
             round_idx: 2,
@@ -232,13 +246,15 @@ mod tests {
             "trace_reported",
             8,
             4,
+            0,
+            0,
             false,
             outcome(),
         ))
         .unwrap();
 
         assert_eq!(value["source"]["type"], "session_round");
-        assert_eq!(value["schema_version"], 7);
+        assert_eq!(value["schema_version"], 8);
         assert_eq!(value["source"]["data"]["prefix_len"], 8);
         assert_eq!(value["source"]["data"]["derived_prefix_len"], 8);
         assert_eq!(value["source"]["data"]["derived_append_len"], 4);
