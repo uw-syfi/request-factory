@@ -96,6 +96,9 @@ struct Manifest {
     millisecond_decimals: usize,
     selection_rule: &'static str,
     max_sessions: Option<usize>,
+    /// Source arrival subtracted from every session so this trace starts at its
+    /// own origin. Recorded so a row can be traced back to the source timeline.
+    arrival_origin_ms: f64,
     sessions: usize,
     rounds: usize,
     /// How much of the raw trace was not replayable as reported. These are the
@@ -129,9 +132,19 @@ fn main() -> Result<()> {
     let mut rows: Vec<ExecutionRow> = Vec::new();
     let mut manifest = new_manifest(&args)?;
 
+    // Rebase onto this trace's own origin. Source arrivals are offsets within
+    // the whole dataset, so any subset would otherwise open with a lead-in that
+    // belongs to sessions it does not contain — a consumer would idle through it
+    // for no reason, and two subsets of one source would not be comparable.
+    let arrival_origin_ms = selected
+        .first()
+        .map(|(_, rounds)| rounds[0].arrival_time)
+        .unwrap_or(0.0);
+    manifest.arrival_origin_ms = arrival_origin_ms;
+
     for (session_id, rounds) in &selected {
         let mut chain = ContextChain::new();
-        let arrival_time_ms = rounds[0].arrival_time;
+        let arrival_time_ms = rounds[0].arrival_time - arrival_origin_ms;
         for (round_idx, raw) in rounds.iter().enumerate() {
             let materialized = chain.materialize(
                 RawRound {
@@ -232,6 +245,7 @@ fn new_manifest(args: &Args) -> Result<Manifest> {
         millisecond_decimals: MILLISECOND_DECIMALS,
         selection_rule: "first_n_by_arrival_then_source_order",
         max_sessions: args.max_sessions,
+        arrival_origin_ms: 0.0,
         sessions: 0,
         rounds: 0,
         folded_prefix_tokens: 0,

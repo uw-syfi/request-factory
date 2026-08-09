@@ -44,8 +44,9 @@ pub struct ExecutionRow {
     pub request_id: String,
     pub session_id: String,
     pub round_idx: usize,
-    /// Session start offset. Identical on every row of one session; only round 0
-    /// consumes it, later rounds release from their predecessor's completion.
+    /// Session start offset from the beginning of *this* trace. Identical on
+    /// every row of one session; only round 0 consumes it, later rounds release
+    /// from their predecessor's completion.
     pub arrival_time_ms: f64,
     /// Cache-eligible leading prefix copied from the previous realized context.
     /// Eligible, never a guaranteed hit.
@@ -92,6 +93,18 @@ pub fn load(path: &str) -> Result<Vec<ExecutionRow>> {
 pub fn validate(rows: &[ExecutionRow]) -> Result<()> {
     if rows.is_empty() {
         bail!("trace has no rows");
+    }
+
+    // A canonical trace is self-contained: its clock starts when it does. A file
+    // carved out of a larger source keeps that source's absolute offsets unless
+    // it is rebased, and a consumer then idles through a lead-in that belongs to
+    // sessions the file does not contain.
+    if rows[0].arrival_time_ms != 0.0 {
+        bail!(
+            "line 2: the earliest arrival_time_ms is {}, expected 0 — a canonical trace \
+             is rebased so its own first session arrives at the origin",
+            rows[0].arrival_time_ms
+        );
     }
 
     let mut seen_request_ids: HashSet<&str> = HashSet::new();
@@ -268,6 +281,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_trace_that_does_not_start_at_the_origin() {
+        let rows = vec![row("a", 0, 1_173_758.075312, 0, 512)];
+        let error = validate(&rows).unwrap_err().to_string();
+        assert!(error.contains("rebased"), "{error}");
+    }
+
+    #[test]
     fn rejects_a_nonzero_prefix_on_a_first_round() {
         let rows = vec![row("a", 0, 0.0, 128, 512)];
         let error = validate(&rows).unwrap_err().to_string();
@@ -301,7 +321,7 @@ mod tests {
 
     #[test]
     fn rejects_session_blocks_out_of_arrival_order() {
-        let rows = vec![row("a", 0, 100.0, 0, 512), row("b", 0, 10.0, 0, 400)];
+        let rows = vec![row("a", 0, 0.0, 0, 512), row("b", 0, -0.0, 0, 400), row("c", 0, 100.0, 0, 1), row("d", 0, 10.0, 0, 1)];
         let error = validate(&rows).unwrap_err().to_string();
         assert!(error.contains("nondecreasing"), "{error}");
     }
