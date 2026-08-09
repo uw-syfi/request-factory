@@ -110,9 +110,12 @@ impl PromptBuilder {
             };
         }
 
-        let mut prompt_ids = self.context_tokens.clone();
-        let derived_prefix_len = prompt_ids.len();
-        let derived_append_len = target_prompt_len.saturating_sub(derived_prefix_len);
+        // A non-major reduction is still the same conversation: keep the exact
+        // leading token-ID prefix, but truncate it to the trace target instead
+        // of letting the live prompt grow beyond the recorded workload shape.
+        let derived_prefix_len = previous_context_len.min(target_prompt_len);
+        let mut prompt_ids = self.context_tokens[..derived_prefix_len].to_vec();
+        let derived_append_len = target_prompt_len - derived_prefix_len;
         prompt_ids.extend(self.token_provider.take(derived_append_len));
         PromptBuild {
             prompt_ids,
@@ -153,17 +156,17 @@ mod tests {
     }
 
     #[test]
-    fn monotonic_policy_retains_full_context_across_small_reduction() {
+    fn monotonic_policy_truncates_to_target_across_small_reduction() {
         let mut builder = builder(200_000);
-        builder.context_tokens = vec![7; 10_000];
+        builder.context_tokens = (0..10_000).collect();
+        let expected_prefix = builder.context_tokens[..9_500].to_vec();
 
         let built = builder.build_prompt(&step(8_500, 1_000), SessionContextPolicy::Monotonic);
 
-        assert_eq!(built.prompt_ids.len(), 10_000);
-        assert_eq!(built.derived_prefix_len, 10_000);
+        assert_eq!(built.prompt_ids, expected_prefix);
+        assert_eq!(built.derived_prefix_len, 9_500);
         assert_eq!(built.derived_append_len, 0);
         assert!(!built.major_compaction);
-        assert!(built.prompt_ids.iter().all(|token_id| *token_id == 7));
     }
 
     #[test]
@@ -211,15 +214,17 @@ mod tests {
     }
 
     #[test]
-    fn monotonic_policy_keeps_context_when_only_one_major_threshold_matches() {
+    fn monotonic_policy_truncates_without_reset_when_only_one_major_threshold_matches() {
         let mut builder = builder(200_000);
         builder.context_tokens = vec![7; 200_000];
 
         let built = builder.build_prompt(&step(130_000, 0), SessionContextPolicy::Monotonic);
 
-        assert_eq!(built.prompt_ids.len(), 200_000);
-        assert_eq!(built.derived_prefix_len, 200_000);
+        assert_eq!(built.prompt_ids.len(), 130_000);
+        assert_eq!(built.derived_prefix_len, 130_000);
+        assert_eq!(built.derived_append_len, 0);
         assert!(!built.major_compaction);
+        assert!(built.prompt_ids.iter().all(|token_id| *token_id == 7));
     }
 }
 
