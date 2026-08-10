@@ -43,13 +43,21 @@ per axis.
 
 ### Axis 1 — trace format
 
-Two separate typed frontends with separate schemas. An independent request is
-never rewritten into a session row with placeholder fields.
+Two typed frontends with separate schemas, and two accepted session schemas. An
+independent request is never rewritten into a session row with placeholder
+fields.
 
 | Value | Row means | Execution |
 |---|---|---|
-| `session` | One round of a multi-round session | Rounds of one session are closed-loop: submit round `i`, await its full response, wait `tool_wait_after_ms`, then submit round `i + 1` |
+| `session-execution-v2` | One **already-materialized** round of a session | Same execution as `session`, but the prompt split is fixed in the file rather than derived at run time |
+| `session` | One round of a multi-round session, as the source reported it | Rounds of one session are closed-loop: submit round `i`, await its full response, wait `tool_wait_after_ms`, then submit round `i + 1` |
 | `independent` | One standalone request | One-shot; rows never share context |
+
+Prefer `session-execution-v2` for anything compared against a simulated run:
+it is the only format whose `prefix_len` is guaranteed to exist when the round
+runs, so both runtimes replay identical work without agreeing on a policy. Use
+raw `session` when you are exploring how a policy changes the workload — that
+is the choice the canonical format has already made for you.
 
 ### Axis 2 — session context policy (prefix-cache assumption)
 
@@ -109,11 +117,15 @@ detokenizes. See [Request backends](#request-backends) for the comparison.
 
 ### Cross-axis constraints
 
-The axes are independent with exactly four exceptions, all enforced by the
+The axes are independent with exactly five exceptions, all enforced by the
 runner:
 
 - `monotonic` (axis 2) requires `--trace-format session` (axis 1). The
   combination is rejected before the trace is even loaded.
+- Any explicit `--session-context-policy` (axis 2) is rejected with
+  `--trace-format session-execution-v2` (axis 1): that trace carries no policy
+  switch, because the policy was resolved when the file was generated and is
+  recorded in its manifest.
 - `monotonic` (axis 2) requires exact generated token IDs, so axis 4 must be a
   native token endpoint (`vllm-tokens`, `sglang-tokens`) or an `openai`
   endpoint that honours `return_token_ids`. A server that ignores the extension
@@ -331,13 +343,78 @@ prefix caching, token mode, and `stream_interval`.
 
 ## Input CSV formats
 
-Select the parser explicitly with `--trace-format session` or
-`--trace-format independent`. The schemas are intentionally separate: independent
-requests are not converted into fake session rows with placeholder fields.
+Select the parser explicitly with `--trace-format session-execution-v2`,
+`--trace-format session`, or `--trace-format independent`. The schemas are
+intentionally separate: independent requests are not converted into fake session
+rows with placeholder fields, and a header is never used to guess which schema a
+file is.
+
+### Canonical execution CSV — `session-execution-v2`
+
+The recommended input. Every column is already materialized, so the file is the
+whole contract and the runner has nothing left to decide:
+
+```csv
+request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms
+1150_round_000000,1150,0,0.000000,0,4211,151,54.000000
+1150_round_000001,1150,1,0.000000,4362,238,147,61.000000
+```
+
+| Column | Unit/type | Contract |
+|---|---|---|
+| `request_id` | String | Exactly `{session_id}_round_{round_idx:06}`. Validated, not trusted. |
+| `session_id` | String | Opaque session identity. |
+| `round_idx` | Non-negative integer | Contiguous from `0` within each session. |
+| `arrival_time_ms` | Milliseconds, 6 decimals | Identical on every row of a session. The earliest arrival in the file is `0`. |
+| `prefix_len` | Tokens | Reusable prefix that **will exist** when the round runs. `0` on round `0`. |
+| `input_len` | Tokens | Fresh tokens appended this round. May be `0` only when a prefix exists. |
+| `output_len` | Tokens | Sent as `max_tokens` with EOS ignored. |
+| `tool_wait_after_ms` | Milliseconds, 6 decimals | Delay before the next round of the same session. |
+
+What the format buys, and what it costs:
+
+- **No runtime policy.** `--session-context-policy` is rejected outright. Two
+  runtimes replaying the file do identical work without having to agree on
+  anything beyond the bytes.
+- **Rebased arrivals.** A canonical trace starts at its own origin, so a
+  three-session subset of a month-long dataset does not open with weeks of dead
+  time.
+- **Row order is the contract.** Rows of a session are contiguous, sessions are
+  nondecreasing by arrival, and no consumer may re-sort by identifier — dense
+  internal IDs are assigned in file order on both sides.
+- The cost is that the fold decision is frozen. To ask "what if the prefix
+  assumption were different", regenerate the file, do not switch a flag.
+
+Generate one from a raw session trace with `tracegen`:
+
+```bash
+cargo run --release --manifest-path replay/Cargo.toml --bin tracegen -- \
+  --source raw_sessions.csv \
+  --policy trace-reported \
+  --max-sessions 200 \
+  --out trace/execution.csv
+```
+
+It writes `execution.csv` plus `execution.manifest.json` and
+`execution.plan.json` beside it. The manifest records the source hash, the
+policy and its thresholds, the selection rule, how many tokens were folded from
+prefix into fresh input, and the planned prefix hit rate — read it before
+quoting any cache number, because a fold that is large is not a bug but does
+mean the source attributed to cache what the replay must actually prefill. The
+plan is the normalized per-round expansion, which is what a simulator compares
+against to prove both sides scheduled the same work.
+
+`--policy` is the one real choice:
+
+| Policy | Keeps | Use when |
+|---|---|---|
+| `trace-reported` | The reported prefix/input split; any prefix the replayed conversation cannot supply is folded into fresh input | You want the trace's own prompt shape, honestly cold where the source was warm |
+| `prefix-preserving` | The longest prefix the conversation can actually supply, truncated to the trace's total, reset only on major compaction | You want maximum realistic cache reuse |
 
 ### Session CSV
 
-The recommended, canonical TraceLab export is:
+The raw, pre-materialization schema. Its `prefix_len` is whatever the source
+reported, which is why this format still needs a runtime policy:
 
 ```csv
 id,input_len,output_len,arrival_time,round_idx,tool_wait_after_ms,prefix_len
@@ -392,6 +469,8 @@ session context.
 
 Select this frontend with `--trace-format independent`. Its schema and runtime
 semantics are generic and do not depend on any simulator or trace producer.
+There is no canonical variant of it: with no context to carry forward, there is
+nothing for a policy to materialize.
 
 ## Session context policies
 
@@ -728,27 +807,41 @@ this zero-fill cannot mean "the server never reports cache detail at all".
 
 ## Output contracts
 
-### Per-request JSONL — schema v7
+### Per-request JSONL — schema v8
 
 `--log-path` receives one typed record per attempted request. Session and
 independent-request source data are tagged variants rather than one sparse
 object.
 
-v7 adds `outcome.echoed_prompt_tokens`: leading generated IDs that repeated the
+v8 adds two prefix-accounting fields to session rounds, which together separate
+a *planned* departure from the source trace from an *unplanned* one at run time:
+
+- `folded_prefix_tokens` — prefix the source reported that the replayed
+  conversation never produced, folded into fresh input. Large and expected on a
+  session's first round, since a real coding agent resumes from context the
+  published trace does not contain. Under `session-execution-v2` this is already
+  baked into the file and the manifest reports the total.
+- `prefix_shortfall_tokens` — planned prefix the *live* conversation could not
+  supply, filled with fresh ids instead. This is the one place a live run
+  departs from its materialized plan, so a nonzero value means a short or failed
+  round upstream, not a trace property. Neither field is ever counted as a cache
+  hit.
+
+v7 added `outcome.echoed_prompt_tokens`: leading generated IDs that repeated the
 prompt tail and were dropped before carry-forward. It is `0` on every server
 that does not echo, which is all of them today apart from the SGLang case
-described under [Request backends](#request-backends). The addition is purely
+described under [Request backends](#request-backends). Both additions are purely
 additive; consumers reading `outcome.status` or `outcome.request_id` are
 unaffected.
 
 Abbreviated session example:
 
 <details>
-<summary><b>View a schema-v6 session record</b></summary>
+<summary><b>View a schema-v8 session record</b></summary>
 
 ```json
 {
-  "schema_version": 7,
+  "schema_version": 8,
   "source": {
     "type": "session_round",
     "data": {
@@ -761,6 +854,8 @@ Abbreviated session example:
       "session_context_policy": "monotonic",
       "derived_prefix_len": 576,
       "derived_append_len": 128,
+      "folded_prefix_tokens": 0,
+      "prefix_shortfall_tokens": 0,
       "major_compaction": false,
       "planned_prefix_hit_rate": 0.8181818182,
       "output_len_target": 64,
@@ -799,8 +894,13 @@ join key against server-side logs. Its shape depends on the frontend:
 
 | Frontend | `request_id` | Example |
 |---|---|---|
-| `session` | `{session_id}_round_{round_idx:06}` | `session-0_round_000001` |
+| `session`, `session-execution-v2` | `{session_id}_round_{round_idx:06}` | `session-0_round_000001` |
 | `independent` | `independent_{id}` | `independent_request-0` |
+
+Under `session-execution-v2` the file carries `request_id` as a column, and the
+runner validates that it matches this form rather than trusting it — so the join
+key against server logs is the same string in the trace, the client log, and the
+server log.
 
 ### Run summary
 
@@ -893,6 +993,9 @@ token-level plan.
 | `monotonic session context requires exact generated token IDs` | The endpoint omitted token IDs or their count disagreed with `completion_tokens`. Use a vLLM endpoint supporting `return_token_ids`, or use `vllm-tokens`. Do not work around this with text re-tokenization. |
 | `server streamed cumulative output` | The SGLang server is in its default cumulative streaming mode. Relaunch it with `--stream-output` (named `--incremental-streaming-output` in newer builds). |
 | `the extra leading ids do not match the prompt tail` | The server streamed more generated IDs than its own `completion_tokens` count, and the excess is not an echo of the prompt. TraceLab refuses to guess what those IDs are; inspect the raw response before trusting the run. |
+| `--trace-format session-execution-v2 carries no context policy` | The canonical trace resolved its policy at generation time. Drop `--session-context-policy`, or regenerate with `tracegen --policy`. |
+| `--rate ... --arrival-mode saturated` rejected | One rescales the recorded timeline, the other discards it. To bound a saturated run, use `--max-concurrency`. |
+| `--max-concurrency` appears to change nothing | The units never overlap, so the cap never binds. Check the trace's arrival spacing against its per-unit duration; to force overlap, use `--arrival-mode saturated`. |
 | `cannot apply --rate` | The selected workload has fewer than two distinct top-level arrival times. |
 | Token-pool repetition warning | Supply a larger corpus or increase `--token-pool-limit`. |
 | `SKIPPED_CONTEXT_OVERFLOW` | Compatibility status name: actual prompt plus target output reached `--max-model-len` while `--skip-when-reaching-limit` was enabled. The request was not sent. |
@@ -919,8 +1022,8 @@ Every flag `session_runner` accepts. The axis columns map back to
 
 | Flag | Default | Values |
 |---|---|---|
-| `--trace-format` | `session` | `session`, `independent` — axis 1 |
-| `--session-context-policy` | `trace-reported` | `trace-reported`, `monotonic` — axis 2. `monotonic` requires `--trace-format session` |
+| `--trace-format` | `session` | `session-execution-v2`, `session`, `independent` — axis 1 |
+| `--session-context-policy` | `trace-reported` | `trace-reported`, `monotonic` (alias of `prefix-preserving`) — axis 2. `monotonic` requires `--trace-format session`; any explicit value is rejected with `session-execution-v2` |
 | `--backend` | `openai` | `openai`, `vllm-tokens`, `sglang-tokens` — axis 4 |
 | `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for `openai`, omit it for the native token endpoints |
 
