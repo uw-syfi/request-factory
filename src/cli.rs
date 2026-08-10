@@ -5,6 +5,22 @@ use tracelab_replay::policy::SessionContextPolicy;
 use crate::trace::TraceFormat;
 
 /// Inference-server wire protocol selected with `--backend`.
+/// Which of the two release axes supplies a unit's start time.
+///
+/// The other axis is `--max-concurrency`. They compose freely: a capped
+/// trace-timed run replays the recorded timeline but never exceeds the cap, and
+/// a capped saturated run is a pure closed-loop generator.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArrivalMode {
+    /// Replay the trace's own arrival timeline, rescaled by `--rate`.
+    #[value(name = "trace-timed")]
+    TraceTimed,
+    /// Ignore recorded arrivals: every unit is eligible from the start, so a
+    /// unit enters as soon as capacity allows. Without a cap this submits the
+    /// whole workload at once.
+    Saturated,
+}
+
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackendKind {
     /// OpenAI-compatible `/completions` (vLLM, and SGLang's OpenAI endpoint).
@@ -70,8 +86,14 @@ pub(crate) struct Args {
     pub(crate) max_items: Option<usize>,
 
     /// Target top-level arrival rate: sessions/s or independent requests/s.
+    /// Only meaningful under `--arrival-mode trace-timed`.
     #[arg(long)]
     pub(crate) rate: Option<f64>,
+
+    /// Where release times come from. Orthogonal to `--max-concurrency`:
+    /// arrival says when a unit *may* start, capacity says how many may run.
+    #[arg(long, value_enum, default_value = "trace-timed")]
+    pub(crate) arrival_mode: ArrivalMode,
 
     #[arg(long, default_value = "session_runner_output.jsonl")]
     pub(crate) log_path: String,

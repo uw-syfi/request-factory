@@ -15,15 +15,17 @@ use std::time::Instant;
 use tokio::sync::{mpsc, Semaphore};
 
 use backend::GenerationClient;
-use cli::Args;
-use tracelab_replay::policy::SessionContextPolicy;
-use executor::{run_independent_request, run_session, status_task, AppState, Stats};
+use cli::{Args, ArrivalMode};
+use executor::{
+    run_independent_request, run_session, status_task, AdmissionOrder, AppState, Stats,
+};
 use record::StepLog;
 use summary::{
     write_logs, write_summary_if_requested, ClientRuntimeSummary, ReplaySummary, RunSummary,
 };
 use tokens::{build_token_pool, load_tokenizer};
 use trace::{load_workload, ReplayWorkload, TraceFormat};
+use tracelab_replay::policy::SessionContextPolicy;
 use workload::WorkloadSummary;
 
 #[tokio::main]
@@ -33,6 +35,12 @@ async fn main() -> Result<()> {
 
     if args.max_concurrency == Some(0) {
         return Err(anyhow!("--max-concurrency must be greater than 0"));
+    }
+    if args.arrival_mode == ArrivalMode::Saturated && args.rate.is_some() {
+        return Err(anyhow!(
+            "--rate rescales the trace's arrival timeline, which --arrival-mode saturated \
+             discards. Drop one of them; to bound a saturated run, use --max-concurrency."
+        ));
     }
     if args.skip_when_reaching_limit && args.max_model_len.is_none() {
         return Err(anyhow!(
@@ -58,7 +66,16 @@ async fn main() -> Result<()> {
 
     let mut workload = load_workload(&args.trace, args.trace_format, args.max_items)?;
     let unit_label = workload.unit_label();
-    if let Some(target_rate) = args.rate {
+    if args.arrival_mode == ArrivalMode::Saturated {
+        eprintln!(
+            "{} arrival rate | saturated (recorded arrivals ignored{})",
+            unit_label,
+            match args.max_concurrency {
+                Some(cap) => format!(", bounded by --max-concurrency {cap}"),
+                None => ", unbounded".to_string(),
+            },
+        );
+    } else if let Some(target_rate) = args.rate {
         let adjustment = workload.apply_arrival_rate(target_rate)?;
         eprintln!(
             "{} arrival rate | trace={:.6}/s target={:.6}/s time_scale={:.6}",
@@ -141,6 +158,11 @@ async fn main() -> Result<()> {
         concurrency_semaphore: args
             .max_concurrency
             .map(|limit| Arc::new(Semaphore::new(limit))),
+        // Only under a cap, because it exists to order contention and there is
+        // none without one.
+        admission_order: args
+            .max_concurrency
+            .map(|_| Arc::new(AdmissionOrder::new(workload.unit_count()))),
     });
 
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);

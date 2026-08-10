@@ -38,7 +38,7 @@ per axis.
 |---|---|---|---|
 | 1 | **Trace format** — what a CSV row is, and whether requests chain | `--trace-format` | `session`, `independent` |
 | 2 | **Session context policy** — how a round's prompt reuses the previous one, i.e. the prefix-cache assumption | `--session-context-policy` | `trace-reported` (default), `monotonic` |
-| 3 | **Arrival and load control** — when top-level units are released, how many run at once | CSV `arrival_time`, `--rate`, `--max-concurrency`, `--max-items` | Trace-as-recorded (default), or any subset of the three flags |
+| 3 | **Arrival and load control** — when top-level units are released, how many run at once | `--arrival-mode`, CSV `arrival_time`, `--rate`, `--max-concurrency`, `--max-items` | `trace-timed` (default) or `saturated`, each with an optional cap |
 | 4 | **Wire backend** — endpoint and output representation | `--backend` | `openai` (default), `vllm-tokens`, `sglang-tokens` |
 
 ### Axis 1 — trace format
@@ -70,12 +70,28 @@ rejected at startup rather than silently ignored.
 Applies uniformly to whichever top-level unit axis 1 selected — a *session* or
 an *independent request* — and never changes prompt content or context reuse.
 
+This axis has two sub-axes that compose freely — *when* a unit may start, and
+*how many* may run — plus a selection control.
+
 | Control | Effect |
 |---|---|
-| CSV `arrival_time` | Default. Release offsets are replayed unchanged. For `session`, only the first sorted round's value releases the session |
+| `--arrival-mode trace-timed` | Default. Release offsets are replayed from CSV `arrival_time`. For `session`, only the first sorted round's value releases the session |
+| `--arrival-mode saturated` | Recorded arrivals are ignored: every unit is eligible from the start. Without a cap this submits the whole workload at once; with one it is a closed-loop generator. Rejected together with `--rate`, which rescales a timeline this mode discards |
 | `--rate N` | Rescale all arrivals to `N` units/s, preserving relative gaps and simultaneous-arrival bursts. Needs at least two distinct arrival times |
-| `--max-concurrency N` | Bound concurrently active units. One session holds its slot across all of its rounds and tool waits |
+| `--max-concurrency N` | Bound concurrently active units, under either arrival mode. One session holds its slot across all of its rounds **and its tool waits** — while waiting on a tool it has no request in flight but is still occupying a slot |
 | `--max-items N` | Keep `N` units, applied before `--rate` is measured. **Not the earliest `N` arrivals**: `session` keeps the lexicographically smallest `N` session IDs (`session-10` sorts before `session-2`), `independent` keeps the first `N` CSV rows |
+
+`--max-concurrency` bounds *workload units*, not HTTP requests in flight. There
+is deliberately no separate in-flight cap: a session is the unit a coding agent
+actually is, and capping requests instead would let a third conversation start
+while a second one is merely waiting on a tool.
+
+Under a cap, units take slots strictly in trace order. Without that rule the
+winner of a freed slot would be whichever task the async runtime happened to
+poll first, so two runs of the same trace could admit different sessions — and
+no comparison against a simulated run of the same trace would mean anything.
+Since the trace is ordered by arrival, waiting for your turn never means waiting
+for a unit that arrives after you.
 
 ### Axis 4 — wire backend
 
@@ -93,7 +109,7 @@ detokenizes. See [Request backends](#request-backends) for the comparison.
 
 ### Cross-axis constraints
 
-The axes are independent with exactly three exceptions, all enforced by the
+The axes are independent with exactly four exceptions, all enforced by the
 runner:
 
 - `monotonic` (axis 2) requires `--trace-format session` (axis 1). The
@@ -105,6 +121,8 @@ runner:
   not at startup.
 - `--rate` (axis 3) needs a trace with at least two distinct arrival times,
   after `--max-items` has been applied.
+- `--rate` (axis 3) is rejected with `--arrival-mode saturated` (axis 3): one
+  rescales the recorded timeline, the other throws it away.
 
 Each native token endpoint additionally requires its own server launch flags,
 listed with the backend in [Request backends](#request-backends). Those are
@@ -273,8 +291,8 @@ Tokio worker threads:
 
 | Boundary | Control | Meaning |
 |---|---|---|
-| TraceLab arrival scheduler | CSV arrivals and `--rate` | When top-level workload units become runnable. |
-| TraceLab active work | `--max-concurrency` | Maximum active sessions or independent requests. |
+| TraceLab arrival scheduler | `--arrival-mode`, CSV arrivals and `--rate` | When top-level workload units become runnable. |
+| TraceLab active work | `--max-concurrency` | Maximum active sessions or independent requests, counted across tool waits. |
 | TraceLab runtime | Tokio workers, reported under `client_runtime` | Polling release and HTTP client tasks. |
 | vLLM HTTP frontend | `--api-server-count N` | Number of API processes draining EngineCore outputs and emitting streams. |
 | vLLM EngineCore | TP/DP, batching, and token-budget flags | Model execution and engine-side queueing. |
@@ -469,11 +487,38 @@ The backend may still re-tokenize output text for diagnostics and the legacy
 
 ## Arrival scheduling and load control
 
-Without `--rate`, top-level units use the CSV arrival offsets unchanged:
+Release is two independent decisions: *when* a unit may start, and *how many*
+may run at once. Neither implies the other, and the runner keeps them separate
+so that "replay the recorded timeline, but never more than eight conversations
+at once" is expressible.
 
-- `session`: one arrival per session; the concurrency permit is held across all
-  rounds and tool waits in that session.
-- `independent`: one arrival and permit per request.
+### When: `--arrival-mode`
+
+Under `trace-timed` (the default) and without `--rate`, top-level units use the
+CSV arrival offsets unchanged:
+
+- `session`: one arrival per session, taken from the first sorted round.
+- `independent`: one arrival per request.
+
+Under `saturated` the recorded offsets are ignored entirely and every unit is
+eligible from the start, so what actually paces the run is `--max-concurrency`
+plus how fast the server answers. This is the mode to use when the question is
+"what does this workload look like at saturation" rather than "what did this
+timeline do". Since it discards the timeline, it is rejected with `--rate`.
+
+### How many: `--max-concurrency`
+
+The cap counts *top-level units*, not requests:
+
+- `session`: one permit per session, acquired after its arrival and held across
+  every round **and every tool wait** until the session ends. A session waiting
+  on a tool has no request in flight and still owns its slot.
+- `independent`: one permit per request.
+
+Permits are handed out in trace order, so which unit takes a freed slot is a
+property of the trace rather than of the async runtime's scheduling that run.
+
+### Rescaling the timeline: `--rate`
 
 `--rate N` rescales arrivals to `N` sessions/s or requests/s. The trace rate is:
 
@@ -883,9 +928,10 @@ Every flag `session_runner` accepts. The axis columns map back to
 
 | Flag | Default | Notes |
 |---|---|---|
+| `--arrival-mode` | `trace-timed` | `trace-timed`, `saturated`. `saturated` is rejected with `--rate` |
 | `--max-items N` | unlimited | Alias `--max-sessions`. See the axis-3 table for its per-frontend selection order |
 | `--rate N` | trace arrivals unchanged | Units/s. Needs at least two distinct arrival times after `--max-items` |
-| `--max-concurrency N` | unlimited | Must be greater than `0`; `0` is rejected at startup |
+| `--max-concurrency N` | unlimited | Must be greater than `0`; `0` is rejected at startup. Caps active units — a session counts while it waits on a tool |
 
 ### Generation
 

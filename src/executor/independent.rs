@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::backend::context_limit_skip_result;
+use crate::cli::ArrivalMode;
 use crate::executor::AppState;
 use crate::record::StepLog;
 use crate::tokens::TokenProvider;
@@ -19,10 +20,7 @@ pub(crate) async fn run_independent_request(
     request: IndependentRequest,
 ) {
     let arrival_release_lag_ms = wait_for_arrival(&state, request.arrival_time).await;
-    let _concurrency_permit = match &state.concurrency_semaphore {
-        Some(semaphore) => semaphore.clone().acquire_owned().await.ok(),
-        None => None,
-    };
+    let _concurrency_permit = state.acquire_capacity_slot(request_ordinal).await;
     let mut token_provider = match TokenProvider::new(
         state.token_pool.clone(),
         request_ordinal.wrapping_mul(9_973),
@@ -68,6 +66,9 @@ pub(crate) async fn run_independent_request(
 }
 
 async fn wait_for_arrival(state: &AppState, arrival_time_ms: f64) -> f64 {
+    if state.args.arrival_mode == ArrivalMode::Saturated {
+        return 0.0;
+    }
     let arrival_time_ms = arrival_time_ms.max(0.0);
     let target = state.run_start + Duration::from_secs_f64(arrival_time_ms / 1000.0);
     let now = Instant::now();

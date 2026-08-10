@@ -3,13 +3,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::backend::{context_limit_skip_result, GenerationResult};
-use crate::cli::Args;
-use tracelab_replay::policy::SessionContextPolicy;
+use crate::cli::{Args, ArrivalMode};
 use crate::executor::AppState;
 use crate::record::StepLog;
 use crate::tokens::{PromptBuild, PromptBuilder, TokenProvider};
 use crate::trace::SessionStep;
 use crate::util::reaches_context_limit;
+use tracelab_replay::policy::SessionContextPolicy;
 
 /// Replay one session as an ordered, closed-loop chain of rounds.
 pub(crate) async fn run_session(
@@ -20,10 +20,10 @@ pub(crate) async fn run_session(
     steps: Vec<SessionStep>,
 ) {
     wait_for_session_arrival(&state, &steps).await;
-    let _concurrency_permit = match &state.concurrency_semaphore {
-        Some(semaphore) => semaphore.clone().acquire_owned().await.ok(),
-        None => None,
-    };
+    // Bound to this scope on purpose: the session owns its slot for every round
+    // and every tool wait below, and gives it up only when the whole
+    // conversation ends. That is the contract VibeSim's session ledger mirrors.
+    let _concurrency_permit = state.acquire_capacity_slot(session_ordinal).await;
 
     let token_provider = match TokenProvider::new(
         state.token_pool.clone(),
@@ -121,6 +121,9 @@ fn should_skip_at_context_limit(args: &Args, prompt_len: usize, output_len_targe
 }
 
 async fn wait_for_session_arrival(state: &AppState, steps: &[SessionStep]) {
+    if state.args.arrival_mode == ArrivalMode::Saturated {
+        return;
+    }
     let arrival_ms = steps
         .first()
         .map(|step| step.arrival_time.max(0.0))
