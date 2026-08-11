@@ -14,6 +14,10 @@ use crate::util::{elapsed_ms, ratio, unix_seconds_now};
 /// Normalized, backend-agnostic description of one generation request.
 pub(crate) struct GenRequest<'a> {
     pub(crate) model: &'a str,
+    /// The id this replay knows the request by. Sent in the body as well as in
+    /// the `x-request-id` header because the two engines read different ones:
+    /// vLLM adopts the header, SGLang takes a body-level `rid`.
+    pub(crate) request_id: &'a str,
     pub(crate) prompt_ids: &'a [u32],
     pub(crate) max_tokens: usize,
     pub(crate) temperature: f64,
@@ -70,6 +74,11 @@ impl Backend for OpenAiCompletionsBackend {
     fn build_payload(&self, req: &GenRequest) -> Value {
         let mut payload = serde_json::json!({
             "model": req.model,
+            // SGLang's OpenAI layer forwards this straight to GenerateReqInput,
+            // so its records carry the id this replay logged. vLLM has no such
+            // field; its base model allows unknown keys and ignores this one,
+            // taking the id from the x-request-id header instead.
+            "rid": req.request_id,
             // Submit raw token ids (OpenAI `prompt` accepts an int array): no client-side decode,
             // and the server uses the exact ids so prefix-cache keys match what we constructed.
             "prompt": req.prompt_ids,
@@ -142,6 +151,11 @@ impl Backend for VllmTokensBackend {
     fn build_payload(&self, req: &GenRequest) -> Value {
         let mut payload = serde_json::json!({
             "model": req.model,
+            // SGLang's OpenAI layer forwards this straight to GenerateReqInput,
+            // so its records carry the id this replay logged. vLLM has no such
+            // field; its base model allows unknown keys and ignores this one,
+            // taking the id from the x-request-id header instead.
+            "rid": req.request_id,
             "token_ids": req.prompt_ids,
             "sampling_params": {
                 "max_tokens": req.max_tokens,
@@ -219,6 +233,7 @@ impl Backend for SglangTokensBackend {
         // field, so recovering ids out of per-token logprobs would only add
         // compute and serialization to the path we are timing.
         serde_json::json!({
+            "rid": req.request_id,
             "input_ids": req.prompt_ids,
             "sampling_params": {
                 "max_new_tokens": req.max_tokens,
@@ -447,6 +462,7 @@ impl GenerationClient {
         // here and the server's prefix-cache keys match the exact ids we built.
         let payload = self.backend.build_payload(&GenRequest {
             model: &self.model,
+            request_id: &request_id,
             prompt_ids,
             max_tokens,
             temperature: self.temperature,
@@ -754,6 +770,9 @@ impl GenerationClient {
     async fn post_probe(&self, prompt_ids: &[u32]) -> Result<Option<Usage>> {
         let payload = self.backend.build_payload(&GenRequest {
             model: &self.model,
+            // Not a trace request: named so it is obvious in a server log that
+            // this row belongs to the prefix-cache preflight, not the workload.
+            request_id: "tracelab-prefix-cache-preflight",
             prompt_ids,
             max_tokens: 1,
             temperature: 0.0,
@@ -843,6 +862,7 @@ mod tests {
         let backend = VllmTokensBackend;
         let payload = backend.build_payload(&GenRequest {
             model: "meta-llama/Meta-Llama-3-8B",
+            request_id: "req-1",
             prompt_ids: &[11, 22, 33],
             max_tokens: 4,
             temperature: 0.0,
@@ -898,6 +918,7 @@ mod tests {
         let backend = SglangTokensBackend;
         let payload = backend.build_payload(&GenRequest {
             model: "ignored-by-sglang",
+            request_id: "req-1",
             prompt_ids: &[7, 8, 9],
             max_tokens: 16,
             temperature: 0.0,
