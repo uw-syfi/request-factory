@@ -268,24 +268,47 @@ pub(crate) fn build_token_pool(
     tokenizer: &Tokenizer,
     limit: usize,
 ) -> Result<Vec<u32>> {
+    // `Tokenizer::encode_batch` preserves input order while letting the HF
+    // tokenizers backend parallelize independent lines with Rayon. Keep the
+    // batch deliberately small: corpus lines can be arbitrarily large, and all
+    // batch encodings coexist until their IDs have been copied into the pool.
+    const TOKENIZER_BATCH_LINES: usize = 256;
+
     let file = File::open(text_file)
         .with_context(|| format!("failed to open text corpus: {text_file}"))?;
     let reader = BufReader::new(file);
     let mut pool = Vec::with_capacity(limit);
+    let mut line_batch = Vec::with_capacity(TOKENIZER_BATCH_LINES);
+
+    let append_batch = |lines: Vec<String>, pool: &mut Vec<u32>| -> Result<bool> {
+        let encodings = tokenizer
+            .encode_batch(lines, false)
+            .map_err(|err| anyhow!("tokenizer batch encode failed: {err}"))?;
+        for encoding in encodings {
+            let remaining = limit.saturating_sub(pool.len());
+            let token_ids = encoding.get_ids();
+            pool.extend(&token_ids[..token_ids.len().min(remaining)]);
+            if pool.len() >= limit {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
 
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let encoding = tokenizer
-            .encode(line, false)
-            .map_err(|err| anyhow!("tokenizer encode failed: {err}"))?;
-        pool.extend(encoding.get_ids());
-        if pool.len() >= limit {
-            pool.truncate(limit);
+        line_batch.push(line);
+        if line_batch.len() == TOKENIZER_BATCH_LINES
+            && append_batch(std::mem::take(&mut line_batch), &mut pool)?
+        {
             break;
         }
+    }
+    if pool.len() < limit && !line_batch.is_empty() {
+        append_batch(line_batch, &mut pool)?;
     }
 
     if pool.is_empty() {
