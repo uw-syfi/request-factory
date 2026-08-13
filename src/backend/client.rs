@@ -31,6 +31,7 @@ pub(crate) struct GenerationClient {
     pub(super) model: String,
     temperature: f64,
     stream_idle_timeout_secs: u64,
+    record_timeline: bool,
     pub(super) backend: Box<dyn Backend>,
 }
 
@@ -54,6 +55,7 @@ impl GenerationClient {
             model: args.model.clone(),
             temperature: args.temperature,
             stream_idle_timeout_secs: args.stream_idle_timeout_secs,
+            record_timeline: args.timeline,
             backend,
         })
     }
@@ -82,7 +84,7 @@ impl GenerationClient {
         // Monotonic anchor at the send instant: TTFT is measured from here.
         let send_instant = Instant::now();
 
-        let mut fold = StreamAccumulator::new(max_tokens);
+        let mut fold = StreamAccumulator::new(max_tokens, self.record_timeline);
         self.fold_response(&request_id, &payload, send_instant, &mut fold)
             .await;
 
@@ -105,8 +107,10 @@ impl GenerationClient {
             output_text,
             mut output_token_ids,
             usage: mut server,
+            timeline,
             finish_reason,
             failure,
+            ..
         } = fold;
         // The fold reports what went wrong, not what it means for the round; the
         // integrity repair below can still fail an otherwise clean stream.
@@ -218,6 +222,7 @@ impl GenerationClient {
                 error,
             },
             output_ids,
+            timeline,
         }
     }
 

@@ -101,7 +101,11 @@ pub struct Args {
     pub stream_idle_timeout_secs: u64,
 
     /// Stop a session after the first failed round.
-    #[arg(long, default_value_t = true)]
+    ///
+    /// `ArgAction::Set` rather than a bare flag: with a `true` default, a
+    /// set-true flag can only restate the default, which made this knob
+    /// impossible to turn off. Write `--stop-session-on-error false`.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     pub stop_session_on_error: bool,
 
     /// Maximum number of top-level workload units active at once.
@@ -128,4 +132,16 @@ pub struct Args {
     /// Optional JSON summary path for one run.
     #[arg(long)]
     pub summary_path: Option<String>,
+
+    /// Record when every streamed event arrived, per request, to Parquet.
+    ///
+    /// On by default: the measurement is a by-product of the fold that already
+    /// times each event, and the write path is arranged so it cannot slow
+    /// submission. Disable with `--timeline false`.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    pub timeline: bool,
+
+    /// Where the per-event timeline is written.
+    #[arg(long, default_value = "session_runner_timeline.parquet")]
+    pub timeline_path: String,
 }

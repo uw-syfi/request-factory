@@ -16,6 +16,7 @@ mod wire;
 use serde_json::Value;
 
 use crate::record::GenerationOutcome;
+use crate::timeline::TimelineEvent;
 use crate::util::unix_seconds_now;
 
 pub(crate) use client::GenerationClient;
@@ -94,6 +95,9 @@ pub(crate) trait Backend: Send + Sync {
 pub(crate) struct GenerationResult {
     pub(crate) outcome: GenerationOutcome,
     pub(crate) output_ids: Vec<u32>,
+    /// Every arrival on this request's stream, in order. Empty when the run is
+    /// not recording a timeline, and for a request that never reached the wire.
+    pub(crate) timeline: Vec<TimelineEvent>,
 }
 
 pub(crate) fn context_limit_skip_result(
@@ -138,5 +142,6 @@ pub(crate) fn context_limit_skip_result(
             )),
         },
         output_ids: Vec::new(),
+        timeline: Vec::new(),
     }
 }

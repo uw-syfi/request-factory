@@ -35,6 +35,8 @@ mod runner;
 #[cfg(feature = "runtime")]
 mod summary;
 #[cfg(feature = "runtime")]
+mod timeline;
+#[cfg(feature = "runtime")]
 mod tokens;
 #[cfg(feature = "runtime")]
 mod trace;

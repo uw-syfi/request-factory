@@ -839,10 +839,72 @@ is the same string in the trace, the client log, and the server log.
 - `workload`: parsed shape and optional trace-target overflow information;
 - `replay.common`: success/failure counts, throughput, TTFT, TPOT, and E2E;
 - `replay.prefix_cache`: session-only planned-versus-server cache accounting;
-- `client_runtime`: Tokio worker count and sampled global injection-queue peak.
+- `client_runtime`: Tokio worker count and sampled global injection-queue peak;
+- `timeline`: what the per-event timeline recorded, and what it had to drop.
 
 The queue-depth metric does not include every worker-local runnable queue. Use
 it together with `arrival_release_lag_ms` and OS CPU/thread evidence.
+
+### Per-event timeline — Parquet
+
+`--timeline-path` (on by default; `--timeline false` disables) records **when
+each thing arrived** on each request's stream:
+
+| column | type | meaning |
+| --- | --- | --- |
+| `request_id` | `utf8` | the request this arrival belongs to |
+| `seq` | `uint32` | position within that request's stream, from 0 |
+| `elapsed_ms` | `float32` | milliseconds after the request was sent |
+| `kind` | `utf8` | `tokens`, `usage`, `finish`, or `other` |
+| `tokens` | `uint16` | tokens delivered by **this one arrival** |
+| `cumulative_tokens` | `uint32` | tokens delivered by this arrival and all earlier ones |
+
+**One row per arrival, not per token.** A chunk carrying four token ids is one
+observable instant; four rows sharing a timestamp would invite a reader to
+average them as four measurements. `tokens` says how many that one arrival
+carried — the same reasoning that keeps `first_token_event_tokens` out of TPOT's
+denominator.
+
+`kind` is what lets this generalize. A multimodal pipeline reporting per-stage
+progress adds kinds here rather than a second file format.
+
+Measured at 4.7 bytes/row after dictionary encoding and zstd, so the full
+357k-round corpus (~187M output tokens) lands under a gigabyte.
+
+#### It cannot slow submission
+
+The measurement is free — the fold already times every event. The write path is
+arranged so the recording is too:
+
+- events are pushed into a `Vec` preallocated to the request's target output
+  length, so nothing allocates, formats or writes while a response streams;
+- the whole `Vec` is handed off **once per request**, not once per token;
+- the handoff is a `try_send` on a bounded channel. A full channel drops that
+  request's timeline and counts it, because a slow disk must never become
+  backpressure on the thing being measured;
+- all Arrow encoding and compression happens on a thread of the writer's own.
+  Not an async task: zstd is blocking CPU work, and on a runtime worker it
+  competes with the requests being timed. That was measurable — see below.
+
+Measured against `tools/stub_server.py`, which replies with fixed timing so the
+client is the only variable. 6 runs each way, 3000 requests, alternating, on the
+`arrival_release_lag_ms` this client already records *before* the concurrency
+semaphore:
+
+| | p50 | p90 | p99 | mean |
+| --- | --- | --- | --- | --- |
+| writer on a runtime worker | +0.130 | +0.163 | +0.273 | +0.111 |
+| writer on its own thread | −0.029 | +0.005 | +0.075 | −0.019 |
+
+(Milliseconds added by turning the timeline on, pooled over 18,000 requests per
+condition.) The first row is a small but consistently positive bias at every
+percentile; the second is noise around zero, and a run-level Mann-Whitney over
+the six per-run medians gives p = 1.000. Zero dropped timelines in all twelve
+runs.
+
+`timeline.dropped_requests` in the run summary is nonzero exactly when the file
+is a sample of the run rather than a record of it. A run also prints a warning
+in that case, so a lossy timeline says so instead of quietly under-reporting.
 
 ## Metrics
 
@@ -982,7 +1044,7 @@ Every flag `session_runner` accepts. The axis columns map back to
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--stop-session-on-error` | `true` | A session stops after its first failed round. This is a set-true flag with a `true` default, so it cannot currently be switched off from the command line |
+| `--stop-session-on-error` | `true` | A session stops after its first failed round. Takes an explicit value: `--stop-session-on-error false` |
 
 A context-limit skip always ends its session, independently of this flag.
 
@@ -1004,6 +1066,7 @@ A context-limit skip always ends its session, independently of this flag.
 .
 ├── examples/                 canonical trace + raw tracegen inputs
 ├── skills/                   agent-facing operating guide for a replay
+├── tools/                    stub server for measuring the client alone
 ├── src/
 │   ├── lib.rs                the public library: the trace schemas + run_once
 │   ├── schema/
@@ -1036,6 +1099,9 @@ A context-limit skip always ends its session, independently of this flag.
 │   │   └── independent.rs    independent-request CSV parser
 │   ├── tokens.rs             synthetic ID pool + session prompt assembly
 │   ├── record.rs             versioned typed JSONL records
+│   ├── timeline/
+│   │   ├── mod.rs            per-event vocabulary + the non-blocking handoff
+│   │   └── writer.rs         Arrow/Parquet, entirely off the request path
 │   ├── summary.rs            run-level metric aggregation
 │   ├── workload.rs           dry-run workload summaries
 │   └── util.rs               shared timing/ratio helpers

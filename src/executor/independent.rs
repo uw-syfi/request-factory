@@ -6,6 +6,7 @@ use crate::backend::{context_limit_skip_result, Prompt};
 use crate::cli::ArrivalMode;
 use crate::executor::AppState;
 use crate::record::StepLog;
+use crate::timeline::{RequestTimeline, TimelineSink};
 use crate::tokens::TokenProvider;
 use crate::trace::IndependentRequest;
 
@@ -15,6 +16,8 @@ use crate::trace::IndependentRequest;
 pub(crate) async fn run_independent_request(
     state: Arc<AppState>,
     log_tx: mpsc::Sender<StepLog>,
+    // Travels with the task rather than living on `AppState`; see `run_session`.
+    timeline_sink: Option<TimelineSink>,
     request_ordinal: usize,
     request: IndependentRequest,
 ) {
@@ -51,6 +54,12 @@ pub(crate) async fn run_independent_request(
             .run_step(request_id, prompt, request.output_len)
             .await
     };
+    if let Some(sink) = &timeline_sink {
+        sink.offer(RequestTimeline {
+            request_id: result.outcome.request_id.clone(),
+            events: result.timeline,
+        });
+    }
     let log = StepLog::independent_request(
         &request,
         prompt.token_len(),

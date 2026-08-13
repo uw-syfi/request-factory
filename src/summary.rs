@@ -5,6 +5,7 @@ use std::io::Write;
 use tokio::sync::mpsc;
 
 use crate::record::{GenerationOutcome, SessionRoundSource, SourceRecord, StepLog};
+use crate::timeline::TimelineSummary;
 use crate::trace::ReplayWorkload;
 use crate::util::ratio;
 use crate::workload::WorkloadSummary;
@@ -312,6 +313,8 @@ pub struct RunSummary {
     pub(crate) workload: WorkloadSummary,
     pub(crate) replay: ReplaySummary,
     pub(crate) client_runtime: ClientRuntimeSummary,
+    /// What the per-event timeline recorded, including what it had to drop.
+    pub(crate) timeline: TimelineSummary,
 }
 
 #[derive(Debug, Serialize)]

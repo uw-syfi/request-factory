@@ -32,11 +32,14 @@ default = ["runtime"]
 # should not pay reqwest, tokio, tokenizers and hf-hub to get it. Such a
 # consumer takes `default-features = false`.
 runtime = [
+    "dep:arrow-array",
+    "dep:arrow-schema",
     "dep:bytes",
     "dep:clap",
     "dep:fdlimit",
     "dep:futures",
     "dep:hf-hub",
+    "dep:parquet",
     "dep:reqwest",
     "dep:tokenizers",
     "dep:tokio",
@@ -50,6 +53,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Runtime only.
+# Arrow arrays + the Parquet writer for the per-event timeline. A columnar file
+# because the timeline is one row per streamed event over a whole run -- tens of
+# millions of rows whose columns are three integers and two low-cardinality
+# strings, which is exactly what dictionary encoding and RLE are for.
+arrow-array = { version = "55", optional = true }
+arrow-schema = { version = "55", optional = true }
+parquet = { version = "55", default-features = false, features = ["arrow", "zstd"], optional = true }
 bytes = { version = "1.5", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 fdlimit = { version = "0.3", optional = true }

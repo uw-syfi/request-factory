@@ -122,7 +122,8 @@ was generated at — read the manifest.
   --trace trace/execution.csv --trace-format session \
   --text-file corpus.txt --tokenizer <hf-model-or-path> --model <served-name> \
   --base-url http://127.0.0.1:8000 --backend vllm-tokens \
-  --log-path out/session_runner_output.jsonl --summary-path out/summary.json
+  --log-path out/session_runner_output.jsonl --summary-path out/summary.json \
+  --timeline-path out/timeline.parquet
 
 # 3. Saturate under a session cap instead of replaying the timeline.
 #    ... --arrival-mode saturated --max-concurrency 8
@@ -150,10 +151,17 @@ server's own token space.
 - `output_len` is sent as `max_tokens` with `ignore_eos: true`, so output length
   is the trace's, never the model's stopping point. Do not read output length as
   a model behaviour.
-- Failed rounds stop their session by default (`--stop-session-on-error`), so a
-  failure early in a long session removes every later round from the run. Check
-  the completed-round count against the workload summary before comparing
-  aggregates.
+- Failed rounds stop their session by default (`--stop-session-on-error false`
+  to change it), so a failure early in a long session removes every later round
+  from the run. Check the completed-round count against the workload summary
+  before comparing aggregates.
+- The Parquet timeline (`--timeline-path`, on by default) is **one row per
+  arrival, not per token**: a chunk carrying four ids is one row with
+  `tokens = 4`. Averaging its rows as if each were a token measurement is the
+  one mistake the schema is shaped to prevent.
+- Check `timeline.dropped_requests` in `summary.json` before drawing anything
+  from the timeline. Nonzero means the writer fell behind and the file is a
+  sample of the run, not a record of it.
 
 ## Troubleshooting
 

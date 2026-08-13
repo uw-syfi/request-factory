@@ -11,6 +11,8 @@
 
 use std::ops::ControlFlow;
 
+use crate::timeline::{EventKind, TimelineEvent};
+
 use super::integrity::restates_accumulated_output;
 use super::StreamEvent;
 
@@ -50,16 +52,25 @@ pub(super) struct StreamAccumulator {
     pub(super) output_text: String,
     pub(super) output_token_ids: Vec<u32>,
     pub(super) usage: UsageFold,
+    /// One entry per parsed response object, in arrival order. Empty when the
+    /// run is not recording a timeline, which is also the only case in which
+    /// this vector never allocates.
+    pub(super) timeline: Vec<TimelineEvent>,
     pub(super) finish_reason: Option<String>,
     /// Set when the stream itself is unusable. `None` means nothing went wrong
     /// *during* the fold; later checks may still fail the round.
     pub(super) failure: Option<String>,
+    record_timeline: bool,
 }
 
 impl StreamAccumulator {
-    /// `expected_tokens` only sizes the id buffer. A server may return fewer or
+    /// `expected_tokens` only sizes the buffers. A server may return fewer or
     /// more; the capacity is a hint, never a bound.
-    pub(super) fn new(expected_tokens: usize) -> Self {
+    ///
+    /// `record_timeline` decides whether the per-event vector is allocated at
+    /// all. Preallocating both here is the whole reason the fold can record a
+    /// timeline without allocating while a response streams.
+    pub(super) fn new(expected_tokens: usize, record_timeline: bool) -> Self {
         Self {
             first_text_ms: None,
             first_token_id_ms: None,
@@ -71,6 +82,15 @@ impl StreamAccumulator {
             output_text: String::new(),
             output_token_ids: Vec::with_capacity(expected_tokens),
             usage: UsageFold::default(),
+            timeline: if record_timeline {
+                // One event per token is the common case, so the trace's target
+                // output length is the right first guess at how many arrivals
+                // this request will produce.
+                Vec::with_capacity(expected_tokens)
+            } else {
+                Vec::new()
+            },
+            record_timeline,
             finish_reason: None,
             failure: None,
         }
@@ -83,6 +103,11 @@ impl StreamAccumulator {
     /// status, which the engine records separately.
     pub(super) fn absorb(&mut self, event: StreamEvent, at_ms: f64) -> ControlFlow<()> {
         let token_ids = event.token_ids.unwrap_or_default();
+        // Read before the event is consumed below, so the timeline can say what
+        // this one arrival carried.
+        let delivered_tokens = token_ids.len();
+        let carried_usage = event.usage.is_some();
+        let carried_finish_reason = event.finish_reason.is_some();
 
         // Checked before the ids are folded in: appending a cumulative chunk
         // would multiply the output and there would be no way back.
@@ -131,6 +156,17 @@ impl StreamAccumulator {
         }
 
         self.chunk_count += 1;
+        if self.record_timeline {
+            self.timeline.push(TimelineEvent {
+                elapsed_ms: at_ms as f32,
+                kind: EventKind::classify(delivered_tokens, carried_usage, carried_finish_reason),
+                // Saturating rather than wrapping: a chunk this large is not
+                // something any server does, and a wrapped count would be a
+                // quiet lie where a clamped one is an obvious one.
+                tokens: u16::try_from(delivered_tokens).unwrap_or(u16::MAX),
+                cumulative_tokens: u32::try_from(self.output_token_ids.len()).unwrap_or(u32::MAX),
+            });
+        }
         ControlFlow::Continue(())
     }
 
@@ -198,7 +234,7 @@ mod tests {
 
     #[test]
     fn the_first_timed_event_anchors_ttft_and_is_kept_out_of_the_tpot_denominator() {
-        let mut fold = StreamAccumulator::new(8);
+        let mut fold = StreamAccumulator::new(8, false);
         // A first chunk of three tokens: one observable instant, three tokens.
         feed(&mut fold, tokens(&[1, 2, 3]), 100.0);
         feed(&mut fold, tokens(&[4]), 120.0);
@@ -215,7 +251,7 @@ mod tests {
 
     #[test]
     fn a_single_event_response_has_no_measurable_tpot() {
-        let mut fold = StreamAccumulator::new(4);
+        let mut fold = StreamAccumulator::new(4, false);
         feed(&mut fold, tokens(&[1, 2]), 50.0);
 
         assert_eq!(fold.first_token_id_ms, Some(50.0));
@@ -224,7 +260,7 @@ mod tests {
 
     #[test]
     fn empty_token_events_do_not_start_the_clock_or_count() {
-        let mut fold = StreamAccumulator::new(4);
+        let mut fold = StreamAccumulator::new(4, false);
         feed(&mut fold, usage(Some(10), None, None), 5.0);
         feed(&mut fold, tokens(&[]), 6.0);
 
@@ -236,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_cumulative_chunk_breaks_the_stream_before_it_is_folded_in() {
-        let mut fold = StreamAccumulator::new(8);
+        let mut fold = StreamAccumulator::new(8, false);
         feed(&mut fold, tokens(&[1, 2, 3]), 10.0);
 
         assert_eq!(
@@ -251,7 +287,7 @@ mod tests {
 
     #[test]
     fn usage_folds_per_field_so_a_later_partial_chunk_cannot_erase_an_earlier_one() {
-        let mut fold = StreamAccumulator::new(4);
+        let mut fold = StreamAccumulator::new(4, false);
         feed(&mut fold, usage(Some(512), Some(1), Some(496)), 10.0);
         // A terminal chunk that restates only the completion count.
         feed(&mut fold, usage(None, Some(2), None), 20.0);
@@ -270,8 +306,62 @@ mod tests {
     }
 
     #[test]
+    fn the_timeline_records_one_entry_per_arrival_carrying_its_own_token_count() {
+        let mut fold = StreamAccumulator::new(8, true);
+        feed(&mut fold, tokens(&[1, 2, 3]), 100.0);
+        feed(&mut fold, usage(Some(4), Some(3), None), 120.0);
+        feed(&mut fold, tokens(&[4]), 140.0);
+
+        // Three arrivals, four tokens. Not four rows, and not two.
+        assert_eq!(
+            fold.timeline,
+            vec![
+                TimelineEvent {
+                    elapsed_ms: 100.0,
+                    kind: EventKind::Tokens,
+                    tokens: 3,
+                    cumulative_tokens: 3,
+                },
+                TimelineEvent {
+                    elapsed_ms: 120.0,
+                    kind: EventKind::Usage,
+                    tokens: 0,
+                    cumulative_tokens: 3,
+                },
+                TimelineEvent {
+                    elapsed_ms: 140.0,
+                    kind: EventKind::Tokens,
+                    tokens: 1,
+                    cumulative_tokens: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rejected_cumulative_chunk_is_not_an_arrival() {
+        let mut fold = StreamAccumulator::new(8, true);
+        feed(&mut fold, tokens(&[1, 2, 3]), 10.0);
+        let _ = fold.absorb(tokens(&[1, 2, 3, 4]), 20.0);
+
+        // The chunk was refused, so it never happened as far as the record is
+        // concerned -- recording it would put tokens on the timeline that the
+        // output does not contain.
+        assert_eq!(fold.timeline.len(), 1);
+    }
+
+    #[test]
+    fn a_run_that_is_not_recording_never_allocates_the_timeline() {
+        let mut fold = StreamAccumulator::new(64, false);
+        feed(&mut fold, tokens(&[1, 2, 3]), 10.0);
+
+        assert!(fold.timeline.is_empty());
+        assert_eq!(fold.timeline.capacity(), 0);
+    }
+
+    #[test]
     fn the_first_failure_wins() {
-        let mut fold = StreamAccumulator::new(4);
+        let mut fold = StreamAccumulator::new(4, false);
         fold.fail("stream error".to_string());
         fold.fail("idle timeout".to_string());
 
@@ -280,7 +370,7 @@ mod tests {
 
     #[test]
     fn text_and_token_id_clocks_are_independent() {
-        let mut fold = StreamAccumulator::new(4);
+        let mut fold = StreamAccumulator::new(4, false);
         feed(
             &mut fold,
             StreamEvent {

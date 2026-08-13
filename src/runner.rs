@@ -21,6 +21,7 @@ use crate::record::StepLog;
 use crate::summary::{
     write_logs, write_summary_if_requested, ClientRuntimeSummary, ReplaySummary, RunSummary,
 };
+use crate::timeline::{self, TimelineSummary};
 use crate::tokens::{build_token_pool, load_tokenizer};
 use crate::trace::{load_workload, ReplayWorkload};
 use crate::workload::WorkloadSummary;
@@ -50,6 +51,7 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
             workload: workload_summary,
             replay: replay_summary,
             client_runtime: client_runtime_summary(0),
+            timeline: TimelineSummary::default(),
         };
         write_summary_if_requested(args.summary_path.as_deref(), &summary)?;
         return Ok(summary);
@@ -97,6 +99,24 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
         .await
         .context("prefix-cache preflight failed")?;
 
+    // Bounded in requests, not events: it caps how far the writer may fall
+    // behind before timelines are dropped rather than queued. Deep enough that
+    // only a genuinely stuck disk reaches it, shallow enough to bound memory.
+    const TIMELINE_QUEUE_REQUESTS: usize = 4_096;
+    let (timeline_sink, timeline_task) = if args.timeline {
+        let (sink, receiver) = timeline::channel(TIMELINE_QUEUE_REQUESTS);
+        let dropped = sink.dropped_handle();
+        // A thread of its own, not a runtime task: Arrow encoding and zstd are
+        // blocking CPU work, and on a worker thread they compete with the
+        // requests this file exists to time.
+        let path = args.timeline_path.clone();
+        let task =
+            tokio::task::spawn_blocking(move || timeline::write_timeline(path, receiver, dropped));
+        (Some(sink), Some(task))
+    } else {
+        (None, None)
+    };
+
     let state = Arc::new(AppState {
         policy: RunPolicy::from_args(&args),
         client,
@@ -129,8 +149,17 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
             for (session_ordinal, (session_id, steps)) in sessions.into_iter().enumerate() {
                 let state_ref = state.clone();
                 let log_tx_ref = log_tx.clone();
+                let timeline_ref = timeline_sink.clone();
                 join_set.spawn(async move {
-                    run_session(state_ref, log_tx_ref, session_ordinal, session_id, steps).await;
+                    run_session(
+                        state_ref,
+                        log_tx_ref,
+                        timeline_ref,
+                        session_ordinal,
+                        session_id,
+                        steps,
+                    )
+                    .await;
                 });
             }
         }
@@ -138,13 +167,23 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
             for (request_ordinal, request) in requests.into_iter().enumerate() {
                 let state_ref = state.clone();
                 let log_tx_ref = log_tx.clone();
+                let timeline_ref = timeline_sink.clone();
                 join_set.spawn(async move {
-                    run_independent_request(state_ref, log_tx_ref, request_ordinal, request).await;
+                    run_independent_request(
+                        state_ref,
+                        log_tx_ref,
+                        timeline_ref,
+                        request_ordinal,
+                        request,
+                    )
+                    .await;
                 });
             }
         }
     }
+    // Both writers finish when their last sender is gone.
     drop(log_tx);
+    drop(timeline_sink);
 
     while let Some(result) = join_set.join_next().await {
         if let Err(err) = result {
@@ -154,10 +193,16 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
 
     let replay_summary = log_task.await?;
     status_handle.await?;
+    let runtime_global_queue_depth_peak = state.stats.runtime_global_queue_depth_peak();
+    let timeline_summary = match timeline_task {
+        Some(task) => task.await?,
+        None => TimelineSummary::default(),
+    };
     let summary = RunSummary {
         workload: workload_summary,
         replay: replay_summary,
-        client_runtime: client_runtime_summary(state.stats.runtime_global_queue_depth_peak()),
+        client_runtime: client_runtime_summary(runtime_global_queue_depth_peak),
+        timeline: timeline_summary,
     };
     write_summary_if_requested(args.summary_path.as_deref(), &summary)?;
 

@@ -6,6 +6,7 @@ use crate::backend::{context_limit_skip_result, GenerationResult, Prompt};
 use crate::cli::ArrivalMode;
 use crate::executor::AppState;
 use crate::record::StepLog;
+use crate::timeline::{RequestTimeline, TimelineSink};
 use crate::tokens::{PromptBuild, PromptBuilder, TokenProvider};
 use crate::trace::SessionStep;
 
@@ -13,6 +14,11 @@ use crate::trace::SessionStep;
 pub(crate) async fn run_session(
     state: Arc<AppState>,
     log_tx: mpsc::Sender<StepLog>,
+    // Travels with the task rather than living on `AppState`, for the same
+    // reason `log_tx` does: the run closes the writer's channel by dropping
+    // every sender, and a sender parked inside shared state is one nobody can
+    // drop on time.
+    timeline_sink: Option<TimelineSink>,
     session_ordinal: usize,
     session_id: String,
     steps: Vec<SessionStep>,
@@ -65,7 +71,14 @@ pub(crate) async fn run_session(
         let GenerationResult {
             outcome,
             output_ids,
+            timeline,
         } = result;
+        if let Some(sink) = &timeline_sink {
+            sink.offer(RequestTimeline {
+                request_id: outcome.request_id.clone(),
+                events: timeline,
+            });
+        }
         let log = StepLog::session_round(
             &step,
             prompt.token_len(),
