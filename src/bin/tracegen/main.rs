@@ -14,6 +14,8 @@
 //!   trace had to be folded to make it replayable;
 //! - a normalized plan, which is what a differential test compares.
 
+mod policy;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,7 +24,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use tracelab_replay::policy::{
+use policy::{
     ContextChain, RawRound, SessionContextPolicy, MAJOR_COMPACTION_MIN_DROP_RATIO,
     MAJOR_COMPACTION_MIN_DROP_TOKENS,
 };
@@ -197,8 +199,11 @@ fn main() -> Result<()> {
     write_trace(&args.out, &rows)?;
     let manifest_path = sibling(&args.out, "manifest.json");
     let plan_path = sibling(&args.out, "plan.json");
-    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)? + "\n")
-        .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", manifest_path.display()))?;
     fs::write(
         &plan_path,
         serde_json::to_string_pretty(&v2::plan(&rows))? + "\n",
@@ -456,4 +461,87 @@ fn sha256_file(path: &Path) -> Result<String> {
     }
 
     Ok(state.iter().map(|word| format!("{word:08x}")).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_row(id: &str, arrival_time: f64, round_idx: usize) -> RawRow {
+        RawRow {
+            id: id.to_string(),
+            arrival_time,
+            round_idx,
+            prefix_len: 0,
+            input_len: 10,
+            output_len: 4,
+            tool_wait_after_ms: 0.0,
+        }
+    }
+
+    fn ids(sessions: &[(String, Vec<RawRow>)]) -> Vec<&str> {
+        sessions.iter().map(|(id, _)| id.as_str()).collect()
+    }
+
+    #[test]
+    fn grouping_preserves_first_appearance_and_orders_rounds() {
+        let sessions = group_sessions(vec![
+            raw_row("b", 0.0, 1),
+            raw_row("a", 5.0, 0),
+            raw_row("b", 0.0, 0),
+        ])
+        .unwrap();
+
+        assert_eq!(ids(&sessions), ["b", "a"]);
+        let round_indices: Vec<usize> = sessions[0].1.iter().map(|row| row.round_idx).collect();
+        assert_eq!(round_indices, [0, 1]);
+    }
+
+    /// A session arrives once. The loader this replaced kept a per-round arrival
+    /// column and silently used only the first round's value, so a trace that
+    /// disagreed with itself replayed as though it did not.
+    #[test]
+    fn grouping_rejects_a_session_that_declares_two_arrival_times() {
+        let error = group_sessions(vec![raw_row("a", 0.0, 0), raw_row("a", 250.0, 1)])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("declares two arrival times"), "{error}");
+    }
+
+    #[test]
+    fn grouping_rejects_an_empty_session_id() {
+        let error = group_sessions(vec![raw_row("", 0.0, 0)])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("empty session id"), "{error}");
+    }
+
+    #[test]
+    fn selection_keeps_the_earliest_arrivals_not_the_first_seen() {
+        let sessions =
+            group_sessions(vec![raw_row("late", 900.0, 0), raw_row("early", 5.0, 0)]).unwrap();
+
+        let selected = select_sessions(sessions, Some(1));
+
+        assert_eq!(ids(&selected), ["early"]);
+    }
+
+    /// Canonical rule O2: equal arrivals fall back to source appearance order,
+    /// which is what makes a measured replay and a simulated run agree on which
+    /// session entered first.
+    #[test]
+    fn selection_breaks_equal_arrivals_by_source_order() {
+        let sessions = group_sessions(vec![
+            raw_row("second", 100.0, 0),
+            raw_row("first", 100.0, 0),
+            raw_row("third", 100.0, 0),
+        ])
+        .unwrap();
+
+        let selected = select_sessions(sessions, Some(2));
+
+        assert_eq!(ids(&selected), ["second", "first"]);
+    }
 }

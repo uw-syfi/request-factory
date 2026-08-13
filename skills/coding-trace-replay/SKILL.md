@@ -1,6 +1,6 @@
 ---
 name: coding-trace-replay
-description: "Configure, run, and read a TraceLab replay against a live inference server. Use when choosing a trace format or frontend (session-execution-v2, session, independent), generating a canonical trace with tracegen, picking a session context policy (trace-reported versus prefix-preserving/monotonic), setting arrival mode and concurrency (--arrival-mode, --rate, --max-concurrency, --max-items), choosing a wire backend (openai, vllm-tokens, sglang-tokens) and the server flags it requires, launching vLLM or SGLang for a replay, diagnosing prefix-cache preflight failures, cumulative-streaming or echoed-prompt errors, or interpreting session_runner_output.jsonl and summary.json."
+description: "Configure, run, and read a TraceLab replay against a live inference server. Use when choosing a trace format or frontend (session, independent), generating a canonical trace with tracegen and picking its context policy (trace-reported versus monotonic), setting arrival mode and concurrency (--arrival-mode, --rate, --max-concurrency, --max-items), choosing a wire backend (openai, vllm-tokens, sglang-tokens) and the server flags it requires, launching vLLM or SGLang for a replay, diagnosing prefix-cache preflight failures, cumulative-streaming or echoed-prompt errors, or interpreting session_runner_output.jsonl and summary.json."
 ---
 
 # Coding Trace Replay
@@ -31,14 +31,13 @@ answers.
 3. **Always dry-run first**: add `--dry-run` to parse the trace, print the
    workload summary, and contact no server. It catches schema and axis errors in
    under a second.
-4. Decide all four axes explicitly before running. Defaults are `--trace-format
-   session --session-context-policy trace-reported --arrival-mode trace-timed
-   --backend openai`; a default that was never chosen is the usual source of a
-   result nobody can interpret later.
+4. Decide all three axes explicitly before running. Defaults are `--trace-format
+   session --arrival-mode trace-timed --backend openai`; a default that was never
+   chosen is the usual source of a result nobody can interpret later.
 5. Use `uv run python ...` for anything on the Python side (the alignment
    launcher under `alignment/load_generator/`).
 
-## The Four Axes
+## The Three Axes
 
 Read `replay/README.md` § *Configuration axes* for the full tables. The decisions:
 
@@ -46,23 +45,14 @@ Read `replay/README.md` § *Configuration axes* for the full tables. The decisio
 
 | Choose | When |
 |---|---|
-| `session-execution-v2` | The run will be compared against a simulated run, or reproduced later. The prompt split is materialized in the file, so nothing is left for a runtime flag to change. |
-| `session` | Exploring how a context policy changes the workload. This is the raw schema whose `prefix_len` is what the source *reported*. |
+| `session` | Multi-round conversations. Reads a canonical `session-execution-v2` file whose prompt split is already materialized, so nothing is left for a runtime flag to change. A raw CSV is rejected at parse — run it through `tracegen` first. |
 | `independent` | One-shot requests with no shared context. |
 
-### Axis 2 — session context policy
+The prefix/append split is **not** an axis of the run. It is chosen once with
+`tracegen --policy` and recorded in the trace's manifest; see *Generating A
+Canonical Trace* below.
 
-Only meaningful for `--trace-format session`, and **rejected outright** with
-`session-execution-v2`, whose policy was resolved at generation time.
-
-- `trace-reported` — keep the reported prefix/input split; prefix the replayed
-  conversation cannot supply is folded into fresh input.
-- `monotonic` (alias `prefix-preserving`) — keep the longest prefix the
-  conversation can actually supply, up to the trace's total, resetting only on
-  a major compaction. Requires exact generated token IDs, so it constrains
-  axis 4.
-
-### Axis 3 — arrival and capacity
+### Axis 2 — arrival and capacity
 
 Two independent sub-axes. Do not conflate them; they were deliberately split.
 
@@ -73,7 +63,7 @@ Two independent sub-axes. Do not conflate them; they were deliberately split.
   caps *workload units* — a session counts while it waits on a tool, when it has
   no request in flight at all.
 
-### Axis 4 — wire backend
+### Axis 3 — wire backend
 
 All three send the prompt as token IDs and are identical on the input side; they
 differ in whether the server detokenizes on the way out.
@@ -90,7 +80,7 @@ Materialize a raw session CSV once, then hand the same bytes to every consumer:
 
 ```bash
 cargo run --release --manifest-path replay/Cargo.toml --bin tracegen -- \
-  --source raw_sessions.csv \
+  --source replay/examples/multi_session_example.csv \
   --policy trace-reported \
   --max-sessions 200 \
   --out trace/execution.csv
@@ -137,10 +127,11 @@ server's own token space.
 - **A cap that changes nothing means the units never overlapped**, not that the
   cap was ignored. Compare the trace's arrival spacing against per-unit
   duration; use `--arrival-mode saturated` to force overlap.
-- `folded_prefix_tokens` (planned, a trace property) and
-  `prefix_shortfall_tokens` (unplanned, a run property) are both fresh work and
-  neither is ever counted as a cache hit. A nonzero shortfall means a short or
-  failed round upstream — investigate it rather than averaging over it.
+- `folded_prefix_tokens` lives in the **manifest** (planned, a trace property);
+  `prefix_shortfall_tokens` lives in the **JSONL** (unplanned, a run property).
+  Both are fresh work and neither is ever counted as a cache hit. A nonzero
+  shortfall means a short or failed round upstream — investigate it rather than
+  averaging over it.
 - Compare `planned_prefix_hit_rate` against the server's
   `cached_prompt_tokens / prompt_tokens`. A gap is the interesting quantity;
   a run reported without both sides is not evidence of anything.
@@ -163,8 +154,7 @@ configuration rather than server problems:
 | Symptom | Action |
 |---|---|
 | `prefix-cache preflight failed` | The server does not report cached prompt tokens. vLLM needs `--enable-prompt-tokens-details`; SGLang reports them by default. This is a hard abort by design — without it every hit rate silently reads zero. |
-| `carries no context policy` | Drop `--session-context-policy`; regenerate with `tracegen --policy` instead. |
-| `monotonic ... requires exact generated token IDs` | Axis 2 and axis 4 disagree. Use a native token backend, or `openai` against a server honouring `return_token_ids`. Never work around it with text re-tokenization. |
+| `failed to parse a session-execution-v2 row` | The trace is a raw, unmaterialized CSV. Generate a canonical one with `tracegen` first. |
 | `server streamed cumulative output` | SGLang is in default cumulative mode. Relaunch with `--stream-output`. TraceLab fails rather than reporting the distorted late-token latency. |
 | `--rate` rejected with `saturated` | Pick one. To bound a saturated run, use `--max-concurrency`. |
 
@@ -172,7 +162,7 @@ configuration rather than server problems:
 
 When summarizing a replay run:
 
-- Lead with the four axis values, the trace path, and — for a canonical trace —
+- Lead with the three axis values, the trace path, and — for a canonical trace —
   its manifest's policy and fold count. A run reported without its axes cannot
   be reproduced or compared.
 - State attempted versus completed rounds, and name any session that stopped

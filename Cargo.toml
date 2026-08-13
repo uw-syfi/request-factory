@@ -5,9 +5,9 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Typed workload runner for OpenAI-compatible inference servers"
 
-# Shared between the replay runtime and the trace generator. Both must resolve a
-# raw trace's prefix/append split with byte-identical arithmetic, so the rules
-# live in one library rather than being reimplemented per binary.
+# Shared between the replay runtime and the trace generator: both must read and
+# validate the canonical execution trace by identical rules, so the schema lives
+# in one library rather than being reimplemented per binary.
 [lib]
 name = "tracelab_replay"
 path = "src/lib.rs"
@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "tracegen"
-path = "src/bin/tracegen.rs"
+path = "src/bin/tracegen/main.rs"
 
 [dependencies]
 anyhow = "1.0"

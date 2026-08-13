@@ -24,8 +24,7 @@ use summary::{
     write_logs, write_summary_if_requested, ClientRuntimeSummary, ReplaySummary, RunSummary,
 };
 use tokens::{build_token_pool, load_tokenizer};
-use trace::{load_workload, ReplayWorkload, TraceFormat};
-use tracelab_replay::policy::SessionContextPolicy;
+use trace::{load_workload, ReplayWorkload};
 use workload::WorkloadSummary;
 
 #[tokio::main]
@@ -47,23 +46,6 @@ async fn main() -> Result<()> {
             "--skip-when-reaching-limit requires --max-model-len"
         ));
     }
-    if args.trace_format == TraceFormat::SessionExecutionV2
-        && args.session_context_policy != SessionContextPolicy::TraceReported
-    {
-        return Err(anyhow!(
-            "--trace-format session-execution-v2 carries no context policy: it was resolved when \
-             the trace was generated and is recorded in its manifest. Drop \
-             --session-context-policy, or generate the trace with the policy you want."
-        ));
-    }
-    if args.session_context_policy == SessionContextPolicy::PrefixPreserving
-        && args.trace_format != TraceFormat::Session
-    {
-        return Err(anyhow!(
-            "--session-context-policy prefix-preserving (alias monotonic) requires --trace-format session"
-        ));
-    }
-
     let mut workload = load_workload(&args.trace, args.trace_format, args.max_items)?;
     let unit_label = workload.unit_label();
     if args.arrival_mode == ArrivalMode::Saturated {

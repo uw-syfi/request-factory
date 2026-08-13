@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::trace::{IndependentRequest, SessionStep};
 use crate::util::prefix_hit_rate;
 
-const STEP_LOG_SCHEMA_VERSION: u32 = 8;
+const STEP_LOG_SCHEMA_VERSION: u32 = 9;
 
 /// One JSONL record: a typed source plus measurements shared by text generation.
 ///
@@ -30,25 +30,21 @@ pub(crate) struct SessionRoundSource {
     pub(crate) round_idx: usize,
     pub(crate) prefix_len: usize,
     pub(crate) input_len: usize,
-    /// Trace-reported total prompt target (`prefix_len + input_len`).
+    /// Total prompt target the trace declares (`prefix_len + input_len`).
     pub(crate) target_prompt_len: usize,
     pub(crate) prompt_len: usize,
-    pub(crate) session_context_policy: String,
-    /// Cache-reusable prefix and newly appended tokens actually constructed by
-    /// the selected policy. These, rather than the raw trace split, define the
-    /// planned cache hit rate.
+    /// Cache-reusable prefix and newly appended tokens actually constructed.
+    /// These equal the trace's split unless the live conversation came up short,
+    /// and they — not the trace's numbers — define the planned cache hit rate.
     pub(crate) derived_prefix_len: usize,
     pub(crate) derived_append_len: usize,
-    /// Raw trace prefix tokens the context policy moved into fresh input because
-    /// the replayed conversation had not produced them. Large and expected on a
-    /// session's first round, where a real trace usually reports a prefix that
-    /// the published data does not contain.
-    pub(crate) folded_prefix_tokens: usize,
-    /// Planned prefix tokens the *live* conversation could not supply, filled
-    /// with fresh ids instead. Nonzero only after a short or failed round; this
-    /// is the one place a live run departs from its materialized plan.
+    /// Trace prefix tokens the *live* conversation could not supply, filled with
+    /// fresh ids instead. Nonzero only after a short or failed round; this is the
+    /// one place a live run departs from the file it is replaying.
+    ///
+    /// How much the canonical trace already folded away at generation time is a
+    /// property of the file, reported once in its manifest rather than per round.
     pub(crate) prefix_shortfall_tokens: usize,
-    pub(crate) major_compaction: bool,
     pub(crate) planned_prefix_hit_rate: Option<f64>,
     pub(crate) output_len_target: usize,
     pub(crate) tool_wait_after_ms: f64,
@@ -133,12 +129,9 @@ impl StepLog {
     pub(crate) fn session_round(
         step: &SessionStep,
         prompt_len: usize,
-        session_context_policy: &str,
         derived_prefix_len: usize,
         derived_append_len: usize,
-        folded_prefix_tokens: usize,
         prefix_shortfall_tokens: usize,
-        major_compaction: bool,
         outcome: GenerationOutcome,
     ) -> Self {
         Self {
@@ -150,12 +143,9 @@ impl StepLog {
                 input_len: step.input_len,
                 target_prompt_len: step.prefix_len.saturating_add(step.input_len),
                 prompt_len,
-                session_context_policy: session_context_policy.to_string(),
                 derived_prefix_len,
                 derived_append_len,
-                folded_prefix_tokens,
                 prefix_shortfall_tokens,
-                major_compaction,
                 planned_prefix_hit_rate: Some(prefix_hit_rate(derived_prefix_len, prompt_len)),
                 output_len_target: step.output_len,
                 tool_wait_after_ms: step.tool_wait_after_ms,
@@ -240,21 +230,11 @@ mod tests {
             output_len: 3,
             tool_wait_after_ms: 5.0,
         };
-        let value = serde_json::to_value(StepLog::session_round(
-            &step,
-            12,
-            "trace_reported",
-            8,
-            4,
-            0,
-            0,
-            false,
-            outcome(),
-        ))
-        .unwrap();
+        let value =
+            serde_json::to_value(StepLog::session_round(&step, 12, 8, 4, 0, outcome())).unwrap();
 
         assert_eq!(value["source"]["type"], "session_round");
-        assert_eq!(value["schema_version"], 8);
+        assert_eq!(value["schema_version"], 9);
         assert_eq!(value["source"]["data"]["prefix_len"], 8);
         assert_eq!(value["source"]["data"]["derived_prefix_len"], 8);
         assert_eq!(value["source"]["data"]["derived_append_len"], 4);

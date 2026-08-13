@@ -1,7 +1,5 @@
 use clap::{Parser, ValueEnum};
 
-use tracelab_replay::policy::SessionContextPolicy;
-
 use crate::trace::TraceFormat;
 
 /// Inference-server wire protocol selected with `--backend`.
@@ -43,7 +41,8 @@ pub(crate) struct Args {
     pub(crate) trace: String,
 
     /// Input schema frontend. New source formats are separate typed frontends,
-    /// not sparse variants of the session CSV row.
+    /// not sparse variants of one universal row. `session` reads a canonical
+    /// execution trace; generate one from a raw CSV with `tracegen`.
     #[arg(long, value_enum, default_value = "session")]
     pub(crate) trace_format: TraceFormat,
 
@@ -71,12 +70,6 @@ pub(crate) struct Args {
     /// builds).
     #[arg(long, value_enum, default_value = "openai")]
     pub(crate) backend: BackendKind,
-
-    /// How a raw session trace's reported prefix becomes a replayable one.
-    /// Rejected with `--trace-format session-execution-v2`, whose policy was
-    /// already resolved when the trace was generated.
-    #[arg(long, value_enum, default_value = "trace-reported")]
-    pub(crate) session_context_policy: SessionContextPolicy,
 
     #[arg(long, default_value_t = 0.0)]
     pub(crate) temperature: f64,

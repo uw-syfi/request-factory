@@ -12,13 +12,12 @@ pub(crate) use session::{SessionPlans, SessionStep};
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TraceFormat {
     Independent,
-    /// Legacy raw session rounds, whose `prefix_len` is what the source
-    /// reported. Needs a runtime context policy to become replayable.
-    Session,
     /// Canonical, already-materialized execution trace shared with the
-    /// simulator. Carries no policy switch.
-    #[value(name = "session-execution-v2")]
-    SessionExecutionV2,
+    /// simulator. Its `prefix_len` is guaranteed to exist by the time the round
+    /// runs, so there is nothing left for a runtime to decide: the context
+    /// policy that resolved it ran in `tracegen` and is recorded in the file's
+    /// manifest. A raw, unmaterialized CSV is rejected at parse.
+    Session,
 }
 
 /// Typed replay plans produced by the trace frontends.
@@ -46,9 +45,6 @@ pub(crate) fn load_workload(
             independent::load(path, max_items).map(ReplayWorkload::IndependentRequests)
         }
         TraceFormat::Session => session::load(path, max_items).map(ReplayWorkload::Sessions),
-        TraceFormat::SessionExecutionV2 => {
-            session::load_execution_v2(path, max_items).map(ReplayWorkload::Sessions)
-        }
     }
 }
 

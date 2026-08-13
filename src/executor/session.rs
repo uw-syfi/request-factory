@@ -9,7 +9,6 @@ use crate::record::StepLog;
 use crate::tokens::{PromptBuild, PromptBuilder, TokenProvider};
 use crate::trace::SessionStep;
 use crate::util::reaches_context_limit;
-use tracelab_replay::policy::SessionContextPolicy;
 
 /// Replay one session as an ordered, closed-loop chain of rounds.
 pub(crate) async fn run_session(
@@ -44,9 +43,7 @@ pub(crate) async fn run_session(
             derived_prefix_len,
             derived_append_len,
             prefix_shortfall_len,
-            folded_tokens,
-            major_compaction,
-        } = prompt_builder.build_prompt(&step, state.args.session_context_policy);
+        } = prompt_builder.build_prompt(&step);
         let request_id = step.request_id.clone();
         state.stats.record_submit();
         let context_limit_skipped =
@@ -65,39 +62,22 @@ pub(crate) async fn run_session(
                 .await
         };
         let GenerationResult {
-            mut outcome,
+            outcome,
             output_ids,
-            output_ids_exact,
         } = result;
-        let exact_context_failure = outcome.is_success()
-            && state.args.session_context_policy == SessionContextPolicy::PrefixPreserving
-            && !output_ids_exact;
-        if exact_context_failure {
-            outcome.status = "FAILED".to_string();
-            outcome.error = Some(
-                "monotonic session context requires exact generated token IDs, but the server response supplied none or a count inconsistent with completion_tokens"
-                    .to_string(),
-            );
-        }
         let log = StepLog::session_round(
             &step,
             prompt_ids.len(),
-            state.args.session_context_policy.label(),
             derived_prefix_len,
             derived_append_len,
             prefix_shortfall_len,
-            folded_tokens,
-            major_compaction,
             outcome,
         );
         let success = log.outcome.is_success();
         let _ = log_tx.send(log).await;
 
         state.stats.record_result(success);
-        if context_limit_skipped
-            || exact_context_failure
-            || (!success && state.args.stop_session_on_error)
-        {
+        if context_limit_skipped || (!success && state.args.stop_session_on_error) {
             break;
         }
 

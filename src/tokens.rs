@@ -4,7 +4,6 @@ use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
-use tracelab_replay::policy::{ContextChain, RawRound, SessionContextPolicy};
 use crate::trace::SessionStep;
 
 /// Cursor over a shared synthetic token pool. Each session seeds at a distinct
@@ -39,30 +38,28 @@ impl TokenProvider {
 /// split: replay `prefix_len` prior-context tokens, then append `input_len`
 /// fresh synthetic tokens.
 ///
-/// Length arithmetic lives in [`crate::policy`]; this type owns only the token
-/// ids and the one thing the materializer cannot know — whether the replayed
-/// conversation really produced the context the plan assumed.
+/// The split itself is not decided here — it was resolved when the canonical
+/// trace was generated. This type owns only the token ids and the one thing that
+/// generation could not know: whether the replayed conversation really produced
+/// the context the file assumed.
 pub(crate) struct PromptBuilder {
     token_provider: TokenProvider,
     context_tokens: Vec<u32>,
-    chain: ContextChain,
 }
 
-/// One constructed prompt: the planned split, the split actually realized, and
+/// One constructed prompt: the trace's split, the split actually realized, and
 /// the repair between them.
 pub(crate) struct PromptBuild {
     pub(crate) prompt_ids: Vec<u32>,
-    /// Cache-eligible prefix actually built. Equals the planned `prefix_len`
+    /// Cache-eligible prefix actually built. Equals the trace's `prefix_len`
     /// unless the conversation came up short, in which case see
     /// `prefix_shortfall_len`.
     pub(crate) derived_prefix_len: usize,
     pub(crate) derived_append_len: usize,
-    /// Planned prefix tokens the replayed conversation could not supply, filled
-    /// with fresh ids and counted as append rather than as a cache hit.
+    /// Trace prefix tokens the replayed conversation could not supply, filled
+    /// with fresh ids and counted as append rather than as a cache hit. The only
+    /// place a live run departs from the file it is replaying.
     pub(crate) prefix_shortfall_len: usize,
-    /// Raw trace prefix tokens the *policy* moved into fresh input.
-    pub(crate) folded_tokens: usize,
-    pub(crate) major_compaction: bool,
 }
 
 impl PromptBuilder {
@@ -70,33 +67,19 @@ impl PromptBuilder {
         Self {
             token_provider,
             context_tokens: Vec::new(),
-            chain: ContextChain::new(),
         }
     }
 
-    pub(crate) fn build_prompt(
-        &mut self,
-        step: &SessionStep,
-        policy: SessionContextPolicy,
-    ) -> PromptBuild {
-        let planned = self.chain.materialize(
-            RawRound {
-                prefix_len: step.prefix_len,
-                input_len: step.input_len,
-                output_len: step.output_len,
-            },
-            policy,
-        );
-
-        // Recoverable shortage (the runtime half of the contract). The plan is
-        // computed from target output lengths; a real server can return fewer
-        // tokens or fail a round, leaving less context than planned. Fill the
-        // gap with fresh ids and count it as append — never as a cache hit the
-        // server cannot honour — instead of aborting an otherwise runnable
-        // session.
-        let derived_prefix_len = planned.prefix_len.min(self.context_tokens.len());
-        let prefix_shortfall_len = planned.prefix_len - derived_prefix_len;
-        let derived_append_len = planned.input_len + prefix_shortfall_len;
+    pub(crate) fn build_prompt(&mut self, step: &SessionStep) -> PromptBuild {
+        // Recoverable shortage (the runtime half of the contract). The file's
+        // split was computed from target output lengths; a real server can
+        // return fewer tokens or fail a round, leaving less context than the
+        // trace assumed. Fill the gap with fresh ids and count it as append —
+        // never as a cache hit the server cannot honour — instead of aborting an
+        // otherwise runnable session.
+        let derived_prefix_len = step.prefix_len.min(self.context_tokens.len());
+        let prefix_shortfall_len = step.prefix_len - derived_prefix_len;
+        let derived_append_len = step.input_len + prefix_shortfall_len;
 
         let mut prompt_ids = self.context_tokens[..derived_prefix_len].to_vec();
         prompt_ids.extend(self.token_provider.take(derived_append_len));
@@ -105,8 +88,6 @@ impl PromptBuilder {
             derived_prefix_len,
             derived_append_len,
             prefix_shortfall_len,
-            folded_tokens: planned.folded_tokens,
-            major_compaction: planned.major_compaction,
         }
     }
 
@@ -141,25 +122,21 @@ mod tests {
         PromptBuilder::new(TokenProvider::new(pool, 0).unwrap())
     }
 
-    // The policy arithmetic itself is covered in `crate::policy`. These cases
-    // cover what only this layer can get wrong: which token ids end up in the
-    // prompt, and what happens when the live conversation is shorter than the
-    // plan assumed.
+    // How a trace's split was chosen is covered by `tracegen`'s policy tests.
+    // These cases cover what only this layer can get wrong: which token ids end
+    // up in the prompt, and what happens when the live conversation turns out
+    // shorter than the file assumed.
 
     #[test]
     fn carries_exact_output_ids_into_the_next_prompt() {
         let mut builder = builder(200_000);
-        let first = builder.build_prompt(
-            &step(0, 4, 2),
-            SessionContextPolicy::PrefixPreserving,
-        );
+        let first = builder.build_prompt(&step(0, 4, 2));
         assert_eq!(first.prompt_ids, vec![0, 1, 2, 3]);
         builder.commit_output(first.prompt_ids, vec![91, 92]);
 
-        let second = builder.build_prompt(
-            &step(4, 4, 1),
-            SessionContextPolicy::PrefixPreserving,
-        );
+        // The trace's round 1 reuses the whole 6-token round 0 — prompt *and*
+        // output — so the server's real ids must reappear inside the prefix.
+        let second = builder.build_prompt(&step(6, 2, 1));
 
         assert_eq!(second.prompt_ids, vec![0, 1, 2, 3, 91, 92, 4, 5]);
         assert_eq!(second.derived_prefix_len, 6);
@@ -168,63 +145,20 @@ mod tests {
     }
 
     #[test]
-    fn trace_reported_first_round_prefix_becomes_fresh_tokens_not_a_claimed_hit() {
-        let mut builder = builder(200_000);
-
-        let built = builder.build_prompt(
-            &step(12_461, 5_875, 124),
-            SessionContextPolicy::TraceReported,
-        );
-
-        // The session has no context yet, so none of the prompt is cacheable.
-        assert_eq!(built.derived_prefix_len, 0);
-        assert_eq!(built.derived_append_len, 12_461 + 5_875);
-        assert_eq!(built.folded_tokens, 12_461);
-        assert_eq!(built.prompt_ids.len(), 12_461 + 5_875);
-        assert_eq!(built.prompt_ids[..8], [0, 1, 2, 3, 4, 5, 6, 7]);
-    }
-
-    #[test]
     fn repairs_a_prefix_the_live_conversation_could_not_supply() {
         let mut builder = builder(200_000);
-        let first = builder.build_prompt(
-            &step(0, 4, 2),
-            SessionContextPolicy::PrefixPreserving,
-        );
-        // The server returned nothing, so the plan's 6 tokens of context are
-        // really only the 4 prompt tokens.
+        let first = builder.build_prompt(&step(0, 4, 2));
+        // The server returned nothing, so the 6 tokens of context the trace
+        // counted on are really only the 4 prompt tokens.
         builder.commit_output(first.prompt_ids, Vec::new());
 
-        let second = builder.build_prompt(
-            &step(4, 4, 1),
-            SessionContextPolicy::PrefixPreserving,
-        );
+        let second = builder.build_prompt(&step(6, 2, 1));
 
         assert_eq!(second.derived_prefix_len, 4);
         assert_eq!(second.prefix_shortfall_len, 2);
         assert_eq!(second.derived_append_len, 4);
         assert_eq!(second.prompt_ids[..4], [0, 1, 2, 3]);
         assert_eq!(second.prompt_ids.len(), 8);
-    }
-
-    #[test]
-    fn major_compaction_rebuilds_the_prompt_from_fresh_tokens() {
-        let mut builder = builder(400_000);
-        let first = builder.build_prompt(
-            &step(0, 130_000, 10_000),
-            SessionContextPolicy::PrefixPreserving,
-        );
-        builder.commit_output(first.prompt_ids, vec![7; 10_000]);
-
-        let built = builder.build_prompt(
-            &step(50_000, 20_000, 1),
-            SessionContextPolicy::PrefixPreserving,
-        );
-
-        assert!(built.major_compaction);
-        assert_eq!(built.derived_prefix_len, 0);
-        assert_eq!(built.derived_append_len, 70_000);
-        assert_eq!(built.prefix_shortfall_len, 0);
     }
 }
 

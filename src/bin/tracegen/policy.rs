@@ -8,9 +8,12 @@
 //!
 //! Resolving that gap is *materialization*: turning a raw round into a round
 //! whose `prefix_len` is guaranteed to exist by the time it runs. This module
-//! owns that arithmetic and nothing else — no token ids, no tokenizer, no I/O —
-//! so the trace generator and the replay runtime can share one implementation
-//! instead of each maintaining its own copy of the rules.
+//! owns that arithmetic and nothing else — no token ids, no tokenizer, no I/O.
+//!
+//! It lives inside `tracegen` because materialization happens exactly once, when
+//! a canonical trace is generated. A replay runtime never performs it: it reads
+//! a file whose split was already resolved, and the policy that resolved it is
+//! recorded in that file's manifest.
 //!
 //! The two policies differ only in what they preserve when raw and replayed
 //! context disagree:
@@ -18,7 +21,7 @@
 //! - [`SessionContextPolicy::TraceReported`] preserves the *reported split*. It
 //!   never claims more prefix than exists, and moves the shortfall into fresh
 //!   input so the total prompt length still matches the trace.
-//! - [`SessionContextPolicy::PrefixPreserving`] preserves the *longest real
+//! - [`SessionContextPolicy::Monotonic`] preserves the *longest real
 //!   prefix*. It reuses as much of the replayed conversation as the trace's
 //!   total prompt length allows, and only starts over on a major compaction.
 //!
@@ -29,10 +32,9 @@ use clap::ValueEnum;
 
 /// How raw trace lengths become a round's replayable prefix/append split.
 ///
-/// This is a property of the trace, not of a runtime: it is chosen when the
-/// canonical execution trace is generated and recorded in its manifest. The
-/// replay runtime still names it so a raw trace can be replayed directly during
-/// migration.
+/// This is a property of the trace, not of a runtime: it is chosen here, when
+/// the canonical execution trace is generated, and recorded in that trace's
+/// manifest. Nothing downstream gets to reinterpret it.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionContextPolicy {
     /// Preserve the trace-reported split, folding any prefix the replayed
@@ -40,15 +42,14 @@ pub enum SessionContextPolicy {
     TraceReported,
     /// Preserve the longest prefix the replayed conversation can supply, up to
     /// the trace's total prompt length, resetting only on a major compaction.
-    #[value(alias = "monotonic")]
-    PrefixPreserving,
+    Monotonic,
 }
 
 impl SessionContextPolicy {
     pub fn label(self) -> &'static str {
         match self {
             Self::TraceReported => "trace_reported",
-            Self::PrefixPreserving => "prefix_preserving",
+            Self::Monotonic => "monotonic",
         }
     }
 }
@@ -110,7 +111,9 @@ impl ContextChain {
         Self::default()
     }
 
-    /// Context length available to the *next* round.
+    /// Context length available to the *next* round. Read only by the tests
+    /// that pin how a chain grows; generation itself never inspects it.
+    #[cfg(test)]
     pub fn context_len(&self) -> usize {
         self.context_len
     }
@@ -122,7 +125,7 @@ impl ContextChain {
     ) -> MaterializedRound {
         let round = match policy {
             SessionContextPolicy::TraceReported => self.materialize_trace_reported(raw),
-            SessionContextPolicy::PrefixPreserving => self.materialize_prefix_preserving(raw),
+            SessionContextPolicy::Monotonic => self.materialize_monotonic(raw),
         };
         self.context_len = round.prefix_len + round.input_len + round.output_len;
         round
@@ -154,7 +157,7 @@ impl ContextChain {
     /// conversation, so the prefix is truncated to the trace target rather than
     /// retained in full — the live prompt must never grow past the recorded
     /// workload shape.
-    fn materialize_prefix_preserving(&self, raw: RawRound) -> MaterializedRound {
+    fn materialize_monotonic(&self, raw: RawRound) -> MaterializedRound {
         let target_prompt_len = raw.prefix_len + raw.input_len;
         let dropped = self.context_len.saturating_sub(target_prompt_len);
         let drop_ratio = if self.context_len == 0 {
@@ -239,12 +242,12 @@ mod tests {
     }
 
     #[test]
-    fn prefix_preserving_grows_the_prefix_to_the_trace_target() {
+    fn monotonic_grows_the_prefix_to_the_trace_target() {
         let mut chain = ContextChain::new();
-        chain.materialize(raw(0, 512, 64), SessionContextPolicy::PrefixPreserving);
+        chain.materialize(raw(0, 512, 64), SessionContextPolicy::Monotonic);
         assert_eq!(chain.context_len(), 576);
 
-        let round = chain.materialize(raw(576, 128, 64), SessionContextPolicy::PrefixPreserving);
+        let round = chain.materialize(raw(576, 128, 64), SessionContextPolicy::Monotonic);
 
         assert_eq!(round.prefix_len, 576);
         assert_eq!(round.input_len, 128);
@@ -252,13 +255,13 @@ mod tests {
     }
 
     #[test]
-    fn prefix_preserving_reuses_more_than_the_trace_reported() {
+    fn monotonic_reuses_more_than_the_trace_reported() {
         let mut chain = ContextChain::new();
-        chain.materialize(raw(0, 1_000, 100), SessionContextPolicy::PrefixPreserving);
+        chain.materialize(raw(0, 1_000, 100), SessionContextPolicy::Monotonic);
 
         // The trace reports a cold-ish round, but the conversation has 1,100
         // tokens of real context and the target prompt is 900 tokens.
-        let round = chain.materialize(raw(400, 500, 50), SessionContextPolicy::PrefixPreserving);
+        let round = chain.materialize(raw(400, 500, 50), SessionContextPolicy::Monotonic);
 
         assert_eq!(round.prefix_len, 900);
         assert_eq!(round.input_len, 0);
@@ -266,12 +269,12 @@ mod tests {
     }
 
     #[test]
-    fn prefix_preserving_truncates_a_small_reduction_without_resetting() {
+    fn monotonic_truncates_a_small_reduction_without_resetting() {
         let mut chain = ContextChain::new();
-        chain.materialize(raw(0, 9_000, 1_000), SessionContextPolicy::PrefixPreserving);
+        chain.materialize(raw(0, 9_000, 1_000), SessionContextPolicy::Monotonic);
         assert_eq!(chain.context_len(), 10_000);
 
-        let round = chain.materialize(raw(8_500, 1_000, 100), SessionContextPolicy::PrefixPreserving);
+        let round = chain.materialize(raw(8_500, 1_000, 100), SessionContextPolicy::Monotonic);
 
         assert_eq!(round.prefix_len, 9_500);
         assert_eq!(round.input_len, 0);
@@ -279,19 +282,19 @@ mod tests {
     }
 
     #[test]
-    fn prefix_preserving_resets_only_when_both_thresholds_hold() {
+    fn monotonic_resets_only_when_both_thresholds_hold() {
         let mut chain = ContextChain::new();
-        chain.materialize(raw(0, 190_000, 10_000), SessionContextPolicy::PrefixPreserving);
+        chain.materialize(raw(0, 190_000, 10_000), SessionContextPolicy::Monotonic);
         assert_eq!(chain.context_len(), 200_000);
 
         // 70,000 tokens dropped clears the absolute floor but is only 35% of the
         // context, so this is trimming, not compaction.
-        let trimmed = chain.materialize(raw(130_000, 0, 0), SessionContextPolicy::PrefixPreserving);
+        let trimmed = chain.materialize(raw(130_000, 0, 0), SessionContextPolicy::Monotonic);
         assert!(!trimmed.major_compaction);
         assert_eq!(trimmed.prefix_len, 130_000);
 
         // Now 122,000 tokens go, which is 93% of the remaining context.
-        let reset = chain.materialize(raw(8_000, 0, 0), SessionContextPolicy::PrefixPreserving);
+        let reset = chain.materialize(raw(8_000, 0, 0), SessionContextPolicy::Monotonic);
         assert!(reset.major_compaction);
         assert_eq!(reset.prefix_len, 0);
         assert_eq!(reset.input_len, 8_000);
@@ -301,7 +304,7 @@ mod tests {
     fn both_policies_preserve_total_prompt_length() {
         for policy in [
             SessionContextPolicy::TraceReported,
-            SessionContextPolicy::PrefixPreserving,
+            SessionContextPolicy::Monotonic,
         ] {
             let mut chain = ContextChain::new();
             for raw_round in [raw(9_000, 500, 64), raw(600, 128, 64), raw(0, 32, 8)] {

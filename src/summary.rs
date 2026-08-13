@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_summary_uses_policy_derived_prefix_not_raw_trace_prefix() {
+    fn prefix_summary_uses_the_derived_prefix_not_the_traces_own() {
         let source = SessionRoundSource {
             session_id: "session".to_string(),
             round_idx: 1,
@@ -584,12 +584,9 @@ mod tests {
             input_len: 90,
             target_prompt_len: 100,
             prompt_len: 100,
-            session_context_policy: "prefix_preserving".to_string(),
             derived_prefix_len: 80,
             derived_append_len: 20,
-            folded_prefix_tokens: 0,
             prefix_shortfall_tokens: 0,
-            major_compaction: false,
             planned_prefix_hit_rate: Some(0.8),
             output_len_target: 4,
             tool_wait_after_ms: 0.0,

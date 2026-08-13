@@ -312,7 +312,9 @@ fn sglang_usage(meta_info: &Value) -> Option<Usage> {
 /// the TPOT denominator, so the shared engine treats this as a hard failure.
 /// The first chunk is exempt because an empty accumulator prefixes anything.
 fn restates_accumulated_output(accumulated: &[u32], incoming: &[u32]) -> bool {
-    !accumulated.is_empty() && incoming.len() > accumulated.len() && incoming.starts_with(accumulated)
+    !accumulated.is_empty()
+        && incoming.len() > accumulated.len()
+        && incoming.starts_with(accumulated)
 }
 
 /// Verdict on generated token ids that outnumber the server's completion count.
@@ -362,9 +364,6 @@ fn classify_prompt_echo(
 pub(crate) struct GenerationResult {
     pub(crate) outcome: GenerationOutcome,
     pub(crate) output_ids: Vec<u32>,
-    /// True only when `output_ids` came directly from server token-id events and
-    /// agree with the server's completion-token count when that count is present.
-    pub(crate) output_ids_exact: bool,
 }
 
 pub(crate) fn context_limit_skip_result(
@@ -409,7 +408,6 @@ pub(crate) fn context_limit_skip_result(
             )),
         },
         output_ids: Vec::new(),
-        output_ids_exact: false,
     }
 }
 
@@ -728,7 +726,6 @@ impl GenerationClient {
                 error,
             },
             output_ids,
-            output_ids_exact,
         }
     }
 
