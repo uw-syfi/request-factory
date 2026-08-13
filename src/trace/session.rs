@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 
-use tracelab_replay::v2;
+use req_frontend::v2;
 
 /// One round of one session, as the replay runtime executes it.
 ///
@@ -77,7 +77,7 @@ mod tests {
 
     fn write_temp(name: &str, contents: &str) -> String {
         let mut path = std::env::temp_dir();
-        path.push(format!("tracelab-session-test-{name}.csv"));
+        path.push(format!("req-frontend-session-test-{name}.csv"));
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(contents.as_bytes()).unwrap();
         path.display().to_string()

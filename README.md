@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1>TraceLab Replay</h1>
+<h1>req-frontend</h1>
 
 **Replay real coding-agent workload shapes against an inference server.**
 
@@ -26,6 +26,14 @@ requests. It preserves the trace's request lengths, release timing, session
 ordering, and tool waits while replacing private prompt contents with synthetic
 token IDs from a user-supplied text corpus. This runner reproduces workload
 shape, not original private text or model answers.
+
+It reads a trace; it does not collect one. The public coding-agent corpus these
+traces are usually derived from lives in [TraceLab][tracelab], which exports raw
+session rounds; `tracegen` here turns those into the canonical execution trace
+`session_runner` replays. This repository was extracted from TraceLab's
+`replay/` directory and carries that history.
+
+[tracelab]: https://github.com/uw-syfi/TraceLab
 
 ## Configuration axes
 
@@ -128,28 +136,28 @@ For what is deliberately *not* implemented, see [Current scope](#current-scope).
 
 ## Quickstart
 
-Run these commands from the TraceLab repository root.
+Run these commands from the repository root.
 
 ### 1. Build
 
 ```bash
-cargo build --release --manifest-path replay/Cargo.toml --bin session_runner
+cargo build --release --manifest-path Cargo.toml --bin session_runner
 ```
 
 ### 2. Parse and inspect a trace without a server
 
 ```bash
-mkdir -p "$TMPDIR/tracelab-replay"
+mkdir -p "$TMPDIR/req-frontend"
 
-./replay/target/release/session_runner \
-  --trace replay/examples/session_execution_v2_example.csv \
+./target/release/session_runner \
+  --trace examples/session_execution_v2_example.csv \
   --trace-format session \
   --text-file unused-in-dry-run \
   --tokenizer unused-in-dry-run \
   --model dry-run \
   --dry-run \
   --max-model-len 131072 \
-  --summary-path "$TMPDIR/tracelab-replay/dry-run-summary.json"
+  --summary-path "$TMPDIR/req-frontend/dry-run-summary.json"
 ```
 
 `--text-file`, `--tokenizer`, and `--model` remain required CLI arguments, but
@@ -175,8 +183,8 @@ identity are not automatically proven today.
 ### 3. Replay through the OpenAI-compatible backend
 
 ```bash
-./replay/target/release/session_runner \
-  --trace replay/examples/session_execution_v2_example.csv \
+./target/release/session_runner \
+  --trace examples/session_execution_v2_example.csv \
   --trace-format session \
   --text-file /path/to/large-text-corpus \
   --tokenizer /path/to/model-or-tokenizer.json \
@@ -185,8 +193,8 @@ identity are not automatically proven today.
   --base-url http://127.0.0.1:8000/v1 \
   --max-model-len 131072 \
   --skip-when-reaching-limit \
-  --log-path "$TMPDIR/tracelab-replay/requests.jsonl" \
-  --summary-path "$TMPDIR/tracelab-replay/summary.json"
+  --log-path "$TMPDIR/req-frontend/requests.jsonl" \
+  --summary-path "$TMPDIR/req-frontend/summary.json"
 ```
 
 Before any measured requests, every live run performs a two-request
@@ -209,7 +217,7 @@ TTFT/TPOT must exclude detokenization work.
 
 ## Engine-side setup guide
 
-TraceLab measures the full client-visible streaming path, so engine setup is
+req-frontend measures the full client-visible streaming path, so engine setup is
 part of the measurement contract. The model engine and its HTTP frontend are
 separate capacity boundaries: TP/DP and batching control EngineCore execution,
 while vLLM API processes parse requests, receive engine outputs, serialize SSE
@@ -230,11 +238,11 @@ python -m vllm.entrypoints.cli.main serve \
   --disable-uvicorn-access-log
 ```
 
-Use `--base-url http://127.0.0.1:8000/v1 --backend openai` on the TraceLab
+Use `--base-url http://127.0.0.1:8000/v1 --backend openai` on the req-frontend
 side. For native token-in/token-out, add `--tokens-only` to the server command
 and use `--base-url http://127.0.0.1:8000 --backend vllm-tokens`.
 
-| Server setting | Why TraceLab needs it |
+| Server setting | Why req-frontend needs it |
 |---|---|
 | `--enable-prefix-caching` | Enables the cache behavior audited by the mandatory two-request preflight. |
 | `--enable-prompt-tokens-details` | Returns cached-token usage needed to prove the preflight and report cache alignment. |
@@ -254,12 +262,12 @@ python -m sglang.launch_server \
 ```
 
 Use `--base-url http://127.0.0.1:30000 --backend sglang-tokens` on the
-TraceLab side — no `/v1` suffix, because `/generate` is a native route.
+req-frontend side — no `/v1` suffix, because `/generate` is a native route.
 
-| Server setting | Why TraceLab needs it |
+| Server setting | Why req-frontend needs it |
 |---|---|
 | `--skip-tokenizer-init` | Accepts `input_ids` and returns `output_ids` with no detokenization. The counterpart of vLLM's `--tokens-only`. OpenAI-compatible routes stop working on this server. |
-| `--stream-output` | Streams disjoint deltas. Without it SGLang resends the full output every chunk, which distorts late-token latency; TraceLab detects this and fails rather than reporting it. Newer SGLang renames it `--incremental-streaming-output`. |
+| `--stream-output` | Streams disjoint deltas. Without it SGLang resends the full output every chunk, which distorts late-token latency; req-frontend detects this and fails rather than reporting it. Newer SGLang renames it `--incremental-streaming-output`. |
 
 SGLang's radix prefix cache is on by default and reports `cached_tokens` in
 `meta_info`, so the preflight needs no extra flag — unlike vLLM, which needs
@@ -267,19 +275,19 @@ SGLang's radix prefix cache is on by default and reports `cached_tokens` in
 
 ### API process sizing
 
-Do not confuse vLLM API processes with TraceLab concurrency or TraceLab's
+Do not confuse vLLM API processes with req-frontend concurrency or req-frontend's
 Tokio worker threads:
 
 | Boundary | Control | Meaning |
 |---|---|---|
-| TraceLab arrival scheduler | `--arrival-mode`, CSV arrivals and `--rate` | When top-level workload units become runnable. |
-| TraceLab active work | `--max-concurrency` | Maximum active sessions or independent requests, counted across tool waits. |
-| TraceLab runtime | Tokio workers, reported under `client_runtime` | Polling release and HTTP client tasks. |
+| req-frontend arrival scheduler | `--arrival-mode`, CSV arrivals and `--rate` | When top-level workload units become runnable. |
+| req-frontend active work | `--max-concurrency` | Maximum active sessions or independent requests, counted across tool waits. |
+| req-frontend runtime | Tokio workers, reported under `client_runtime` | Polling release and HTTP client tasks. |
 | vLLM HTTP frontend | `--api-server-count N` | Number of API processes draining EngineCore outputs and emitting streams. |
 | vLLM EngineCore | TP/DP, batching, and token-budget flags | Model execution and engine-side queueing. |
 
 One API process can become the bottleneck at high request rates even while the
-GPU engine has capacity. Increasing TraceLab `--max-concurrency` does not fix
+GPU engine has capacity. Increasing req-frontend `--max-concurrency` does not fix
 that server-side bottleneck. Typical evidence is:
 
 - `arrival_release_lag_ms` remains small, proving the client released on time;
@@ -302,11 +310,11 @@ Started 8 API server processes
 ApiServer_0 ... ApiServer_7
 ```
 
-In the vLLM fork used by TraceLab alignment,
+In the vLLM fork used for alignment,
 `python -m vllm.entrypoints.openai.api_server` accepts
 `--api-server-count` but still enters the single-server path. Launch through
 `vllm serve` or `python -m vllm.entrypoints.cli.main serve` to select the real
-multi-API path. Before measuring, also confirm that the TraceLab prefix-cache
+multi-API path. Before measuring, also confirm that the req-frontend prefix-cache
 preflight passes and that the server reports the intended model, TP/DP layout,
 prefix caching, token mode, and `stream_interval`.
 
@@ -359,8 +367,8 @@ What the format buys, and what it costs:
 Generate one from a raw session trace with `tracegen`:
 
 ```bash
-cargo run --release --manifest-path replay/Cargo.toml --bin tracegen -- \
-  --source replay/examples/multi_session_example.csv \
+cargo run --release --manifest-path Cargo.toml --bin tracegen -- \
+  --source examples/multi_session_example.csv \
   --policy trace-reported \
   --max-sessions 200 \
   --out trace/execution.csv
@@ -484,7 +492,7 @@ Every flag, including the ones outside this axis, is listed in the
 
 All three backends submit the prompt as explicit token IDs, so they are
 **identical on the input side**: the server's prefix-cache keys are the exact
-ids TraceLab constructed. They differ only in what comes back, and the
+ids req-frontend constructed. They differ only in what comes back, and the
 difference is not whether generated token IDs are available — they are, on all
 three — but whether the server performs detokenization at all.
 
@@ -543,7 +551,7 @@ POST {base_url}/generate
 
 The server must be launched with **two** flags:
 
-| Server flag | Why TraceLab requires it |
+| Server flag | Why req-frontend requires it |
 |---|---|
 | `--skip-tokenizer-init` | The counterpart of vLLM's `--tokens-only`. The server accepts `input_ids` and returns `output_ids` without ever detokenizing. OpenAI-compatible endpoints stop working on that server, so use `/generate`. |
 | `--stream-output` | Makes streamed chunks disjoint deltas. SGLang's default resends the entire output in every chunk, which is O(n²) bytes over the stream and inflates late-token latency — a measurement artifact, not just a parsing inconvenience. Newer SGLang renames this to `--incremental-streaming-output` and keeps `--stream-output` as a deprecated alias. |
@@ -614,7 +622,7 @@ vLLM server. Omitting `backend` keeps the backward-compatible `openai` default.
 
 ## Synthetic token corpus
 
-`--text-file` supplies content, while the CSV supplies shape. TraceLab tokenizes
+`--text-file` supplies content, while the CSV supplies shape. req-frontend tokenizes
 non-empty corpus lines once with `add_special_tokens = false`, stores the
 resulting IDs in a shared pool, and performs all later prompt construction in
 ID space. The tokenizer must match the served model.
@@ -628,7 +636,7 @@ max(2 * longest_trace_prompt, workload_unit_count, 100,000,000 tokens)
 
 The 100M-token floor consumes about 400 MB for the `u32` ID pool and generally
 requires roughly 400–600 MB or more of source text. `--token-pool-limit` can
-reduce it. If the corpus produces fewer IDs than the longest prompt, TraceLab
+reduce it. If the corpus produces fewer IDs than the longest prompt, req-frontend
 warns that content will repeat within a request and may distort prefix-cache
 measurements. Monotonic construction also keeps every actual prompt at the
 trace-reported target `prefix_len + input_len`.
@@ -639,7 +647,7 @@ boundary transitions but no client/server mismatch: the exact resulting IDs are
 sent directly to the server.
 
 For large-context tests, a large public corpus such as `enwik9` is suitable.
-TraceLab does not bundle it; obtain it from its original distributor and follow
+req-frontend does not bundle it; obtain it from its original distributor and follow
 the applicable license.
 
 ## Context limits and prefix-cache preflight
@@ -654,7 +662,7 @@ of headroom. A live request is skipped when:
 actual_prompt_len + output_len_target >= max_model_len
 ```
 
-Equality deliberately skips. TraceLab does not silently shorten the requested
+Equality deliberately skips. req-frontend does not silently shorten the requested
 output to fit. An independent request is logged as skipped and replay continues.
 A skipped session round is logged and that session terminates, because the
 missing model output makes subsequent context continuation untrustworthy.
@@ -668,7 +676,7 @@ the trace's own numbers only when `prefix_shortfall_tokens` is nonzero.
 
 ### Prefix-cache preflight
 
-Before every non-dry run, TraceLab sends the same 512-token-or-smaller probe
+Before every non-dry run, req-frontend sends the same 512-token-or-smaller probe
 twice and requires the second response to report a positive cached-token count.
 A single probe cannot separate "prefix caching is off" from "the cache is
 cold", so the run aborts unless the second response proves a hit. Both probe
@@ -785,7 +793,7 @@ join key against server-side logs. Its shape depends on the frontend:
 | `independent` | `independent_{id}` | `independent_request-0` |
 
 Both frontends namespace their ids with the frontend name. That prefix is
-TraceLab's, not the corpus's: the `session_id` column keeps whatever the dataset
+this client's, not the corpus's: the `session_id` column keeps whatever the dataset
 called the session, which in the published corpus is a bare integer that would
 otherwise make `0_round_000001` say nothing about what it identifies. Only
 `round_idx` is zero-padded.
@@ -884,7 +892,7 @@ token-level plan.
 | `prefix-cache preflight failed` | Enable prefix caching and prompt-token usage details — for vLLM, `--enable-prompt-tokens-details` (or `ENABLE_PROMPT_TOKENS_DETAILS=1`) with prefix caching left on. Confirm both probe requests reach the same server/cache shard. |
 | `failed to parse a session-execution-v2 row` | The file is a raw, unmaterialized CSV. Run it through `tracegen` first; `--trace-format session` reads canonical traces only. |
 | `server streamed cumulative output` | The SGLang server is in its default cumulative streaming mode. Relaunch it with `--stream-output` (named `--incremental-streaming-output` in newer builds). |
-| `the extra leading ids do not match the prompt tail` | The server streamed more generated IDs than its own `completion_tokens` count, and the excess is not an echo of the prompt. TraceLab refuses to guess what those IDs are; inspect the raw response before trusting the run. |
+| `the extra leading ids do not match the prompt tail` | The server streamed more generated IDs than its own `completion_tokens` count, and the excess is not an echo of the prompt. req-frontend refuses to guess what those IDs are; inspect the raw response before trusting the run. |
 | `--rate ... --arrival-mode saturated` rejected | One rescales the recorded timeline, the other discards it. To bound a saturated run, use `--max-concurrency`. |
 | `--max-concurrency` appears to change nothing | The units never overlap, so the cap never binds. Check the trace's arrival spacing against its per-unit duration; to force overlap, use `--arrival-mode saturated`. |
 | `cannot apply --rate` | The selected workload has fewer than two distinct top-level arrival times. |
@@ -963,12 +971,18 @@ A context-limit skip always ends its session, independently of this flag.
 <summary><b>Contributor-facing module map</b></summary>
 
 ```text
-replay/
+.
 ├── examples/                 canonical trace + raw tracegen inputs
+├── skills/                   agent-facing operating guide for a replay
 ├── src/
+│   ├── lib.rs                the public library: the canonical trace, only
+│   ├── v2.rs                 session-execution-v2 schema, minting, validation
 │   ├── main.rs               argument validation, preflight, task fan-out
 │   ├── cli.rs                public CLI contract
 │   ├── backend.rs            backend adapters + shared streaming engine
+│   ├── bin/tracegen/
+│   │   ├── main.rs           raw trace -> canonical trace + manifest
+│   │   └── policy.rs         context-policy arithmetic (generation-time only)
 │   ├── executor/
 │   │   ├── mod.rs            shared run state, progress counters, status task
 │   │   ├── session.rs        ordered closed-loop session executor
@@ -990,6 +1004,12 @@ own only endpoint, payload, and response parsing. The shared generation client
 accepts normalized token-generation requests; it does not depend on either
 frontend's row type.
 
+`src/lib.rs` exposes exactly one thing — the canonical `session-execution-v2`
+trace — because that is the only artifact other programs need to agree with us
+about. `session_runner` and `tracegen` are binaries built on top of it, and a
+simulator reading the same trace links the library rather than reimplementing
+the schema.
+
 </details>
 
 ## Current scope
@@ -1007,5 +1027,5 @@ Not currently provided:
 - TTFT/TPOT SLO pass/fail policy;
 - block-level Prometheus cache telemetry.
 
-TraceLab code is licensed under Apache 2.0; see the repository-level
-[`LICENSE`](../LICENSE).
+This code is licensed under Apache 2.0; see the repository-level
+[`LICENSE`](LICENSE).

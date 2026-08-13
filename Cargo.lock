@@ -1452,6 +1452,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "req-frontend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "csv",
+ "fdlimit",
+ "futures",
+ "hf-hub",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.11.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1978,24 +1996,6 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
-
-[[package]]
-name = "tracelab-session-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "csv",
- "fdlimit",
- "futures",
- "hf-hub",
- "reqwest",
- "serde",
- "serde_json",
- "tokenizers",
- "tokio",
-]
 
 [[package]]
 name = "tracing"

@@ -28,7 +28,7 @@ use policy::{
     ContextChain, RawRound, SessionContextPolicy, MAJOR_COMPACTION_MIN_DROP_RATIO,
     MAJOR_COMPACTION_MIN_DROP_TOKENS,
 };
-use tracelab_replay::v2::{
+use req_frontend::v2::{
     self, format_milliseconds, request_id, ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME,
 };
 

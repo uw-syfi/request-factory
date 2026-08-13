@@ -1,21 +1,20 @@
 ---
 name: coding-trace-replay
-description: "Configure, run, and read a TraceLab replay against a live inference server. Use when choosing a trace format or frontend (session, independent), generating a canonical trace with tracegen and picking its context policy (trace-reported versus monotonic), setting arrival mode and concurrency (--arrival-mode, --rate, --max-concurrency, --max-items), choosing a wire backend (openai, vllm-tokens, sglang-tokens) and the server flags it requires, launching vLLM or SGLang for a replay, diagnosing prefix-cache preflight failures, cumulative-streaming or echoed-prompt errors, or interpreting session_runner_output.jsonl and summary.json."
+description: "Configure, run, and read a req-frontend replay against a live inference server. Use when choosing a trace format or frontend (session, independent), generating a canonical trace with tracegen and picking its context policy (trace-reported versus monotonic), setting arrival mode and concurrency (--arrival-mode, --rate, --max-concurrency, --max-items), choosing a wire backend (openai, vllm-tokens, sglang-tokens) and the server flags it requires, launching vLLM or SGLang for a replay, diagnosing prefix-cache preflight failures, cumulative-streaming or echoed-prompt errors, or interpreting session_runner_output.jsonl and summary.json."
 ---
 
 # Coding Trace Replay
 
 ## Overview
 
-Use this skill to drive `replay/` — the `session_runner` load generator and the
-`tracegen` materializer. This is the *replay* side of the repo, distinct from the
-dataset pipeline (`$coding-trace-collect` → `$coding-trace-normalize` →
-`$coding-trace-sanitize` → `$coding-trace-analyze`) that produces the traces it
-consumes.
+Use this skill to drive this repo — the `session_runner` load generator and the
+`tracegen` materializer. This is the *replay* side of the pipeline, distinct
+from the dataset side that produces the raw traces it consumes; that lives in
+[TraceLab](https://github.com/uw-syfi/TraceLab).
 
-`replay/README.md` is the authoritative reference and stays authoritative. This
-skill is the decision path through it: which value on each axis, what that
-choice commits you to, and which failures mean a real problem versus a
+`README.md` is the authoritative reference and stays authoritative. This skill
+is the decision path through it: which value on each axis, what that choice
+commits you to, and which failures mean a real problem versus a
 misconfiguration.
 
 The runner replaces private prompt text with synthetic token IDs from a corpus
@@ -25,21 +24,19 @@ answers.
 
 ## First Steps
 
-1. Work from the repo root (`pyproject.toml`, `replay/`, `trace/`, `artifacts/`).
-2. Build once: `cargo build --release --manifest-path replay/Cargo.toml`. The
-   binaries are `session_runner` and `tracegen`.
+1. Work from the repo root (`Cargo.toml`, `src/`, `examples/`).
+2. Build once: `cargo build --release`. The binaries are `session_runner` and
+   `tracegen`.
 3. **Always dry-run first**: add `--dry-run` to parse the trace, print the
    workload summary, and contact no server. It catches schema and axis errors in
    under a second.
 4. Decide all three axes explicitly before running. Defaults are `--trace-format
    session --arrival-mode trace-timed --backend openai`; a default that was never
    chosen is the usual source of a result nobody can interpret later.
-5. Use `uv run python ...` for anything on the Python side (the alignment
-   launcher under `alignment/load_generator/`).
 
 ## The Three Axes
 
-Read `replay/README.md` § *Configuration axes* for the full tables. The decisions:
+Read `README.md` § *Configuration axes* for the full tables. The decisions:
 
 ### Axis 1 — trace format
 
@@ -79,8 +76,8 @@ differ in whether the server detokenizes on the way out.
 Materialize a raw session CSV once, then hand the same bytes to every consumer:
 
 ```bash
-cargo run --release --manifest-path replay/Cargo.toml --bin tracegen -- \
-  --source replay/examples/multi_session_example.csv \
+cargo run --release --bin tracegen -- \
+  --source examples/multi_session_example.csv \
   --policy trace-reported \
   --max-sessions 200 \
   --out trace/execution.csv
@@ -94,8 +91,8 @@ prefill; on real coding-agent data this is dominated by first rounds, where the
 agent resumed from context the published trace does not contain. A large fold is
 not a bug, but a hit rate reported without it is misleading.
 
-The raw source CSV comes from `$coding-trace-analyze`
-(`artifacts/trace_facts/csv_export/convert.py`). Session identity there is
+The raw source CSV comes from TraceLab's exporter,
+`artifacts/trace_facts/csv_export/convert.py`. Session identity there is
 `(project, session_file, session_id)` — grouping by `session_id` alone merges
 distinct sessions.
 
@@ -103,14 +100,14 @@ distinct sessions.
 
 ```bash
 # 1. Parse only. No server contacted.
-./replay/target/release/session_runner \
-  --trace trace/execution.csv --trace-format session-execution-v2 \
+./target/release/session_runner \
+  --trace trace/execution.csv --trace-format session \
   --text-file corpus.txt --tokenizer <hf-model-or-path> --model <served-name> \
   --dry-run
 
 # 2. Replay a canonical trace through native vLLM token-in/token-out.
-./replay/target/release/session_runner \
-  --trace trace/execution.csv --trace-format session-execution-v2 \
+./target/release/session_runner \
+  --trace trace/execution.csv --trace-format session \
   --text-file corpus.txt --tokenizer <hf-model-or-path> --model <served-name> \
   --base-url http://127.0.0.1:8000 --backend vllm-tokens \
   --log-path out/session_runner_output.jsonl --summary-path out/summary.json
@@ -148,14 +145,14 @@ server's own token space.
 
 ## Troubleshooting
 
-Full table in `replay/README.md` § *Troubleshooting*. The ones that are
+Full table in `README.md` § *Troubleshooting*. The ones that are
 configuration rather than server problems:
 
 | Symptom | Action |
 |---|---|
 | `prefix-cache preflight failed` | The server does not report cached prompt tokens. vLLM needs `--enable-prompt-tokens-details`; SGLang reports them by default. This is a hard abort by design — without it every hit rate silently reads zero. |
 | `failed to parse a session-execution-v2 row` | The trace is a raw, unmaterialized CSV. Generate a canonical one with `tracegen` first. |
-| `server streamed cumulative output` | SGLang is in default cumulative mode. Relaunch with `--stream-output`. TraceLab fails rather than reporting the distorted late-token latency. |
+| `server streamed cumulative output` | SGLang is in default cumulative mode. Relaunch with `--stream-output`. req-frontend fails rather than reporting the distorted late-token latency. |
 | `--rate` rejected with `saturated` | Pick one. To bound a saturated run, use `--max-concurrency`. |
 
 ## Reporting Guidance

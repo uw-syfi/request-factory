@@ -1,5 +1,5 @@
 [package]
-name = "tracelab-session-runner"
+name = "req-frontend"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
@@ -9,7 +9,7 @@ description = "Typed workload runner for OpenAI-compatible inference servers"
 # validate the canonical execution trace by identical rules, so the schema lives
 # in one library rather than being reimplemented per binary.
 [lib]
-name = "tracelab_replay"
+name = "req_frontend"
 path = "src/lib.rs"
 
 [[bin]]
@@ -34,7 +34,7 @@ serde_json = "1.0"
 tokenizers = "0.21"
 tokio = { version = "1.36", features = ["full"] }
 
-# TraceLab is also vendored as a submodule below larger Rust workspaces. Keep
-# its replay runner an independent workspace so Cargo never inherits the host
-# repository's members, target directory, or dependency policy.
+# This crate is also vendored as a submodule below larger Rust workspaces. Keep
+# it an independent workspace so Cargo never inherits the host repository's
+# members, target directory, or dependency policy.
 [workspace]

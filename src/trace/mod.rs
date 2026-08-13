@@ -155,7 +155,7 @@ mod tests {
 
     fn step(session_id: &str, arrival_time: f64, round_idx: usize) -> SessionStep {
         SessionStep {
-            request_id: tracelab_replay::v2::request_id(session_id, round_idx),
+            request_id: req_frontend::v2::request_id(session_id, round_idx),
             session_id: session_id.to_string(),
             arrival_time,
             round_idx,
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn independent_frontend_keeps_independent_request_type() {
         let path = std::env::temp_dir().join(format!(
-            "tracelab_independent_frontend_{}.csv",
+            "req_frontend_independent_{}.csv",
             std::process::id()
         ));
         fs::write(

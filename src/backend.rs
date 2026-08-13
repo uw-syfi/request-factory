@@ -655,7 +655,7 @@ impl GenerationClient {
                 }
             }
         }
-        let output_len_actual = server_completion_tokens.unwrap_or_else(|| {
+        let output_len_actual = server_completion_tokens.unwrap_or({
             if output_token_ids.is_empty() {
                 output_len_text_tokens
             } else {
@@ -769,7 +769,7 @@ impl GenerationClient {
             model: &self.model,
             // Not a trace request: named so it is obvious in a server log that
             // this row belongs to the prefix-cache preflight, not the workload.
-            request_id: "tracelab-prefix-cache-preflight",
+            request_id: "req-frontend-prefix-cache-preflight",
             prompt_ids,
             max_tokens: 1,
             temperature: 0.0,
