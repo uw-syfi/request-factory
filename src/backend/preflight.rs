@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use super::client::GenerationClient;
-use super::{Backend, GenRequest, Usage};
+use super::{Backend, GenRequest, Prompt, Usage};
 
 impl GenerationClient {
     /// Abort early unless the server actually reports prefix-cache hits.
@@ -18,12 +18,13 @@ impl GenerationClient {
     /// probe prompt twice and require the second response to report cached tokens. This also
     /// confirms prefix caching itself is enabled server-side.
     pub(crate) async fn preflight_cache_check(&self, probe_ids: &[u32]) -> Result<()> {
+        let probe = Prompt::Tokens(probe_ids);
         // First request warms the prefix cache; the identical second request must hit it.
-        self.post_probe(probe_ids)
+        self.post_probe(probe)
             .await
             .context("preflight warm-up request failed")?;
         let usage = self
-            .post_probe(probe_ids)
+            .post_probe(probe)
             .await
             .context("preflight cache-hit request failed")?;
 
@@ -35,7 +36,7 @@ impl GenerationClient {
             other => Err(anyhow!(
                 "preflight: server reported no prefix-cache hit (prompt_tokens={:?}, cached_tokens={:?}). \
                  Launch the server with prompt-token details and prefix caching enabled \
-                 (vLLM: --enable-prompt-tokens-details / ENABLE_PROMPT_TOKENS_DETAILS=1); see replay/README.md.",
+                 (vLLM: --enable-prompt-tokens-details / ENABLE_PROMPT_TOKENS_DETAILS=1); see README.md.",
                 usage.prompt_tokens, other
             )),
         }
@@ -46,13 +47,13 @@ impl GenerationClient {
     /// Both supported backends expose prompt-cache details in the final SSE usage
     /// chunk. Keeping preflight on that same wire path also avoids depending on a
     /// backend's optional non-streaming response schema.
-    async fn post_probe(&self, prompt_ids: &[u32]) -> Result<Option<Usage>> {
+    async fn post_probe(&self, probe: Prompt<'_>) -> Result<Option<Usage>> {
         let payload = self.backend.build_payload(&GenRequest {
             model: &self.model,
             // Not a trace request: named so it is obvious in a server log that
             // this row belongs to the prefix-cache preflight, not the workload.
             request_id: "req-frontend-prefix-cache-preflight",
-            prompt_ids,
+            prompt: probe,
             max_tokens: 1,
             temperature: 0.0,
             stream: true,

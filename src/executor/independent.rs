@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use crate::backend::context_limit_skip_result;
+use crate::backend::{context_limit_skip_result, Prompt};
 use crate::cli::ArrivalMode;
 use crate::executor::AppState;
 use crate::record::StepLog;
@@ -33,29 +33,28 @@ pub(crate) async fn run_independent_request(
         }
     };
     let prompt_ids = token_provider.take(request.input_len);
+    let prompt = Prompt::Tokens(&prompt_ids);
     let request_id = format!("independent_{}", request.id);
     state.stats.record_submit();
     let result = if state.args.skip_when_reaching_limit
-        && state
-            .args
-            .max_model_len
-            .is_some_and(|limit| reaches_context_limit(prompt_ids.len(), request.output_len, limit))
-    {
+        && state.args.max_model_len.is_some_and(|limit| {
+            reaches_context_limit(prompt.token_len(), request.output_len, limit)
+        }) {
         context_limit_skip_result(
             request_id,
-            prompt_ids.len(),
+            prompt.token_len(),
             request.output_len,
             state.args.max_model_len,
         )
     } else {
         state
             .client
-            .run_step(request_id, &prompt_ids, request.output_len)
+            .run_step(request_id, prompt, request.output_len)
             .await
     };
     let log = StepLog::independent_request(
         &request,
-        prompt_ids.len(),
+        prompt.token_len(),
         arrival_release_lag_ms,
         result.outcome,
     );

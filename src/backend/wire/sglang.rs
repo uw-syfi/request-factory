@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::super::{Backend, GenRequest, StreamEvent, Usage};
+use super::super::{Backend, GenRequest, Prompt, StreamEvent, Usage};
 // Only `usage_usize`: SGLang's `meta_info` schema is fixed, so it reads exact
 // keys rather than searching the provider alias list.
 use super::usage_usize;
@@ -27,13 +27,14 @@ impl Backend for SglangTokensBackend {
     }
 
     fn build_payload(&self, req: &GenRequest) -> Value {
+        let Prompt::Tokens(prompt_ids) = req.prompt;
         // No `model` field: an SGLang server hosts exactly one model. No
         // `return_logprob` either — `output_ids` is a native top-level response
         // field, so recovering ids out of per-token logprobs would only add
         // compute and serialization to the path we are timing.
         serde_json::json!({
             "rid": req.request_id,
-            "input_ids": req.prompt_ids,
+            "input_ids": prompt_ids,
             "sampling_params": {
                 "max_new_tokens": req.max_tokens,
                 "temperature": req.temperature,
@@ -113,7 +114,7 @@ mod tests {
         let payload = backend.build_payload(&GenRequest {
             model: "ignored-by-sglang",
             request_id: "req-1",
-            prompt_ids: &[7, 8, 9],
+            prompt: Prompt::Tokens(&[7, 8, 9]),
             max_tokens: 16,
             temperature: 0.0,
             stream: true,

@@ -18,7 +18,7 @@ use crate::util::{elapsed_ms, ratio, unix_seconds_now};
 use super::integrity::{classify_prompt_echo, PromptEcho};
 use super::stream::StreamAccumulator;
 use super::wire::build_backend;
-use super::{Backend, GenRequest, GenerationResult};
+use super::{Backend, GenRequest, GenerationResult, Prompt};
 
 /// Shared streaming engine. It knows only normalized text-generation inputs and
 /// outcomes; frontend/source identity remains in the executor layer.
@@ -61,7 +61,7 @@ impl GenerationClient {
     pub(crate) async fn run_step(
         &self,
         request_id: String,
-        prompt_ids: &[u32],
+        prompt: Prompt<'_>,
         max_tokens: usize,
     ) -> GenerationResult {
         let submit_timestamp = unix_seconds_now();
@@ -72,7 +72,7 @@ impl GenerationClient {
         let payload = self.backend.build_payload(&GenRequest {
             model: &self.model,
             request_id: &request_id,
-            prompt_ids,
+            prompt,
             max_tokens,
             temperature: self.temperature,
             stream: true,
@@ -125,6 +125,7 @@ impl GenerationClient {
         // unexplained excess fails the round: carrying either one forward would
         // corrupt the next prompt and every cache number derived from it.
         let mut echoed_prompt_tokens = 0usize;
+        let Prompt::Tokens(prompt_ids) = prompt;
         if status == "SUCCESS" {
             if let Some(completion_tokens) = server.completion_tokens {
                 match classify_prompt_echo(&output_token_ids, prompt_ids, completion_tokens) {

@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::super::{Backend, GenRequest, StreamEvent, Usage};
+use super::super::{Backend, GenRequest, Prompt, StreamEvent, Usage};
 use super::{usage_cached_prompt_tokens, usage_usize};
 
 /// OpenAI-compatible `/completions` protocol. Works against vLLM and SGLang's OpenAI endpoint.
@@ -12,6 +12,7 @@ impl Backend for OpenAiCompletionsBackend {
     }
 
     fn build_payload(&self, req: &GenRequest) -> Value {
+        let Prompt::Tokens(prompt_ids) = req.prompt;
         let mut payload = serde_json::json!({
             "model": req.model,
             // SGLang's OpenAI layer forwards this straight to GenerateReqInput,
@@ -21,7 +22,7 @@ impl Backend for OpenAiCompletionsBackend {
             "rid": req.request_id,
             // Submit raw token ids (OpenAI `prompt` accepts an int array): no client-side decode,
             // and the server uses the exact ids so prefix-cache keys match what we constructed.
-            "prompt": req.prompt_ids,
+            "prompt": prompt_ids,
             "max_tokens": req.max_tokens,
             "temperature": req.temperature,
             "stream": req.stream,

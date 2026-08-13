@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::super::{Backend, GenRequest, StreamEvent, Usage};
+use super::super::{Backend, GenRequest, Prompt, StreamEvent, Usage};
 use super::{usage_cached_prompt_tokens, usage_usize};
 
 /// vLLM native token-in/token-out protocol. The server must be launched with
@@ -13,6 +13,7 @@ impl Backend for VllmTokensBackend {
     }
 
     fn build_payload(&self, req: &GenRequest) -> Value {
+        let Prompt::Tokens(prompt_ids) = req.prompt;
         let mut payload = serde_json::json!({
             "model": req.model,
             // SGLang's OpenAI layer forwards this straight to GenerateReqInput,
@@ -20,7 +21,7 @@ impl Backend for VllmTokensBackend {
             // field; its base model allows unknown keys and ignores this one,
             // taking the id from the x-request-id header instead.
             "rid": req.request_id,
-            "token_ids": req.prompt_ids,
+            "token_ids": prompt_ids,
             "sampling_params": {
                 "max_tokens": req.max_tokens,
                 "temperature": req.temperature,
@@ -80,7 +81,7 @@ mod tests {
         let payload = backend.build_payload(&GenRequest {
             model: "meta-llama/Meta-Llama-3-8B",
             request_id: "req-1",
-            prompt_ids: &[11, 22, 33],
+            prompt: Prompt::Tokens(&[11, 22, 33]),
             max_tokens: 4,
             temperature: 0.0,
             stream: true,

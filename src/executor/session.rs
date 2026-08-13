@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use crate::backend::{context_limit_skip_result, GenerationResult};
+use crate::backend::{context_limit_skip_result, GenerationResult, Prompt};
 use crate::cli::{Args, ArrivalMode};
 use crate::executor::AppState;
 use crate::record::StepLog;
@@ -44,21 +44,22 @@ pub(crate) async fn run_session(
             derived_append_len,
             prefix_shortfall_len,
         } = prompt_builder.build_prompt(&step);
+        let prompt = Prompt::Tokens(&prompt_ids);
         let request_id = step.request_id.clone();
         state.stats.record_submit();
         let context_limit_skipped =
-            should_skip_at_context_limit(&state.args, prompt_ids.len(), step.output_len);
+            should_skip_at_context_limit(&state.args, prompt.token_len(), step.output_len);
         let result = if context_limit_skipped {
             context_limit_skip_result(
                 request_id,
-                prompt_ids.len(),
+                prompt.token_len(),
                 step.output_len,
                 state.args.max_model_len,
             )
         } else {
             state
                 .client
-                .run_step(request_id, &prompt_ids, step.output_len)
+                .run_step(request_id, prompt, step.output_len)
                 .await
         };
         let GenerationResult {
@@ -67,7 +68,7 @@ pub(crate) async fn run_session(
         } = result;
         let log = StepLog::session_round(
             &step,
-            prompt_ids.len(),
+            prompt.token_len(),
             derived_prefix_len,
             derived_append_len,
             prefix_shortfall_len,

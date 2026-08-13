@@ -20,6 +20,32 @@ use crate::util::unix_seconds_now;
 
 pub(crate) use client::GenerationClient;
 
+/// What one request sends as its input.
+///
+/// One variant today, and an enum anyway on purpose. The second variant is
+/// interleaved text and media; when it lands, every place that has to decide how
+/// to shape or measure a prompt should be a place the compiler names rather than
+/// one a reader has to go find. Each site therefore destructures — an
+/// irrefutable `let` today, a compile error the day the variant appears.
+///
+/// Borrowed rather than owned: prompts here reach a million tokens, and the
+/// session executor still needs this one after the send, to carry forward as the
+/// next round's context.
+#[derive(Clone, Copy)]
+pub(crate) enum Prompt<'a> {
+    /// Token ids built by the caller and sent verbatim, so the server's
+    /// prefix-cache keys match the exact ids the workload planned.
+    Tokens(&'a [u32]),
+}
+
+impl Prompt<'_> {
+    /// Tokens the server will charge as this prompt's length.
+    pub(crate) fn token_len(&self) -> usize {
+        let Self::Tokens(prompt_ids) = self;
+        prompt_ids.len()
+    }
+}
+
 /// Normalized, backend-agnostic description of one generation request.
 pub(crate) struct GenRequest<'a> {
     pub(crate) model: &'a str,
@@ -27,7 +53,7 @@ pub(crate) struct GenRequest<'a> {
     /// the `x-request-id` header because the two engines read different ones:
     /// vLLM adopts the header, SGLang takes a body-level `rid`.
     pub(crate) request_id: &'a str,
-    pub(crate) prompt_ids: &'a [u32],
+    pub(crate) prompt: Prompt<'a>,
     pub(crate) max_tokens: usize,
     pub(crate) temperature: f64,
     pub(crate) stream: bool,
