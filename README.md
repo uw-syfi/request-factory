@@ -325,13 +325,13 @@ nothing left to decide:
 
 ```csv
 request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms
-0_round_000000,0,0,0.000000,0,14438,157,2672.000000
-0_round_000001,0,1,0.000000,14435,1724,91,50.000000
+session_0_round_000000,0,0,0.000000,0,14438,157,2672.000000
+session_0_round_000001,0,1,0.000000,14435,1724,91,50.000000
 ```
 
 | Column | Unit/type | Contract |
 |---|---|---|
-| `request_id` | String | Exactly `{session_id}_round_{round_idx:06}`. Validated, not trusted. |
+| `request_id` | String | Exactly `session_{session_id}_round_{round_idx:06}`. Validated, not trusted. |
 | `session_id` | String | Opaque session identity. |
 | `round_idx` | Non-negative integer | Contiguous from `0` within each session. |
 | `arrival_time_ms` | Milliseconds, 6 decimals | Identical on every row of a session. The earliest arrival in the file is `0`. |
@@ -751,7 +751,7 @@ Abbreviated session example:
     }
   },
   "outcome": {
-    "request_id": "0_round_000001",
+    "request_id": "session_0_round_000001",
     "status": "SUCCESS",
     "output_len_actual": 64,
     "first_token_id_ms": 18.4,
@@ -781,12 +781,14 @@ join key against server-side logs. Its shape depends on the frontend:
 
 | Frontend | `request_id` | Example |
 |---|---|---|
-| `session` | `{session_id}_round_{round_idx:06}` | `0_round_000001` |
+| `session` | `session_{session_id}_round_{round_idx:06}` | `session_0_round_000001` |
 | `independent` | `independent_{id}` | `independent_request-0` |
 
-Only `round_idx` is padded. `session_id` is opaque and copied verbatim, so the
-ids a real trace produces are as short as its session names — bare integers in
-the published corpus.
+Both frontends namespace their ids with the frontend name. That prefix is
+TraceLab's, not the corpus's: the `session_id` column keeps whatever the dataset
+called the session, which in the published corpus is a bare integer that would
+otherwise make `0_round_000001` say nothing about what it identifies. Only
+`round_idx` is zero-padded.
 
 A canonical trace carries `request_id` as a column, and the runner validates that
 it matches this form rather than trusting it — so the join key against server logs

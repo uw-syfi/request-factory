@@ -106,7 +106,7 @@ mod tests {
 
     fn step(prefix_len: usize, input_len: usize, output_len: usize) -> SessionStep {
         SessionStep {
-            request_id: "session_round_000000".to_string(),
+            request_id: "session_s1_round_000000".to_string(),
             session_id: "session".to_string(),
             arrival_time: 0.0,
             round_idx: 0,

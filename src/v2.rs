@@ -66,11 +66,13 @@ impl ExecutionRow {
 
 /// Mint the canonical request id for a round.
 ///
-/// Deliberately the same shape the replay runtime used to derive internally, so
-/// moving the identifier into the file changes where it comes from without
-/// changing any existing log or analysis that keys on it.
+/// `session_` namespaces the id by the frontend that produced it, matching what
+/// the independent frontend already does with `independent_{id}`. The corpus's
+/// own name for the session is left alone in the `session_id` column — this
+/// prefix is TraceLab's, not the dataset's, which matters because published
+/// sessions are often bare integers that say nothing about what they identify.
 pub fn request_id(session_id: &str, round_idx: usize) -> String {
-    format!("{session_id}_round_{round_idx:06}")
+    format!("session_{session_id}_round_{round_idx:06}")
 }
 
 /// Read a canonical file, rejecting anything that is not canonical.
@@ -357,7 +359,7 @@ mod tests {
         assert_eq!(plan[0].predecessor_request_id, None);
         assert_eq!(
             plan[1].predecessor_request_id.as_deref(),
-            Some("a_round_000000")
+            Some("session_a_round_000000")
         );
         assert_eq!(plan[2].predecessor_request_id, None);
         assert_eq!(plan[2].session_arrival_time_ms, "250.000000");

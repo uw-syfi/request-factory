@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn session_record_keeps_session_fields_inside_tagged_source() {
         let step = SessionStep {
-            request_id: "s1_round_000002".to_string(),
+            request_id: "session_s1_round_000002".to_string(),
             session_id: "s1".to_string(),
             arrival_time: 0.0,
             round_idx: 2,

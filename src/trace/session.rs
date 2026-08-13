@@ -88,14 +88,14 @@ mod tests {
         let path = write_temp(
             "cap",
             "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms\n\
-             session-2_round_000000,session-2,0,0.000000,0,10,4,0.000000\n\
-             session-10_round_000000,session-10,0,5.000000,0,10,4,0.000000\n",
+             session_2_round_000000,2,0,0.000000,0,10,4,0.000000\n\
+             session_10_round_000000,10,0,5.000000,0,10,4,0.000000\n",
         );
 
         let sessions = load(&path, Some(1)).unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0, "session-2");
+        assert_eq!(sessions[0].0, "2");
     }
 
     /// A raw, unmaterialized CSV must be rejected rather than half-read.
@@ -122,9 +122,9 @@ mod tests {
         let path = write_temp(
             "v2",
             "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms\n\
-             b_round_000000,b,0,0.000000,0,512,64,0.000000\n\
-             b_round_000001,b,1,0.000000,576,128,64,0.000000\n\
-             a_round_000000,a,0,250.000000,0,400,48,0.000000\n",
+             session_b_round_000000,b,0,0.000000,0,512,64,0.000000\n\
+             session_b_round_000001,b,1,0.000000,576,128,64,0.000000\n\
+             session_a_round_000000,a,0,250.000000,0,400,48,0.000000\n",
         );
 
         let sessions = load(&path, None).unwrap();
@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].0, "b");
         assert_eq!(sessions[1].0, "a");
-        assert_eq!(sessions[0].1[1].request_id, "b_round_000001");
+        assert_eq!(sessions[0].1[1].request_id, "session_b_round_000001");
         assert_eq!(sessions[0].1[1].prefix_len, 576);
     }
 
@@ -141,7 +141,7 @@ mod tests {
         let path = write_temp(
             "v2-bad",
             "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms\n\
-             a_round_000000,a,0,0.000000,128,512,64,0.000000\n",
+             session_a_round_000000,a,0,0.000000,128,512,64,0.000000\n",
         );
 
         let error = load(&path, None).unwrap_err().to_string();

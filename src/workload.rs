@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn session_static_limit_check_includes_output_and_reserves_headroom() {
         let step = SessionStep {
-            request_id: "session_round_000000".to_string(),
+            request_id: "session_s1_round_000000".to_string(),
             session_id: "session".to_string(),
             arrival_time: 0.0,
             round_idx: 3,
