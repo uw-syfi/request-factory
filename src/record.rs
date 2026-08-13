@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use crate::schema::slo::SloMeasurement;
 use crate::trace::{IndependentRequest, SessionStep};
 use crate::util::prefix_hit_rate;
 
@@ -177,6 +178,24 @@ impl StepLog {
 }
 
 impl GenerationOutcome {
+    /// This step as an SLO sees it.
+    ///
+    /// The mapping is deliberately explicit rather than derived by field name,
+    /// and it is the same choice the summary's percentiles make: token-id TTFT
+    /// preferred, the text-delta clock as the fallback for servers that return
+    /// no ids. Judging an objective on one clock while reporting percentiles on
+    /// another would put two numbers in one file that cannot both be right.
+    /// `total_duration_ms` is submission to completion, not the wire-response
+    /// window.
+    pub(crate) fn slo_measurement(&self) -> SloMeasurement {
+        SloMeasurement {
+            succeeded: self.is_success(),
+            ttft_ms: self.first_token_id_ms.or(self.first_token_ms),
+            tpot_ms: self.token_delivery_tpot_ms,
+            e2e_ms: Some(self.total_duration_ms),
+        }
+    }
+
     pub(crate) fn is_success(&self) -> bool {
         self.status == "SUCCESS"
     }

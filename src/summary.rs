@@ -5,6 +5,7 @@ use std::io::Write;
 use tokio::sync::mpsc;
 
 use crate::record::{GenerationOutcome, SessionRoundSource, SourceRecord, StepLog};
+use crate::schema::slo::SloSummary;
 use crate::timeline::TimelineSummary;
 use crate::trace::ReplayWorkload;
 use crate::util::ratio;
@@ -315,6 +316,19 @@ pub struct RunSummary {
     pub(crate) client_runtime: ClientRuntimeSummary,
     /// What the per-event timeline recorded, including what it had to drop.
     pub(crate) timeline: TimelineSummary,
+    /// Attainment against the objective this run was held to, or `None` when no
+    /// objective was declared. Serialized as null rather than omitted, so a
+    /// consumer can tell "no SLO" apart from "an older summary format".
+    pub slo: Option<SloSummary>,
+}
+
+/// What draining the log stream produced.
+///
+/// Two folds over one pass: the replay statistics every run reports, and the
+/// SLO attainment a run reports only when it was given an objective.
+pub(crate) struct LogFold {
+    pub(crate) replay: ReplaySummary,
+    pub(crate) slo: Option<SloSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -328,11 +342,16 @@ pub(crate) struct ClientRuntimeSummary {
 }
 
 /// Drain logged requests to JSONL on disk and fold them into a typed replay summary.
+///
+/// SLO attainment folds in the same pass rather than in a second one: every step
+/// is already in hand here, and a separate statistics path over the same records
+/// is how two numbers that must agree stop agreeing.
 pub(crate) async fn write_logs(
     path: String,
     mut rx: mpsc::Receiver<StepLog>,
     mut summary: ReplaySummary,
-) -> ReplaySummary {
+    mut slo: Option<SloSummary>,
+) -> LogFold {
     let file = File::create(&path).expect("failed to create log file");
     let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
     let mut measurements = ReplayMeasurements::default();
@@ -340,6 +359,9 @@ pub(crate) async fn write_logs(
     while let Some(record) = rx.recv().await {
         summary.add(&record);
         measurements.add(&record.outcome);
+        if let Some(slo) = slo.as_mut() {
+            slo.add(&record.outcome.slo_measurement());
+        }
         log_server_prefix_hit_rate(&record);
         if let Ok(json) = serde_json::to_string(&record) {
             let _ = writeln!(writer, "{json}");
@@ -349,7 +371,13 @@ pub(crate) async fn write_logs(
     let _ = writer.flush();
     summary.finalize(&mut measurements);
     log_server_prefix_hit_rate_summary(&summary);
-    summary
+    if let Some(slo) = slo.as_ref() {
+        eprintln!("{}", slo.describe());
+    }
+    LogFold {
+        replay: summary,
+        slo,
+    }
 }
 
 fn log_server_prefix_hit_rate(record: &StepLog) {

@@ -20,11 +20,13 @@
 pub mod media;
 pub mod omni;
 pub mod session_execution_v2;
+pub mod slo;
 
 use anyhow::{bail, Result};
 
 pub use media::{AudioExtent, DecodingStrategy, ImageExtent, VideoExtent};
 pub use omni::{OmniInputSegment, OmniOutputSpec};
+pub use slo::{SloMeasurement, SloSource, SloSpec, SloSummary};
 
 /// Columns every native row carries, whatever its kind: who it is and when it
 /// arrives.

@@ -33,6 +33,8 @@ mod record;
 #[cfg(feature = "runtime")]
 mod runner;
 #[cfg(feature = "runtime")]
+mod slo_source;
+#[cfg(feature = "runtime")]
 mod summary;
 #[cfg(feature = "runtime")]
 mod timeline;

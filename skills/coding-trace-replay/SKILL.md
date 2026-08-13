@@ -127,6 +127,9 @@ was generated at — read the manifest.
 
 # 3. Saturate under a session cap instead of replaying the timeline.
 #    ... --arrival-mode saturated --max-concurrency 8
+
+# 4. Hold the run to an objective and report attainment.
+#    ... --slo 'ttft_ms=500,tpot_ms=50'
 ```
 
 `--tokenizer` must match the served model: it sizes the synthetic corpus in the
@@ -162,6 +165,12 @@ server's own token space.
 - Check `timeline.dropped_requests` in `summary.json` before drawing anything
   from the timeline. Nonzero means the writer fell behind and the file is a
   sample of the run, not a record of it.
+- `slo.attainment` is the fraction of steps that met **every** declared bound,
+  not a percentile target. Read `unmeasured_steps` alongside it: those steps
+  count against attainment but were failures or metrics that did not exist, not
+  responses that came back slowly. A trace can declare its own objective in a
+  `<trace>.slo.json` sidecar; `--slo` overrides it and prints that it did, so
+  check `slo.source` before attributing a number to a trace.
 
 ## Troubleshooting
 

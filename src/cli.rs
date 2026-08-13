@@ -144,4 +144,13 @@ pub struct Args {
     /// Where the per-event timeline is written.
     #[arg(long, default_value = "session_runner_timeline.parquet")]
     pub timeline_path: String,
+
+    /// Service-level objective for this run: `ttft_ms=500,tpot_ms=50`.
+    ///
+    /// Per-metric upper bounds. The summary reports the fraction of steps that
+    /// met every declared bound, and the fraction that met each one.
+    ///
+    /// Overrides an objective the trace declares in its `.slo.json` sidecar.
+    #[arg(long)]
+    pub slo: Option<String>,
 }

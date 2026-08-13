@@ -18,6 +18,8 @@ use crate::executor::{
     run_independent_request, run_session, status_task, AdmissionOrder, AppState, RunPolicy, Stats,
 };
 use crate::record::StepLog;
+use crate::schema::slo::SloSummary;
+use crate::slo_source;
 use crate::summary::{
     write_logs, write_summary_if_requested, ClientRuntimeSummary, ReplaySummary, RunSummary,
 };
@@ -44,6 +46,10 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
     report_arrival_rate(&args, &mut workload, unit_label)?;
 
     let replay_summary = ReplaySummary::empty_for(&workload);
+    // Resolved before anything is loaded, so a malformed objective fails in a
+    // second rather than after a corpus has been tokenized.
+    let slo_summary = slo_source::resolve(&args.trace, args.slo.as_deref())?
+        .map(|(spec, source)| SloSummary::new(spec, source));
     let workload_summary = WorkloadSummary::from_workload(&workload, args.max_model_len);
     workload_summary.print();
     if args.dry_run {
@@ -52,6 +58,9 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
             replay: replay_summary,
             client_runtime: client_runtime_summary(0),
             timeline: TimelineSummary::default(),
+            // A dry run sends nothing, so it measures nothing: reporting the
+            // declared objective with no steps behind it would read as a result.
+            slo: slo_summary,
         };
         write_summary_if_requested(args.summary_path.as_deref(), &summary)?;
         return Ok(summary);
@@ -134,7 +143,12 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
     });
 
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
-    let log_task = tokio::spawn(write_logs(args.log_path.clone(), log_rx, replay_summary));
+    let log_task = tokio::spawn(write_logs(
+        args.log_path.clone(),
+        log_rx,
+        replay_summary,
+        slo_summary,
+    ));
     let status_handle = tokio::spawn(status_task(
         state.stats.clone(),
         workload.unit_count(),
@@ -191,7 +205,7 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
         }
     }
 
-    let replay_summary = log_task.await?;
+    let folded = log_task.await?;
     status_handle.await?;
     let runtime_global_queue_depth_peak = state.stats.runtime_global_queue_depth_peak();
     let timeline_summary = match timeline_task {
@@ -200,9 +214,10 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
     };
     let summary = RunSummary {
         workload: workload_summary,
-        replay: replay_summary,
+        replay: folded.replay,
         client_runtime: client_runtime_summary(runtime_global_queue_depth_peak),
         timeline: timeline_summary,
+        slo: folded.slo,
     };
     write_summary_if_requested(args.summary_path.as_deref(), &summary)?;
 

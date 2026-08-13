@@ -840,7 +840,8 @@ is the same string in the trace, the client log, and the server log.
 - `replay.common`: success/failure counts, throughput, TTFT, TPOT, and E2E;
 - `replay.prefix_cache`: session-only planned-versus-server cache accounting;
 - `client_runtime`: Tokio worker count and sampled global injection-queue peak;
-- `timeline`: what the per-event timeline recorded, and what it had to drop.
+- `timeline`: what the per-event timeline recorded, and what it had to drop;
+- `slo`: attainment against the declared objective, or `null` when none was.
 
 The queue-depth metric does not include every worker-local runnable queue. Use
 it together with `arrival_release_lag_ms` and OS CPU/thread evidence.
@@ -905,6 +906,69 @@ runs.
 `timeline.dropped_requests` in the run summary is nonzero exactly when the file
 is a sample of the run rather than a record of it. A run also prints a warning
 in that case, so a lossy timeline says so instead of quietly under-reporting.
+
+### Service-level objectives
+
+An objective is a set of **upper bounds**, and the number it produces is an
+**attainment rate**: the fraction of steps that met every bound declared.
+
+```bash
+--slo 'ttft_ms=500,tpot_ms=50'
+```
+
+| metric | bound on |
+| --- | --- |
+| `ttft_ms` | time to first token, from the moment the request was sent |
+| `tpot_ms` | client-observed delivery time per output token after the first timed event |
+| `e2e_ms` | submission to completion |
+
+Not a percentile target. "p99 TTFT under 500 ms" hides how many requests were
+bad, and a run of two hundred thousand rounds has room to hide a great deal.
+
+Both scopes are supported, and the summary records which one applied:
+
+| scope | how | `slo.source` |
+| --- | --- | --- |
+| global | `--slo` on the command line | `global` |
+| per trace | a `<trace>.slo.json` sidecar beside the trace file | `trace` |
+
+The sidecar is the same convention `.manifest.json` and `.plan.json` already
+use, so a trace and everything true about it travel together:
+
+```json
+{ "ttft_ms": 500, "tpot_ms": 50 }
+```
+
+`--slo` overrides a sidecar and says so on stderr, because a trace that declares
+an objective and a run that ignores it is exactly where an unaccountable number
+comes from. A misspelled metric name, an empty spec, and a sidecar declaring no
+bounds are all errors — a run that reports 100% attainment because it was
+quietly asked for nothing is the worst failure available here.
+
+Every step is judged on all declared bounds, and the fold happens in the same
+pass that produces the replay percentiles, on the same clocks. Three outcomes
+per metric:
+
+| | meaning |
+| --- | --- |
+| attained | measured at or under the bound |
+| violated | measured past the bound |
+| unmeasured | the step failed, or succeeded without producing that metric (a one-event response has no measurable TPOT) |
+
+Unmeasured counts **against** attainment and is reported separately, so nobody
+reads "94% attained" as "6% were slow" when it was "6% never answered". A failed
+step is never attained: a response that did not arrive did not arrive on time
+either.
+
+```text
+slo attainment | source=Global steps=48 overall=0.6667 |
+  ttft_ms<=5 1.0000 (0 violated, 0 unmeasured) |
+  e2e_ms<=60 0.6667 (16 violated, 0 unmeasured)
+```
+
+`SloSpec` and the attainment fold live in `src/schema/slo.rs`, alongside the
+trace schemas rather than in the runtime, because a measured replay and a
+simulated run must report the same number for the same trace.
 
 ## Metrics
 
@@ -1056,6 +1120,9 @@ A context-limit skip always ends its session, independently of this flag.
 | `--summary-path` | unset | No JSON summary is written unless given. Also written by `--dry-run` |
 | `--dry-run` | off | Static inspection only; returns before the tokenizer, corpus, and preflight |
 | `--token-pool-limit N` | see [Synthetic token corpus](#synthetic-token-corpus) | Cap on synthetic pool size |
+| `--timeline` | `true` | Per-event Parquet timeline. Takes an explicit value: `--timeline false` |
+| `--timeline-path` | `session_runner_timeline.parquet` | Where that timeline is written |
+| `--slo` | trace sidecar, else none | `ttft_ms=500,tpot_ms=50`. Overrides a `<trace>.slo.json` sidecar. See [Service-level objectives](#service-level-objectives) |
 
 ## Repository structure
 
@@ -1073,8 +1140,10 @@ A context-limit skip always ends its session, independently of this flag.
 │   │   ├── mod.rs            trace kinds, tags, column blocks, header check
 │   │   ├── media.rs          image/video/audio extents, decoding strategy
 │   │   ├── omni.rs           heterogeneous input/output segment JSON
+│   │   ├── slo.rs            objective bounds + the attainment fold
 │   │   └── session_execution_v2.rs  the canonical schema, minting, validation
 │   ├── runner.rs             one run: validate, load, preflight, fan out, fold
+│   ├── slo_source.rs         --slo, the trace's sidecar, and which one won
 │   ├── main.rs               argument parsing; one call into the library
 │   ├── cli.rs                public CLI contract
 │   ├── backend/
