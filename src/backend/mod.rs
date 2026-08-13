@@ -10,6 +10,7 @@
 mod client;
 mod integrity;
 mod preflight;
+mod stream;
 mod wire;
 
 use serde_json::Value;

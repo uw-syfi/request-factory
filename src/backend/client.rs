@@ -15,7 +15,8 @@ use crate::cli::Args;
 use crate::record::{GenerationOutcome, ServerUsageLog};
 use crate::util::{elapsed_ms, ratio, unix_seconds_now};
 
-use super::integrity::{classify_prompt_echo, restates_accumulated_output, PromptEcho};
+use super::integrity::{classify_prompt_echo, PromptEcho};
+use super::stream::StreamAccumulator;
 use super::wire::build_backend;
 use super::{Backend, GenRequest, GenerationResult};
 
@@ -80,157 +81,37 @@ impl GenerationClient {
         let post_timestamp = Some(unix_seconds_now());
         // Monotonic anchor at the send instant: TTFT is measured from here.
         let send_instant = Instant::now();
-        let mut first_token_ms = None;
-        let mut first_token_id_ms = None;
-        let mut last_token_id_ms = None;
-        let mut first_token_event_tokens = 0usize;
-        let mut token_event_count = 0usize;
-        let mut usage_event_count = 0usize;
-        let mut chunk_count = 0usize;
-        let mut output_text = String::new();
-        let mut output_token_ids: Vec<u32> = Vec::new();
-        let mut status = "SUCCESS".to_string();
-        let mut error = None;
-        let mut finish_reason = None;
-        let mut server_prompt_tokens = None;
-        let mut server_completion_tokens = None;
-        let mut server_total_tokens = None;
-        let mut server_cached_prompt_tokens = None;
-        let mut saw_server_usage = false;
 
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .header("x-request-id", &request_id)
-            .json(&payload)
-            .send()
+        let mut fold = StreamAccumulator::new(max_tokens);
+        self.fold_response(&request_id, &payload, send_instant, &mut fold)
             .await;
-
-        match response {
-            Ok(response) if response.status().is_success() => {
-                let mut stream = response.bytes_stream();
-                let mut buffer = BytesMut::with_capacity(8192);
-                let mut done = false;
-
-                while !done {
-                    match timeout(
-                        Duration::from_secs(self.stream_idle_timeout_secs),
-                        stream.next(),
-                    )
-                    .await
-                    {
-                        Ok(Some(Ok(chunk))) => {
-                            buffer.extend_from_slice(&chunk);
-                            while let Some(idx) = buffer.iter().position(|&b| b == b'\n') {
-                                let line_bytes = buffer.split_to(idx + 1);
-                                let line = String::from_utf8_lossy(&line_bytes);
-                                let line = line.trim();
-                                if !line.starts_with("data: ") {
-                                    continue;
-                                }
-                                let data = line.trim_start_matches("data: ").trim();
-                                if data == "[DONE]" {
-                                    done = true;
-                                    break;
-                                }
-                                if let Ok(value) = serde_json::from_str::<Value>(data) {
-                                    let event = self.backend.parse_event(&value);
-                                    let event_elapsed_ms = elapsed_ms(send_instant);
-                                    let token_ids = event.token_ids.unwrap_or_default();
-                                    if restates_accumulated_output(&output_token_ids, &token_ids) {
-                                        status = "FAILED".to_string();
-                                        error = Some(format!(
-                                            "server streamed cumulative output: a chunk repeated all {} \
-                                             tokens delivered so far. Launch SGLang with \
-                                             --stream-output (renamed --incremental-streaming-output \
-                                             in newer builds) so chunks are disjoint deltas.",
-                                            output_token_ids.len(),
-                                        ));
-                                        done = true;
-                                        break;
-                                    }
-                                    if !token_ids.is_empty() {
-                                        if first_token_id_ms.is_none() {
-                                            first_token_id_ms = Some(event_elapsed_ms);
-                                            first_token_event_tokens = token_ids.len();
-                                        }
-                                        last_token_id_ms = Some(event_elapsed_ms);
-                                        token_event_count += 1;
-                                        output_token_ids.extend(token_ids);
-                                    }
-                                    if let Some(delta) = event.text_delta {
-                                        if !delta.is_empty() {
-                                            if first_token_ms.is_none() {
-                                                first_token_ms = Some(event_elapsed_ms);
-                                            }
-                                            output_text.push_str(&delta);
-                                        }
-                                    }
-                                    if let Some(reason) = event.finish_reason {
-                                        finish_reason = Some(reason);
-                                    }
-                                    if let Some(usage) = event.usage {
-                                        usage_event_count += 1;
-                                        saw_server_usage = true;
-                                        server_prompt_tokens =
-                                            usage.prompt_tokens.or(server_prompt_tokens);
-                                        server_completion_tokens =
-                                            usage.completion_tokens.or(server_completion_tokens);
-                                        server_total_tokens =
-                                            usage.total_tokens.or(server_total_tokens);
-                                        server_cached_prompt_tokens = usage
-                                            .cached_prompt_tokens
-                                            .or(server_cached_prompt_tokens);
-                                    }
-                                    chunk_count += 1;
-                                }
-                            }
-                        }
-                        Ok(Some(Err(err))) => {
-                            status = "FAILED".to_string();
-                            error = Some(format!("stream error: {err}"));
-                            break;
-                        }
-                        Ok(None) => break,
-                        Err(_) => {
-                            status = "FAILED".to_string();
-                            error = Some(format!(
-                                "stream idle timeout after {}s",
-                                self.stream_idle_timeout_secs
-                            ));
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(response) => {
-                status = "FAILED".to_string();
-                error = Some(format!("HTTP {}", response.status()));
-            }
-            Err(err) => {
-                status = "FAILED".to_string();
-                error = Some(format!("request error: {err}"));
-            }
-        }
 
         // Stop the wire-response clock before output re-tokenization and log shaping.
         let response_complete_ms = post_timestamp.map(|_| elapsed_ms(send_instant));
-        let token_delivery_tpot_ms = match (
-            first_token_id_ms,
-            last_token_id_ms,
-            output_token_ids.len().checked_sub(first_token_event_tokens),
-        ) {
-            (Some(first), Some(last), Some(delivered_after_first_event))
-                if delivered_after_first_event > 0 && last >= first =>
-            {
-                Some((last - first) / delivered_after_first_event as f64)
-            }
-            _ => None,
-        };
-        let terminal_tail_ms = match (last_token_id_ms, response_complete_ms) {
+        let token_delivery_tpot_ms = fold.token_delivery_tpot_ms();
+        let terminal_tail_ms = match (fold.last_token_id_ms, response_complete_ms) {
             (Some(last), Some(complete)) if complete >= last => Some(complete - last),
             _ => None,
         };
+
+        let StreamAccumulator {
+            first_text_ms,
+            first_token_id_ms,
+            last_token_id_ms,
+            first_token_event_tokens,
+            token_event_count,
+            usage_event_count,
+            chunk_count,
+            output_text,
+            mut output_token_ids,
+            usage: mut server,
+            finish_reason,
+            failure,
+        } = fold;
+        // The fold reports what went wrong, not what it means for the round; the
+        // integrity repair below can still fail an otherwise clean stream.
+        let mut error = failure;
+        let mut status = if error.is_some() { "FAILED" } else { "SUCCESS" }.to_string();
 
         // Re-encode the output text for a diagnostic token count and as a carry-forward fallback.
         let reencoded_output_ids: Vec<u32> = self
@@ -245,7 +126,7 @@ impl GenerationClient {
         // corrupt the next prompt and every cache number derived from it.
         let mut echoed_prompt_tokens = 0usize;
         if status == "SUCCESS" {
-            if let Some(completion_tokens) = server_completion_tokens {
+            if let Some(completion_tokens) = server.completion_tokens {
                 match classify_prompt_echo(&output_token_ids, prompt_ids, completion_tokens) {
                     PromptEcho::None => {}
                     PromptEcho::Leading(echoed) => {
@@ -265,7 +146,7 @@ impl GenerationClient {
                 }
             }
         }
-        let output_len_actual = server_completion_tokens.unwrap_or({
+        let output_len_actual = server.completion_tokens.unwrap_or({
             if output_token_ids.is_empty() {
                 output_len_text_tokens
             } else {
@@ -275,7 +156,7 @@ impl GenerationClient {
         // Prefer the server's exact generated token ids (return_token_ids) for carry-forward, but
         // trust them only when their count matches the server's completion_tokens. Otherwise (an
         // older server that ignored the flag, or a shape mismatch) fall back to the re-encoded ids.
-        let output_ids_exact = server_completion_tokens.map_or_else(
+        let output_ids_exact = server.completion_tokens.map_or_else(
             || !output_token_ids.is_empty(),
             |count| output_token_ids.len() == count,
         );
@@ -287,24 +168,24 @@ impl GenerationClient {
         // Servers omit cached-token details when nothing was cached, so usage-present but
         // cache-detail-absent means zero cached tokens. Requires the server to report
         // prompt-token details (vLLM: --enable-prompt-tokens-details) to be meaningful.
-        if server_cached_prompt_tokens.is_none() && server_prompt_tokens.is_some() {
-            server_cached_prompt_tokens = Some(0);
+        if server.cached_prompt_tokens.is_none() && server.prompt_tokens.is_some() {
+            server.cached_prompt_tokens = Some(0);
         }
         let server_uncached_prompt_tokens =
-            match (server_prompt_tokens, server_cached_prompt_tokens) {
+            match (server.prompt_tokens, server.cached_prompt_tokens) {
                 (Some(prompt), Some(cached)) => Some(prompt.saturating_sub(cached)),
                 _ => None,
             };
-        let server_prefix_hit_rate = match (server_cached_prompt_tokens, server_prompt_tokens) {
+        let server_prefix_hit_rate = match (server.cached_prompt_tokens, server.prompt_tokens) {
             (Some(cached), Some(prompt)) => ratio(cached, prompt),
             _ => None,
         };
 
-        let server_usage = saw_server_usage.then_some(ServerUsageLog {
-            prompt_tokens: server_prompt_tokens,
-            completion_tokens: server_completion_tokens,
-            total_tokens: server_total_tokens,
-            cached_prompt_tokens: server_cached_prompt_tokens,
+        let server_usage = server.seen.then_some(ServerUsageLog {
+            prompt_tokens: server.prompt_tokens,
+            completion_tokens: server.completion_tokens,
+            total_tokens: server.total_tokens,
+            cached_prompt_tokens: server.cached_prompt_tokens,
             uncached_prompt_tokens: server_uncached_prompt_tokens,
             prefix_hit_rate: server_prefix_hit_rate,
         });
@@ -320,7 +201,7 @@ impl GenerationClient {
                 submit_timestamp,
                 post_timestamp,
                 complete_timestamp: unix_seconds_now(),
-                first_token_ms,
+                first_token_ms: first_text_ms,
                 first_token_id_ms,
                 last_token_id_ms,
                 first_token_event_tokens,
@@ -336,6 +217,81 @@ impl GenerationClient {
                 error,
             },
             output_ids,
+        }
+    }
+
+    /// Send one request and drive its response into `fold`.
+    ///
+    /// Owns the transport — connection, SSE framing, idle timeout — and nothing
+    /// else: every observation it makes goes through [`StreamAccumulator`], and
+    /// every failure it can see is reported the same way, so the caller reads
+    /// one place to learn how the round went.
+    async fn fold_response(
+        &self,
+        request_id: &str,
+        payload: &Value,
+        send_instant: Instant,
+        fold: &mut StreamAccumulator,
+    ) {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header("x-request-id", request_id)
+            .json(payload)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => return fold.fail(format!("HTTP {}", response.status())),
+            Err(err) => return fold.fail(format!("request error: {err}")),
+        };
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = BytesMut::with_capacity(8192);
+        let mut done = false;
+
+        while !done {
+            match timeout(
+                Duration::from_secs(self.stream_idle_timeout_secs),
+                stream.next(),
+            )
+            .await
+            {
+                Ok(Some(Ok(chunk))) => {
+                    buffer.extend_from_slice(&chunk);
+                    while let Some(idx) = buffer.iter().position(|&b| b == b'\n') {
+                        let line_bytes = buffer.split_to(idx + 1);
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        let line = line.trim();
+                        if !line.starts_with("data: ") {
+                            continue;
+                        }
+                        let data = line.trim_start_matches("data: ").trim();
+                        if data == "[DONE]" {
+                            done = true;
+                            break;
+                        }
+                        // A line that is not valid JSON is skipped rather than
+                        // failed: some servers interleave keep-alive comments.
+                        if let Ok(value) = serde_json::from_str::<Value>(data) {
+                            let event = self.backend.parse_event(&value);
+                            if fold.absorb(event, elapsed_ms(send_instant)).is_break() {
+                                done = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Err(err))) => return fold.fail(format!("stream error: {err}")),
+                Ok(None) => return,
+                Err(_) => {
+                    return fold.fail(format!(
+                        "stream idle timeout after {}s",
+                        self.stream_idle_timeout_secs
+                    ))
+                }
+            }
         }
     }
 }
