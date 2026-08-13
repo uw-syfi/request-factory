@@ -1005,16 +1005,25 @@ A context-limit skip always ends its session, independently of this flag.
 ├── examples/                 canonical trace + raw tracegen inputs
 ├── skills/                   agent-facing operating guide for a replay
 ├── src/
-│   ├── lib.rs                the public library: the canonical trace, only
+│   ├── lib.rs                the public library: the canonical trace + run_once
 │   ├── v2.rs                 session-execution-v2 schema, minting, validation
-│   ├── main.rs               argument validation, preflight, task fan-out
+│   ├── runner.rs             one run: validate, load, preflight, fan out, fold
+│   ├── main.rs               argument parsing; one call into the library
 │   ├── cli.rs                public CLI contract
-│   ├── backend.rs            backend adapters + shared streaming engine
+│   ├── backend/
+│   │   ├── mod.rs            normalized request/response vocabulary + Backend
+│   │   ├── wire/             one file per protocol: openai, vllm, sglang
+│   │   ├── client.rs         the protocol-blind streaming engine
+│   │   ├── stream.rs         the response fold, testable without a server
+│   │   ├── integrity.rs      may this response be believed at all
+│   │   └── preflight.rs      the prefix-cache gate run once before a workload
 │   ├── bin/tracegen/
 │   │   ├── main.rs           raw trace -> canonical trace + manifest
+│   │   ├── arrivals.rs       seeded arrival synthesis + session selection
 │   │   └── policy.rs         context-policy arithmetic (generation-time only)
 │   ├── executor/
-│   │   ├── mod.rs            shared run state, progress counters, status task
+│   │   ├── mod.rs            run policy, shared state, counters, status task
+│   │   ├── admission.rs      declaration-order admission under a cap
 │   │   ├── session.rs        ordered closed-loop session executor
 │   │   └── independent.rs    one-shot independent-request executor
 │   ├── trace/
@@ -1034,11 +1043,13 @@ own only endpoint, payload, and response parsing. The shared generation client
 accepts normalized token-generation requests; it does not depend on either
 frontend's row type.
 
-`src/lib.rs` exposes exactly one thing — the canonical `session-execution-v2`
-trace — because that is the only artifact other programs need to agree with us
-about. `session_runner` and `tracegen` are binaries built on top of it, and a
+`src/lib.rs` exposes two things. The canonical `session-execution-v2` trace,
+because that is the artifact other programs need to agree with us about — a
 simulator reading the same trace links the library rather than reimplementing
-the schema.
+the schema. And `run_once`, because a run is not only something a person starts
+from a shell: a sweep drives dozens of them, and doing that in one process is
+what lets it pay for the tokenizer and the synthetic token pool once instead of
+per point. `session_runner` and `tracegen` are binaries built on top.
 
 </details>
 
