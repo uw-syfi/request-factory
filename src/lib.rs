@@ -17,20 +17,37 @@
 //! generation-time decision owned solely by the `tracegen` binary, and its
 //! outcome is recorded in the manifest beside the file it produced.
 
-mod backend;
-mod cli;
-mod executor;
-mod record;
-mod runner;
-mod summary;
-mod tokens;
-mod trace;
-mod util;
-mod workload;
-
 pub mod schema;
 
+// The runtime is feature-gated so a consumer that only reads trace files -- a
+// simulator replaying the same bytes -- can take the schemas without building an
+// HTTP client, a tokenizer and an async runtime to get at them.
+#[cfg(feature = "runtime")]
+mod backend;
+#[cfg(feature = "runtime")]
+mod cli;
+#[cfg(feature = "runtime")]
+mod executor;
+#[cfg(feature = "runtime")]
+mod record;
+#[cfg(feature = "runtime")]
+mod runner;
+#[cfg(feature = "runtime")]
+mod summary;
+#[cfg(feature = "runtime")]
+mod tokens;
+#[cfg(feature = "runtime")]
+mod trace;
+#[cfg(feature = "runtime")]
+mod util;
+#[cfg(feature = "runtime")]
+mod workload;
+
+#[cfg(feature = "runtime")]
 pub use cli::{Args, ArrivalMode, BackendKind};
+#[cfg(feature = "runtime")]
 pub use runner::run_once;
+#[cfg(feature = "runtime")]
 pub use summary::RunSummary;
+#[cfg(feature = "runtime")]
 pub use trace::TraceFormat;

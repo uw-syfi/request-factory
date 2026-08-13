@@ -5,9 +5,9 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Typed workload runner for OpenAI-compatible inference servers"
 
-# Shared between the replay runtime and the trace generator: both must read and
-# validate the canonical execution trace by identical rules, so the schema lives
-# in one library rather than being reimplemented per binary.
+# Shared between the replay runtime, the trace generator, and any other program
+# that reads the same files: all of them must agree on what a trace *is*, so the
+# schemas live in one library rather than being reimplemented per consumer.
 [lib]
 name = "req_frontend"
 path = "src/lib.rs"
@@ -15,24 +15,49 @@ path = "src/lib.rs"
 [[bin]]
 name = "session_runner"
 path = "src/main.rs"
+required-features = ["runtime"]
 
 [[bin]]
 name = "tracegen"
 path = "src/bin/tracegen/main.rs"
+required-features = ["runtime"]
+
+[features]
+default = ["runtime"]
+
+# The replay runtime: the HTTP client, the tokenizer, the CLI, the executors.
+#
+# Split out because the largest consumer of this crate does not want any of it.
+# A simulator reading the same trace files needs `schema` and nothing else, and
+# should not pay reqwest, tokio, tokenizers and hf-hub to get it. Such a
+# consumer takes `default-features = false`.
+runtime = [
+    "dep:bytes",
+    "dep:clap",
+    "dep:fdlimit",
+    "dep:futures",
+    "dep:hf-hub",
+    "dep:reqwest",
+    "dep:tokenizers",
+    "dep:tokio",
+]
 
 [dependencies]
+# Always on: what it takes to describe and read a trace file.
 anyhow = "1.0"
-bytes = "1.5"
-clap = { version = "4.5", features = ["derive"] }
 csv = "1.3"
-fdlimit = "0.3"
-futures = "0.3"
-hf-hub = "0.3"
-reqwest = { version = "0.11", features = ["json", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokenizers = "0.21"
-tokio = { version = "1.36", features = ["full"] }
+
+# Runtime only.
+bytes = { version = "1.5", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+fdlimit = { version = "0.3", optional = true }
+futures = { version = "0.3", optional = true }
+hf-hub = { version = "0.3", optional = true }
+reqwest = { version = "0.11", features = ["json", "stream"], optional = true }
+tokenizers = { version = "0.21", optional = true }
+tokio = { version = "1.36", features = ["full"], optional = true }
 
 # This crate is also vendored as a submodule below larger Rust workspaces. Keep
 # it an independent workspace so Cargo never inherits the host repository's

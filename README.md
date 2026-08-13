@@ -1057,6 +1057,16 @@ that in one process is what lets it pay for the tokenizer and the synthetic toke
 pool once instead of per point. `session_runner` and `tracegen` are binaries
 built on top.
 
+A consumer that only reads trace files takes the schemas without the runtime:
+
+```toml
+req-frontend = { path = "...", default-features = false }
+```
+
+That drops reqwest, tokio, tokenizers and hf-hub, leaving `anyhow`, `csv`,
+`serde` and `serde_json` — because a program that never sends a request should
+not compile an HTTP client to find out what a column is called.
+
 </details>
 
 ## Current scope
