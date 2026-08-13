@@ -9,15 +9,65 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 
 use crate::backend::GenerationClient;
-use crate::cli::Args;
+use crate::cli::{Args, ArrivalMode};
+use crate::util::reaches_context_limit;
 
 pub(crate) use admission::AdmissionOrder;
 pub(crate) use independent::run_independent_request;
 pub(crate) use session::run_session;
 
+/// The four run-level decisions a workload-unit executor actually makes.
+///
+/// `Args` has twenty fields and the executors read these four. Handing over the
+/// whole struct made every executor look like it might depend on the endpoint
+/// URL or the log path, and left no way to tell from a type what a change to
+/// `Args` could reach.
+#[derive(Clone, Copy)]
+pub(crate) struct RunPolicy {
+    /// Which axis supplies a unit's start time.
+    pub(crate) arrival_mode: ArrivalMode,
+    /// Declared model context limit, when there is one.
+    max_model_len: Option<usize>,
+    /// Whether to skip a request that would reach that limit rather than send it.
+    skip_when_reaching_limit: bool,
+    /// Whether a session stops after its first failed round.
+    pub(crate) stop_session_on_error: bool,
+}
+
+impl RunPolicy {
+    pub(crate) fn from_args(args: &Args) -> Self {
+        Self {
+            arrival_mode: args.arrival_mode,
+            max_model_len: args.max_model_len,
+            skip_when_reaching_limit: args.skip_when_reaching_limit,
+            stop_session_on_error: args.stop_session_on_error,
+        }
+    }
+
+    /// The limit to report on a skip. `None` means none was declared, which is
+    /// also the only case in which [`Self::skips_at_context_limit`] is never true.
+    pub(crate) fn max_model_len(&self) -> Option<usize> {
+        self.max_model_len
+    }
+
+    /// Whether this request reaches the declared context limit and must be
+    /// skipped rather than sent. Both executors ask the same question, so they
+    /// ask it in one place.
+    pub(crate) fn skips_at_context_limit(
+        &self,
+        prompt_len: usize,
+        output_len_target: usize,
+    ) -> bool {
+        self.skip_when_reaching_limit
+            && self
+                .max_model_len
+                .is_some_and(|limit| reaches_context_limit(prompt_len, output_len_target, limit))
+    }
+}
+
 /// Shared, immutable-per-run state handed to every workload-unit executor.
 pub(crate) struct AppState {
-    pub(crate) args: Args,
+    pub(crate) policy: RunPolicy,
     pub(crate) client: Arc<GenerationClient>,
     pub(crate) token_pool: Arc<Vec<u32>>,
     pub(crate) stats: Arc<Stats>,

@@ -308,7 +308,7 @@ impl PrefixCacheSummary {
 
 /// Combined dry-run/full-run JSON summary: workload shape plus replay results.
 #[derive(Debug, Serialize)]
-pub(crate) struct RunSummary {
+pub struct RunSummary {
     pub(crate) workload: WorkloadSummary,
     pub(crate) replay: ReplaySummary,
     pub(crate) client_runtime: ClientRuntimeSummary,
@@ -422,13 +422,13 @@ fn percentile_sorted(values: &[f64], q: f64) -> f64 {
 /// Write the combined run summary to `--summary-path` when one was requested.
 pub(crate) fn write_summary_if_requested(
     summary_path: Option<&str>,
-    summary: RunSummary,
+    summary: &RunSummary,
 ) -> Result<()> {
     let Some(path) = summary_path else {
         return Ok(());
     };
     let file = File::create(path).with_context(|| format!("failed to create summary: {path}"))?;
-    serde_json::to_writer_pretty(file, &summary)
+    serde_json::to_writer_pretty(file, summary)
         .with_context(|| format!("failed to write summary: {path}"))?;
     Ok(())
 }

@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 
-use req_frontend::v2;
+use crate::v2;
 
 /// One round of one session, as the replay runtime executes it.
 ///

@@ -9,7 +9,7 @@ use crate::trace::TraceFormat;
 /// trace-timed run replays the recorded timeline but never exceeds the cap, and
 /// a capped saturated run is a pure closed-loop generator.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ArrivalMode {
+pub enum ArrivalMode {
     /// Replay the trace's own arrival timeline, rescaled by `--rate`.
     #[value(name = "trace-timed")]
     TraceTimed,
@@ -20,7 +20,7 @@ pub(crate) enum ArrivalMode {
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BackendKind {
+pub enum BackendKind {
     /// OpenAI-compatible `/completions` (vLLM, and SGLang's OpenAI endpoint).
     Openai,
     /// vLLM native token-in/token-out `/inference/v1/generate` endpoint.
@@ -35,86 +35,86 @@ pub(crate) enum BackendKind {
     version,
     about = "Typed trace workload runner for OpenAI-compatible inference servers"
 )]
-pub(crate) struct Args {
+pub struct Args {
     /// Source trace CSV interpreted by --trace-format.
     #[arg(long)]
-    pub(crate) trace: String,
+    pub trace: String,
 
     /// Input schema frontend. New source formats are separate typed frontends,
     /// not sparse variants of one universal row. `session` reads a canonical
     /// execution trace; generate one from a raw CSV with `tracegen`.
     #[arg(long, value_enum, default_value = "session")]
-    pub(crate) trace_format: TraceFormat,
+    pub trace_format: TraceFormat,
 
     /// Text corpus used to build synthetic prompt/input/output token pools.
     #[arg(long)]
-    pub(crate) text_file: String,
+    pub text_file: String,
 
     /// tokenizer.json path or a model directory containing tokenizer.json.
     #[arg(long)]
-    pub(crate) tokenizer: String,
+    pub tokenizer: String,
 
     /// Protocol base URL. Use http://host:port/v1 for openai and
     /// http://host:port for the native token endpoints.
     #[arg(long, default_value = "http://127.0.0.1:8000/v1")]
-    pub(crate) base_url: String,
+    pub base_url: String,
 
     /// Model name sent in the request payload. Ignored by `sglang-tokens`,
     /// whose server hosts exactly one model and takes no model field.
     #[arg(long)]
-    pub(crate) model: String,
+    pub model: String,
 
     /// Inference-server wire protocol. `vllm-tokens` requires vLLM
     /// --tokens-only; `sglang-tokens` requires SGLang --skip-tokenizer-init
     /// and --stream-output (renamed --incremental-streaming-output in newer
     /// builds).
     #[arg(long, value_enum, default_value = "openai")]
-    pub(crate) backend: BackendKind,
+    pub backend: BackendKind,
 
     #[arg(long, default_value_t = 0.0)]
-    pub(crate) temperature: f64,
+    pub temperature: f64,
 
     /// Limit top-level workload units (sessions or independent requests).
     #[arg(long, alias = "max-sessions")]
-    pub(crate) max_items: Option<usize>,
+    pub max_items: Option<usize>,
 
     /// Target top-level arrival rate: sessions/s or independent requests/s.
     /// Only meaningful under `--arrival-mode trace-timed`.
     #[arg(long)]
-    pub(crate) rate: Option<f64>,
+    pub rate: Option<f64>,
 
     /// Where release times come from. Orthogonal to `--max-concurrency`:
     /// arrival says when a unit *may* start, capacity says how many may run.
     #[arg(long, value_enum, default_value = "trace-timed")]
-    pub(crate) arrival_mode: ArrivalMode,
+    pub arrival_mode: ArrivalMode,
 
     #[arg(long, default_value = "session_runner_output.jsonl")]
-    pub(crate) log_path: String,
+    pub log_path: String,
 
     /// Cap on synthetic token-pool size. Defaults to cover the workload's longest prompt with
     /// headroom, so synthetic content never repeats within a single request.
     #[arg(long)]
-    pub(crate) token_pool_limit: Option<usize>,
+    pub token_pool_limit: Option<usize>,
 
     /// Max seconds to wait for the next streaming chunk before failing a request.
     #[arg(long, default_value_t = 600)]
-    pub(crate) stream_idle_timeout_secs: u64,
+    pub stream_idle_timeout_secs: u64,
 
     /// Stop a session after the first failed round.
     #[arg(long, default_value_t = true)]
-    pub(crate) stop_session_on_error: bool,
+    pub stop_session_on_error: bool,
 
     /// Maximum number of top-level workload units active at once.
     #[arg(long)]
-    pub(crate) max_concurrency: Option<usize>,
+    pub max_concurrency: Option<usize>,
 
     /// Parse and statically summarize the workload without loading tokens or contacting a server.
     #[arg(long, default_value_t = false)]
-    pub(crate) dry_run: bool,
+    pub dry_run: bool,
 
     /// Optional model context limit used for static trace-target overflow reporting.
     #[arg(long)]
-    pub(crate) max_model_len: Option<usize>,
+    pub max_model_len: Option<usize>,
 
     /// Skip a request when prompt plus target output reaches the model limit,
     /// reserving at least one token of context headroom.
@@ -123,9 +123,9 @@ pub(crate) struct Args {
         visible_aliases = ["skip-on-context-limit", "fail-on-context-overflow"],
         default_value_t = false
     )]
-    pub(crate) skip_when_reaching_limit: bool,
+    pub skip_when_reaching_limit: bool,
 
     /// Optional JSON summary path for one run.
     #[arg(long)]
-    pub(crate) summary_path: Option<String>,
+    pub summary_path: Option<String>,
 }

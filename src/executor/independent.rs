@@ -8,7 +8,6 @@ use crate::executor::AppState;
 use crate::record::StepLog;
 use crate::tokens::TokenProvider;
 use crate::trace::IndependentRequest;
-use crate::util::reaches_context_limit;
 
 /// Replay one independent request. This is deliberately separate from the session
 /// executor: independent requests have no round ordering, prefix carry-forward,
@@ -36,15 +35,15 @@ pub(crate) async fn run_independent_request(
     let prompt = Prompt::Tokens(&prompt_ids);
     let request_id = format!("independent_{}", request.id);
     state.stats.record_submit();
-    let result = if state.args.skip_when_reaching_limit
-        && state.args.max_model_len.is_some_and(|limit| {
-            reaches_context_limit(prompt.token_len(), request.output_len, limit)
-        }) {
+    let result = if state
+        .policy
+        .skips_at_context_limit(prompt.token_len(), request.output_len)
+    {
         context_limit_skip_result(
             request_id,
             prompt.token_len(),
             request.output_len,
-            state.args.max_model_len,
+            state.policy.max_model_len(),
         )
     } else {
         state
@@ -65,7 +64,7 @@ pub(crate) async fn run_independent_request(
 }
 
 async fn wait_for_arrival(state: &AppState, arrival_time_ms: f64) -> f64 {
-    if state.args.arrival_mode == ArrivalMode::Saturated {
+    if state.policy.arrival_mode == ArrivalMode::Saturated {
         return 0.0;
     }
     let arrival_time_ms = arrival_time_ms.max(0.0);

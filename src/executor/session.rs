@@ -3,12 +3,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::backend::{context_limit_skip_result, GenerationResult, Prompt};
-use crate::cli::{Args, ArrivalMode};
+use crate::cli::ArrivalMode;
 use crate::executor::AppState;
 use crate::record::StepLog;
 use crate::tokens::{PromptBuild, PromptBuilder, TokenProvider};
 use crate::trace::SessionStep;
-use crate::util::reaches_context_limit;
 
 /// Replay one session as an ordered, closed-loop chain of rounds.
 pub(crate) async fn run_session(
@@ -47,14 +46,15 @@ pub(crate) async fn run_session(
         let prompt = Prompt::Tokens(&prompt_ids);
         let request_id = step.request_id.clone();
         state.stats.record_submit();
-        let context_limit_skipped =
-            should_skip_at_context_limit(&state.args, prompt.token_len(), step.output_len);
+        let context_limit_skipped = state
+            .policy
+            .skips_at_context_limit(prompt.token_len(), step.output_len);
         let result = if context_limit_skipped {
             context_limit_skip_result(
                 request_id,
                 prompt.token_len(),
                 step.output_len,
-                state.args.max_model_len,
+                state.policy.max_model_len(),
             )
         } else {
             state
@@ -78,7 +78,7 @@ pub(crate) async fn run_session(
         let _ = log_tx.send(log).await;
 
         state.stats.record_result(success);
-        if context_limit_skipped || (!success && state.args.stop_session_on_error) {
+        if context_limit_skipped || (!success && state.policy.stop_session_on_error) {
             break;
         }
 
@@ -94,15 +94,8 @@ pub(crate) async fn run_session(
     state.stats.record_unit_done();
 }
 
-fn should_skip_at_context_limit(args: &Args, prompt_len: usize, output_len_target: usize) -> bool {
-    args.skip_when_reaching_limit
-        && args
-            .max_model_len
-            .is_some_and(|limit| reaches_context_limit(prompt_len, output_len_target, limit))
-}
-
 async fn wait_for_session_arrival(state: &AppState, steps: &[SessionStep]) {
-    if state.args.arrival_mode == ArrivalMode::Saturated {
+    if state.policy.arrival_mode == ArrivalMode::Saturated {
         return;
     }
     let arrival_ms = steps

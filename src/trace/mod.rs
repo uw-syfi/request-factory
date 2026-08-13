@@ -10,7 +10,7 @@ pub(crate) use session::{SessionPlans, SessionStep};
 /// Source schema selector. Each frontend retains its own typed workload rather
 /// than filling absent fields in a universal row with zeros or nulls.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TraceFormat {
+pub enum TraceFormat {
     Independent,
     /// Canonical, already-materialized execution trace shared with the
     /// simulator. Its `prefix_len` is guaranteed to exist by the time the round
@@ -155,7 +155,7 @@ mod tests {
 
     fn step(session_id: &str, arrival_time: f64, round_idx: usize) -> SessionStep {
         SessionStep {
-            request_id: req_frontend::v2::request_id(session_id, round_idx),
+            request_id: crate::v2::request_id(session_id, round_idx),
             session_id: session_id.to_string(),
             arrival_time,
             round_idx,
