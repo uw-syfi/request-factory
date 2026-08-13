@@ -1005,8 +1005,12 @@ A context-limit skip always ends its session, independently of this flag.
 ├── examples/                 canonical trace + raw tracegen inputs
 ├── skills/                   agent-facing operating guide for a replay
 ├── src/
-│   ├── lib.rs                the public library: the canonical trace + run_once
-│   ├── v2.rs                 session-execution-v2 schema, minting, validation
+│   ├── lib.rs                the public library: the trace schemas + run_once
+│   ├── schema/
+│   │   ├── mod.rs            trace kinds, tags, column blocks, header check
+│   │   ├── media.rs          image/video/audio extents, decoding strategy
+│   │   ├── omni.rs           heterogeneous input/output segment JSON
+│   │   └── session_execution_v2.rs  the canonical schema, minting, validation
 │   ├── runner.rs             one run: validate, load, preflight, fan out, fold
 │   ├── main.rs               argument parsing; one call into the library
 │   ├── cli.rs                public CLI contract
@@ -1043,13 +1047,15 @@ own only endpoint, payload, and response parsing. The shared generation client
 accepts normalized token-generation requests; it does not depend on either
 frontend's row type.
 
-`src/lib.rs` exposes two things. The canonical `session-execution-v2` trace,
-because that is the artifact other programs need to agree with us about — a
-simulator reading the same trace links the library rather than reimplementing
-the schema. And `run_once`, because a run is not only something a person starts
-from a shell: a sweep drives dozens of them, and doing that in one process is
-what lets it pay for the tokenizer and the synthetic token pool once instead of
-per point. `session_runner` and `tracegen` are binaries built on top.
+`src/lib.rs` exposes two things. `schema/`, because what a trace file is — which
+kinds exist, what columns each one obliges a file to carry — is the artifact
+other programs must agree with us about; a simulator reading the same file links
+the library rather than reimplementing the taxonomy, and adding a tenth kind is
+then an edit in one repository. And `run_once`, because a run is not only
+something a person starts from a shell: a sweep drives dozens of them, and doing
+that in one process is what lets it pay for the tokenizer and the synthetic token
+pool once instead of per point. `session_runner` and `tracegen` are binaries
+built on top.
 
 </details>
 

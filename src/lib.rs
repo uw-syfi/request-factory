@@ -28,7 +28,7 @@ mod trace;
 mod util;
 mod workload;
 
-pub mod v2;
+pub mod schema;
 
 pub use cli::{Args, ArrivalMode, BackendKind};
 pub use runner::run_once;

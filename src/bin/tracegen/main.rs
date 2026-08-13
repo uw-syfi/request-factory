@@ -30,8 +30,9 @@ use policy::{
     ContextChain, RawRound, SessionContextPolicy, MAJOR_COMPACTION_MIN_DROP_RATIO,
     MAJOR_COMPACTION_MIN_DROP_TOKENS,
 };
-use req_frontend::v2::{
-    self, format_milliseconds, request_id, ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME,
+use req_frontend::schema::session_execution_v2 as v2;
+use req_frontend::schema::session_execution_v2::{
+    format_milliseconds, request_id, ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME,
 };
 
 /// Raw schema name accepted by `--source-schema`. Declared rather than sniffed:

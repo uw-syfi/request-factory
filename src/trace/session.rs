@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 
-use crate::v2;
+use crate::schema::session_execution_v2 as v2;
 
 /// One round of one session, as the replay runtime executes it.
 ///

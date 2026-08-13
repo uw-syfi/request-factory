@@ -28,6 +28,22 @@ pub const SCHEMA_NAME: &str = "session-execution-v2";
 /// byte-identical afterwards; and VibeSim converts milliseconds to its internal
 /// clock by truncation, so two spellings of one instant can land on different
 /// ticks.
+/// The canonical column order, which is also the file's header.
+///
+/// Declared rather than derived from [`ExecutionRow`]'s field order: the order
+/// is part of the format, and a consumer checking a header must be able to state
+/// what it expects without constructing a row.
+pub const COLUMNS: &[&str] = &[
+    "request_id",
+    "session_id",
+    "round_idx",
+    "arrival_time_ms",
+    "prefix_len",
+    "input_len",
+    "output_len",
+    "tool_wait_after_ms",
+];
+
 pub const MILLISECOND_DECIMALS: usize = 6;
 
 pub fn format_milliseconds(value: f64) -> String {

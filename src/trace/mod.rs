@@ -155,7 +155,7 @@ mod tests {
 
     fn step(session_id: &str, arrival_time: f64, round_idx: usize) -> SessionStep {
         SessionStep {
-            request_id: crate::v2::request_id(session_id, round_idx),
+            request_id: crate::schema::session_execution_v2::request_id(session_id, round_idx),
             session_id: session_id.to_string(),
             arrival_time,
             round_idx,
