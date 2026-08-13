@@ -69,7 +69,7 @@ impl ExecutionRow {
 /// `session_` namespaces the id by the frontend that produced it, matching what
 /// the independent frontend already does with `independent_{id}`. The corpus's
 /// own name for the session is left alone in the `session_id` column — this
-/// prefix is TraceLab's, not the dataset's, which matters because published
+/// prefix is this client's, not the dataset's, which matters because published
 /// sessions are often bare integers that say nothing about what they identify.
 pub fn request_id(session_id: &str, round_idx: usize) -> String {
     format!("session_{session_id}_round_{round_idx:06}")
@@ -259,7 +259,13 @@ pub fn plan(rows: &[ExecutionRow]) -> Vec<PlanRow> {
 mod tests {
     use super::*;
 
-    fn row(session: &str, round_idx: usize, arrival: f64, prefix: usize, input: usize) -> ExecutionRow {
+    fn row(
+        session: &str,
+        round_idx: usize,
+        arrival: f64,
+        prefix: usize,
+        input: usize,
+    ) -> ExecutionRow {
         ExecutionRow {
             request_id: request_id(session, round_idx),
             session_id: session.to_string(),
@@ -323,7 +329,12 @@ mod tests {
 
     #[test]
     fn rejects_session_blocks_out_of_arrival_order() {
-        let rows = vec![row("a", 0, 0.0, 0, 512), row("b", 0, -0.0, 0, 400), row("c", 0, 100.0, 0, 1), row("d", 0, 10.0, 0, 1)];
+        let rows = vec![
+            row("a", 0, 0.0, 0, 512),
+            row("b", 0, -0.0, 0, 400),
+            row("c", 0, 100.0, 0, 1),
+            row("d", 0, 10.0, 0, 1),
+        ];
         let error = validate(&rows).unwrap_err().to_string();
         assert!(error.contains("nondecreasing"), "{error}");
     }

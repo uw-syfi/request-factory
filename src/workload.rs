@@ -75,10 +75,7 @@ impl WorkloadSummary {
 }
 
 impl SessionWorkloadSummary {
-    fn from_sessions(
-        sessions: &SessionPlans,
-        max_model_len: Option<usize>,
-    ) -> Self {
+    fn from_sessions(sessions: &SessionPlans, max_model_len: Option<usize>) -> Self {
         let mut summary = Self {
             sessions: sessions.len(),
             rounds: 0,

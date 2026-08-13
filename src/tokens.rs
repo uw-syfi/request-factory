@@ -100,68 +100,6 @@ impl PromptBuilder {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn step(prefix_len: usize, input_len: usize, output_len: usize) -> SessionStep {
-        SessionStep {
-            request_id: "session_s1_round_000000".to_string(),
-            session_id: "session".to_string(),
-            arrival_time: 0.0,
-            round_idx: 0,
-            prefix_len,
-            input_len,
-            output_len,
-            tool_wait_after_ms: 0.0,
-        }
-    }
-
-    fn builder(pool_len: usize) -> PromptBuilder {
-        let pool = Arc::new((0..pool_len as u32).collect());
-        PromptBuilder::new(TokenProvider::new(pool, 0).unwrap())
-    }
-
-    // How a trace's split was chosen is covered by `tracegen`'s policy tests.
-    // These cases cover what only this layer can get wrong: which token ids end
-    // up in the prompt, and what happens when the live conversation turns out
-    // shorter than the file assumed.
-
-    #[test]
-    fn carries_exact_output_ids_into_the_next_prompt() {
-        let mut builder = builder(200_000);
-        let first = builder.build_prompt(&step(0, 4, 2));
-        assert_eq!(first.prompt_ids, vec![0, 1, 2, 3]);
-        builder.commit_output(first.prompt_ids, vec![91, 92]);
-
-        // The trace's round 1 reuses the whole 6-token round 0 — prompt *and*
-        // output — so the server's real ids must reappear inside the prefix.
-        let second = builder.build_prompt(&step(6, 2, 1));
-
-        assert_eq!(second.prompt_ids, vec![0, 1, 2, 3, 91, 92, 4, 5]);
-        assert_eq!(second.derived_prefix_len, 6);
-        assert_eq!(second.derived_append_len, 2);
-        assert_eq!(second.prefix_shortfall_len, 0);
-    }
-
-    #[test]
-    fn repairs_a_prefix_the_live_conversation_could_not_supply() {
-        let mut builder = builder(200_000);
-        let first = builder.build_prompt(&step(0, 4, 2));
-        // The server returned nothing, so the 6 tokens of context the trace
-        // counted on are really only the 4 prompt tokens.
-        builder.commit_output(first.prompt_ids, Vec::new());
-
-        let second = builder.build_prompt(&step(6, 2, 1));
-
-        assert_eq!(second.derived_prefix_len, 4);
-        assert_eq!(second.prefix_shortfall_len, 2);
-        assert_eq!(second.derived_append_len, 4);
-        assert_eq!(second.prompt_ids[..4], [0, 1, 2, 3]);
-        assert_eq!(second.prompt_ids.len(), 8);
-    }
-}
-
 /// Load a tokenizer from a local tokenizer.json / model directory, or download
 /// it from the Hugging Face Hub when the path is a repo id.
 pub(crate) fn load_tokenizer(path: &str) -> Result<Tokenizer> {
@@ -249,4 +187,66 @@ pub(crate) fn build_token_pool(
         return Err(anyhow!("text corpus produced an empty token pool"));
     }
     Ok(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(prefix_len: usize, input_len: usize, output_len: usize) -> SessionStep {
+        SessionStep {
+            request_id: "session_s1_round_000000".to_string(),
+            session_id: "session".to_string(),
+            arrival_time: 0.0,
+            round_idx: 0,
+            prefix_len,
+            input_len,
+            output_len,
+            tool_wait_after_ms: 0.0,
+        }
+    }
+
+    fn builder(pool_len: usize) -> PromptBuilder {
+        let pool = Arc::new((0..pool_len as u32).collect());
+        PromptBuilder::new(TokenProvider::new(pool, 0).unwrap())
+    }
+
+    // How a trace's split was chosen is covered by `tracegen`'s policy tests.
+    // These cases cover what only this layer can get wrong: which token ids end
+    // up in the prompt, and what happens when the live conversation turns out
+    // shorter than the file assumed.
+
+    #[test]
+    fn carries_exact_output_ids_into_the_next_prompt() {
+        let mut builder = builder(200_000);
+        let first = builder.build_prompt(&step(0, 4, 2));
+        assert_eq!(first.prompt_ids, vec![0, 1, 2, 3]);
+        builder.commit_output(first.prompt_ids, vec![91, 92]);
+
+        // The trace's round 1 reuses the whole 6-token round 0 — prompt *and*
+        // output — so the server's real ids must reappear inside the prefix.
+        let second = builder.build_prompt(&step(6, 2, 1));
+
+        assert_eq!(second.prompt_ids, vec![0, 1, 2, 3, 91, 92, 4, 5]);
+        assert_eq!(second.derived_prefix_len, 6);
+        assert_eq!(second.derived_append_len, 2);
+        assert_eq!(second.prefix_shortfall_len, 0);
+    }
+
+    #[test]
+    fn repairs_a_prefix_the_live_conversation_could_not_supply() {
+        let mut builder = builder(200_000);
+        let first = builder.build_prompt(&step(0, 4, 2));
+        // The server returned nothing, so the 6 tokens of context the trace
+        // counted on are really only the 4 prompt tokens.
+        builder.commit_output(first.prompt_ids, Vec::new());
+
+        let second = builder.build_prompt(&step(6, 2, 1));
+
+        assert_eq!(second.derived_prefix_len, 4);
+        assert_eq!(second.prefix_shortfall_len, 2);
+        assert_eq!(second.derived_append_len, 4);
+        assert_eq!(second.prompt_ids[..4], [0, 1, 2, 3]);
+        assert_eq!(second.prompt_ids.len(), 8);
+    }
 }
