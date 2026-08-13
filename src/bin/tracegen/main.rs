@@ -14,6 +14,7 @@
 //!   trace had to be folded to make it replayable;
 //! - a normalized plan, which is what a differential test compares.
 
+mod arrivals;
 mod policy;
 
 use std::collections::BTreeMap;
@@ -24,6 +25,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+use arrivals::{ArrivalPattern, Rng, SessionOrder};
 use policy::{
     ContextChain, RawRound, SessionContextPolicy, MAJOR_COMPACTION_MIN_DROP_RATIO,
     MAJOR_COMPACTION_MIN_DROP_TOKENS,
@@ -34,24 +36,26 @@ use req_frontend::v2::{
 
 /// Raw schema name accepted by `--source-schema`. Declared rather than sniffed:
 /// a new raw format is a new declared schema, not a header guess.
-const RAW_SCHEMA_SESSION_ROUNDS_V1: &str = "session-rounds-v1";
+const RAW_SCHEMA_SESSION_ROUNDS_V2: &str = "session-rounds-v2";
 
-/// One row of the raw trace `artifacts/trace_facts/csv_export/convert.py` emits.
+/// One row of the raw trace TraceLab's
+/// `artifacts/trace_facts/csv_export/convert.py` exports.
 ///
-/// `id` names the *session* here, which is exactly the ambiguity v2 removes —
-/// the same column name means a request in other tools. It is read under its
-/// raw name and never propagated.
+/// It carries no arrival time: the corpus has none, so this tool invents the
+/// timeline. Every field here is something the source actually observed.
+///
+/// Unknown columns are rejected rather than ignored. A `session-rounds-v1` file
+/// still has every column v2 needs, so without this it would parse cleanly and
+/// its recorded `arrival_time` would be silently replaced by a synthetic one —
+/// the exact failure mode of quietly accepting a file from the wrong schema.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawRow {
-    #[serde(alias = "session_id")]
-    id: String,
-    #[serde(default)]
-    arrival_time: f64,
+    session_id: String,
     round_idx: usize,
-    prefix_len: usize,
     input_len: usize,
     output_len: usize,
-    #[serde(default)]
+    prefix_len: usize,
     tool_wait_after_ms: f64,
 }
 
@@ -67,7 +71,7 @@ struct Args {
     source: PathBuf,
 
     /// Declared raw schema. Never inferred from the header.
-    #[arg(long, default_value = RAW_SCHEMA_SESSION_ROUNDS_V1)]
+    #[arg(long, default_value = RAW_SCHEMA_SESSION_ROUNDS_V2)]
     source_schema: String,
 
     /// Context policy to resolve into the canonical trace. The generated file
@@ -79,9 +83,26 @@ struct Args {
     #[arg(long)]
     out: PathBuf,
 
-    /// Keep only the first N sessions, in canonical arrival order.
+    /// Keep only the first N sessions, in the emitted session order.
     #[arg(long)]
     max_sessions: Option<usize>,
+
+    /// Session order before arrivals are assigned.
+    #[arg(long, value_enum, default_value = "source")]
+    session_order: SessionOrder,
+
+    /// Synthetic session arrival rate, in sessions per second. The source has
+    /// no arrival times, so this timeline is invented here and recorded.
+    #[arg(long, default_value_t = 1.0)]
+    arrival_rate: f64,
+
+    /// Synthetic session arrival process.
+    #[arg(long, value_enum, default_value = "poisson")]
+    arrival_pattern: ArrivalPattern,
+
+    /// Seed for session shuffling and Poisson arrivals. Same seed, same trace.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
 }
 
 /// Everything needed to explain, and reproduce, one canonical trace.
@@ -98,9 +119,12 @@ struct Manifest {
     millisecond_decimals: usize,
     selection_rule: &'static str,
     max_sessions: Option<usize>,
-    /// Source arrival subtracted from every session so this trace starts at its
-    /// own origin. Recorded so a row can be traced back to the source timeline.
-    arrival_origin_ms: f64,
+    /// How the timeline was invented. The source has no arrival times, so
+    /// without these four fields a trace cannot be reproduced from its source.
+    session_order: &'static str,
+    arrival_rate_per_second: f64,
+    arrival_pattern: &'static str,
+    seed: u64,
     sessions: usize,
     rounds: usize,
     /// How much of the raw trace was not replayable as reported. These are the
@@ -120,33 +144,40 @@ struct Manifest {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.source_schema != RAW_SCHEMA_SESSION_ROUNDS_V1 {
+    if args.source_schema != RAW_SCHEMA_SESSION_ROUNDS_V2 {
         bail!(
-            "unknown --source-schema {:?}; this build reads {RAW_SCHEMA_SESSION_ROUNDS_V1:?}",
+            "unknown --source-schema {:?}; this build reads {RAW_SCHEMA_SESSION_ROUNDS_V2:?}",
             args.source_schema
+        );
+    }
+    if !(args.arrival_rate.is_finite() && args.arrival_rate > 0.0) {
+        bail!(
+            "--arrival-rate must be finite and positive, got {}",
+            args.arrival_rate
         );
     }
 
     let raw_rows = read_raw(&args.source)?;
     let sessions = group_sessions(raw_rows)?;
-    let selected = select_sessions(sessions, args.max_sessions);
+
+    // One RNG drives both the permutation and the gaps, so a seed names the
+    // whole timeline rather than half of it.
+    let mut rng = Rng::new(args.seed);
+    let selected = select_sessions(sessions, args.max_sessions, args.session_order, &mut rng);
+    // Arrivals are drawn for the sessions that survived selection, so capping
+    // shortens the trace without changing the offered rate.
+    let arrivals = arrivals::synthesize(
+        &mut rng,
+        selected.len(),
+        args.arrival_rate,
+        args.arrival_pattern,
+    );
 
     let mut rows: Vec<ExecutionRow> = Vec::new();
     let mut manifest = new_manifest(&args)?;
 
-    // Rebase onto this trace's own origin. Source arrivals are offsets within
-    // the whole dataset, so any subset would otherwise open with a lead-in that
-    // belongs to sessions it does not contain — a consumer would idle through it
-    // for no reason, and two subsets of one source would not be comparable.
-    let arrival_origin_ms = selected
-        .first()
-        .map(|(_, rounds)| rounds[0].arrival_time)
-        .unwrap_or(0.0);
-    manifest.arrival_origin_ms = arrival_origin_ms;
-
-    for (session_id, rounds) in &selected {
+    for ((session_id, rounds), &arrival_time_ms) in selected.iter().zip(&arrivals) {
         let mut chain = ContextChain::new();
-        let arrival_time_ms = rounds[0].arrival_time - arrival_origin_ms;
         for (round_idx, raw) in rounds.iter().enumerate() {
             let materialized = chain.materialize(
                 RawRound {
@@ -248,9 +279,12 @@ fn new_manifest(args: &Args) -> Result<Manifest> {
         major_compaction_min_drop_tokens: MAJOR_COMPACTION_MIN_DROP_TOKENS,
         major_compaction_min_drop_ratio: MAJOR_COMPACTION_MIN_DROP_RATIO,
         millisecond_decimals: MILLISECOND_DECIMALS,
-        selection_rule: "first_n_by_arrival_then_source_order",
+        selection_rule: "first_n_in_emitted_session_order",
         max_sessions: args.max_sessions,
-        arrival_origin_ms: 0.0,
+        session_order: args.session_order.label(),
+        arrival_rate_per_second: args.arrival_rate,
+        arrival_pattern: args.arrival_pattern.label(),
+        seed: args.seed,
         sessions: 0,
         rounds: 0,
         folded_prefix_tokens: 0,
@@ -280,17 +314,18 @@ fn read_raw(path: &Path) -> Result<Vec<RawRow>> {
 /// Group raw rows into sessions, preserving first-appearance order and sorting
 /// each session's rounds by the raw `round_idx`.
 ///
-/// First-appearance order is the tie-break under equal arrivals (canonical rule
-/// O2), so it is preserved rather than replaced by a sort on the identifier.
+/// First-appearance order is the source's own order, which is the default
+/// emission order, so it is preserved rather than replaced by a sort on the
+/// identifier — that is lexicographic and means nothing here.
 fn group_sessions(rows: Vec<RawRow>) -> Result<Vec<(String, Vec<RawRow>)>> {
     let mut order: Vec<String> = Vec::new();
     let mut grouped: BTreeMap<String, Vec<RawRow>> = BTreeMap::new();
     for row in rows {
-        if row.id.is_empty() {
+        if row.session_id.is_empty() {
             bail!("raw trace has a row with an empty session id");
         }
-        let entry = grouped.entry(row.id.clone()).or_insert_with(|| {
-            order.push(row.id.clone());
+        let entry = grouped.entry(row.session_id.clone()).or_insert_with(|| {
+            order.push(row.session_id.clone());
             Vec::new()
         });
         entry.push(row);
@@ -300,38 +335,26 @@ fn group_sessions(rows: Vec<RawRow>) -> Result<Vec<(String, Vec<RawRow>)>> {
     for session_id in order {
         let mut rounds = grouped.remove(&session_id).expect("session was recorded");
         rounds.sort_by_key(|round| round.round_idx);
-        let arrival = rounds[0].arrival_time;
-        if !arrival.is_finite() || arrival < 0.0 {
-            bail!("session {session_id:?} has arrival_time {arrival}, expected finite and non-negative");
-        }
-        if let Some(mismatch) = rounds.iter().find(|round| round.arrival_time != arrival) {
-            bail!(
-                "session {session_id:?} declares two arrival times ({arrival} and {}); \
-                 a session arrives once",
-                mismatch.arrival_time
-            );
-        }
         sessions.push((session_id, rounds));
     }
     Ok(sessions)
 }
 
-/// Keep the first `max` sessions in canonical order.
+/// Order the sessions, then keep the first `max`.
 ///
-/// Canonical order is arrival first, then source appearance for equal arrivals,
-/// which is also the order the rows are emitted in. Selecting a prefix of a
-/// fixed schedule must follow that schedule — not the session identifier, whose
-/// lexicographic order is unrelated to when the work arrives.
+/// Selection happens before arrivals are drawn, so a cap takes a prefix of the
+/// session order rather than the earliest slice of a timeline. That keeps the
+/// offered rate of a capped trace equal to the rate of the full one instead of
+/// silently compressing it.
 fn select_sessions(
     mut sessions: Vec<(String, Vec<RawRow>)>,
     max: Option<usize>,
+    order: SessionOrder,
+    rng: &mut Rng,
 ) -> Vec<(String, Vec<RawRow>)> {
-    sessions.sort_by(|left, right| {
-        left.1[0]
-            .arrival_time
-            .partial_cmp(&right.1[0].arrival_time)
-            .expect("arrival times were validated as finite")
-    });
+    if order == SessionOrder::Shuffle {
+        rng.shuffle(&mut sessions);
+    }
     if let Some(max) = max {
         sessions.truncate(max);
     }
@@ -467,14 +490,13 @@ fn sha256_file(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn raw_row(id: &str, arrival_time: f64, round_idx: usize) -> RawRow {
+    fn raw_row(session_id: &str, round_idx: usize) -> RawRow {
         RawRow {
-            id: id.to_string(),
-            arrival_time,
+            session_id: session_id.to_string(),
             round_idx,
-            prefix_len: 0,
             input_len: 10,
             output_len: 4,
+            prefix_len: 0,
             tool_wait_after_ms: 0.0,
         }
     }
@@ -485,33 +507,17 @@ mod tests {
 
     #[test]
     fn grouping_preserves_first_appearance_and_orders_rounds() {
-        let sessions = group_sessions(vec![
-            raw_row("b", 0.0, 1),
-            raw_row("a", 5.0, 0),
-            raw_row("b", 0.0, 0),
-        ])
-        .unwrap();
+        let sessions =
+            group_sessions(vec![raw_row("b", 1), raw_row("a", 0), raw_row("b", 0)]).unwrap();
 
         assert_eq!(ids(&sessions), ["b", "a"]);
         let round_indices: Vec<usize> = sessions[0].1.iter().map(|row| row.round_idx).collect();
         assert_eq!(round_indices, [0, 1]);
     }
 
-    /// A session arrives once. The loader this replaced kept a per-round arrival
-    /// column and silently used only the first round's value, so a trace that
-    /// disagreed with itself replayed as though it did not.
-    #[test]
-    fn grouping_rejects_a_session_that_declares_two_arrival_times() {
-        let error = group_sessions(vec![raw_row("a", 0.0, 0), raw_row("a", 250.0, 1)])
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("declares two arrival times"), "{error}");
-    }
-
     #[test]
     fn grouping_rejects_an_empty_session_id() {
-        let error = group_sessions(vec![raw_row("", 0.0, 0)])
+        let error = group_sessions(vec![raw_row("", 0)])
             .unwrap_err()
             .to_string();
 
@@ -519,29 +525,55 @@ mod tests {
     }
 
     #[test]
-    fn selection_keeps_the_earliest_arrivals_not_the_first_seen() {
+    fn selection_in_source_order_takes_a_prefix_of_the_file() {
         let sessions =
-            group_sessions(vec![raw_row("late", 900.0, 0), raw_row("early", 5.0, 0)]).unwrap();
+            group_sessions(vec![raw_row("c", 0), raw_row("a", 0), raw_row("b", 0)]).unwrap();
 
-        let selected = select_sessions(sessions, Some(1));
+        let selected = select_sessions(sessions, Some(2), SessionOrder::Source, &mut Rng::new(0));
 
-        assert_eq!(ids(&selected), ["early"]);
+        assert_eq!(ids(&selected), ["c", "a"]);
     }
 
-    /// Canonical rule O2: equal arrivals fall back to source appearance order,
-    /// which is what makes a measured replay and a simulated run agree on which
-    /// session entered first.
+    /// Shuffling happens before truncation, so a cap samples across the whole
+    /// file rather than re-cutting the same prefix under a different name.
     #[test]
-    fn selection_breaks_equal_arrivals_by_source_order() {
-        let sessions = group_sessions(vec![
-            raw_row("second", 100.0, 0),
-            raw_row("first", 100.0, 0),
-            raw_row("third", 100.0, 0),
-        ])
-        .unwrap();
+    fn shuffled_selection_samples_the_whole_file_and_is_seed_reproducible() {
+        let rows: Vec<RawRow> = (0..32)
+            .map(|index| raw_row(&format!("s{index:02}"), 0))
+            .collect();
 
-        let selected = select_sessions(sessions, Some(2));
+        let take = |seed: u64| {
+            let sessions = group_sessions(rows.clone()).unwrap();
+            let selected = select_sessions(
+                sessions,
+                Some(4),
+                SessionOrder::Shuffle,
+                &mut Rng::new(seed),
+            );
+            ids(&selected)
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        };
 
-        assert_eq!(ids(&selected), ["second", "first"]);
+        let shuffled = take(1);
+        assert_eq!(shuffled.len(), 4);
+        assert_eq!(shuffled, take(1), "the same seed must select the same four");
+        assert_ne!(
+            shuffled,
+            ["s00", "s01", "s02", "s03"],
+            "a shuffle that returns the source prefix is not shuffling"
+        );
+    }
+
+    /// The whole point of drawing arrivals after selection: a capped trace has
+    /// the same offered rate as the full one, not a compressed slice of it.
+    #[test]
+    fn capping_does_not_change_the_offered_rate() {
+        let mut rng = Rng::new(0);
+        let capped = arrivals::synthesize(&mut rng, 10, 2.0, ArrivalPattern::Constant);
+
+        assert_eq!(capped.last().copied(), Some(4500.0));
+        assert!(capped.windows(2).all(|pair| pair[1] - pair[0] == 500.0));
     }
 }

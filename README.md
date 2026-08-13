@@ -83,7 +83,7 @@ This axis has two sub-axes that compose freely — *when* a unit may start, and
 | `--arrival-mode saturated` | Recorded arrivals are ignored: every unit is eligible from the start. Without a cap this submits the whole workload at once; with one it is a closed-loop generator. Rejected together with `--rate`, which rescales a timeline this mode discards |
 | `--rate N` | Rescale all arrivals to `N` units/s, preserving relative gaps and simultaneous-arrival bursts. Needs at least two distinct arrival times, measured after `--max-items` has been applied |
 | `--max-concurrency N` | Bound concurrently active units, under either arrival mode. One session holds its slot across all of its rounds **and its tool waits** — while waiting on a tool it has no request in flight but is still occupying a slot |
-| `--max-items N` | Keep the first `N` units in trace order, applied before `--rate` is measured. A canonical session file is ordered by arrival, so this keeps the earliest-arriving sessions; `independent` keeps the first `N` CSV rows |
+| `--max-items N` | Keep the first `N` units in trace order, applied before `--rate` is measured. Rows are kept in file order; `independent` keeps the first `N` CSV rows |
 
 `--max-concurrency` bounds *workload units*, not HTTP requests in flight. There
 is deliberately no separate in-flight cap: a session is the unit a coding agent
@@ -141,7 +141,7 @@ Run these commands from the repository root.
 ### 1. Build
 
 ```bash
-cargo build --release --manifest-path Cargo.toml --bin session_runner
+cargo build --release --bin session_runner
 ```
 
 ### 2. Parse and inspect a trace without a server
@@ -353,9 +353,9 @@ What the format buys, and what it costs:
 - **No runtime policy.** There is no context-policy flag on the runner at all.
   Two runtimes replaying the file do identical work without having to agree on
   anything beyond the bytes.
-- **Rebased arrivals.** A canonical trace starts at its own origin, so a
-  three-session subset of a month-long dataset does not open with weeks of dead
-  time.
+- **Arrivals are part of the file.** The corpus behind these traces has no
+  session arrival times, so the timeline is synthesized once at generation and
+  recorded in the manifest. A trace starts at its own origin.
 - **Row order is the contract.** Rows of a session are contiguous, sessions are
   nondecreasing by arrival, and no consumer may re-sort by identifier — dense
   internal IDs are assigned in file order on both sides.
@@ -364,10 +364,10 @@ What the format buys, and what it costs:
 
 #### Generating a canonical trace
 
-Generate one from a raw session trace with `tracegen`:
+Generate one from a raw `session-rounds-v2` trace with `tracegen`:
 
 ```bash
-cargo run --release --manifest-path Cargo.toml --bin tracegen -- \
+cargo run --release --bin tracegen -- \
   --source examples/multi_session_example.csv \
   --policy trace-reported \
   --max-sessions 200 \
@@ -376,12 +376,42 @@ cargo run --release --manifest-path Cargo.toml --bin tracegen -- \
 
 It writes `execution.csv` plus `execution.manifest.json` and
 `execution.plan.json` beside it. The manifest records the source hash, the
-policy and its thresholds, the selection rule, how many tokens were folded from
-prefix into fresh input, and the planned prefix hit rate — read it before
-quoting any cache number, because a fold that is large is not a bug but does
-mean the source attributed to cache what the replay must actually prefill. The
-plan is the normalized per-round expansion, which is what a simulator compares
-against to prove both sides scheduled the same work.
+policy and its thresholds, the selection rule, the arrival synthesis, how many
+tokens were folded from prefix into fresh input, and the planned prefix hit rate
+— read it before quoting any cache number, because a fold that is large is not
+a bug but does mean the source attributed to cache what the replay must actually
+prefill. The plan is the normalized per-round expansion, which is what a
+simulator compares against to prove both sides scheduled the same work.
+
+Between the source hash and those fields, the manifest is a complete recipe:
+given the same raw CSV, the flags it records regenerate the trace byte for byte.
+
+#### Shaping the workload
+
+The raw trace says what each session *did*, never when it arrived — the corpus
+has no arrival timestamps. So the timeline is invented here, and so is the
+choice of which sessions to keep:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--arrival-rate` | `1.0` | Session arrivals per second. |
+| `--arrival-pattern` | `poisson` | `poisson` for exponential gaps, `constant` for even spacing. |
+| `--session-order` | `source` | `source` keeps the file's order; `shuffle` permutes first. |
+| `--max-sessions` | all | Keep the first N of the emitted order. |
+| `--seed` | `0` | Drives both the shuffle and the Poisson gaps. |
+
+Selection runs *before* arrivals are drawn, so `--max-sessions` shortens a trace
+without compressing it: a 200-session cut offers the same rate as the full file
+rather than the densest slice of it.
+
+Randomness is a xoshiro256\*\* stream implemented in `bin/tracegen/arrivals.rs`
+rather than taken from a crate, and its output is pinned by a test. Reproducing
+a published trace years from now means reproducing that exact bit stream, which
+a dependency free to change its default algorithm cannot promise.
+
+Downstream, `session_runner --rate` rescales this recorded timeline and
+`--arrival-mode saturated` ignores it. Neither can recover what rate the file
+was generated at; that is what the manifest is for.
 
 #### Choosing a policy
 

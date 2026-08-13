@@ -91,10 +91,22 @@ prefill; on real coding-agent data this is dominated by first rounds, where the
 agent resumed from context the published trace does not contain. A large fold is
 not a bug, but a hit rate reported without it is misleading.
 
-The raw source CSV comes from TraceLab's exporter,
-`artifacts/trace_facts/csv_export/convert.py`. Session identity there is
-`(project, session_file, session_id)` — grouping by `session_id` alone merges
-distinct sessions.
+The raw source CSV is `session-rounds-v2` from TraceLab's exporter,
+`artifacts/trace_facts/csv_export/convert.py`. That exporter is deterministic
+and carries no timeline — the corpus has no arrival timestamps.
+
+So `tracegen` invents one, and every knob that shapes the workload lives here
+rather than upstream: `--arrival-rate` (default `1.0`/s), `--arrival-pattern`
+(`poisson` or `constant`), `--session-order` (`source` or `shuffle`),
+`--max-sessions`, and `--seed`. All five land in the manifest, so a trace plus
+its manifest and source hash is a complete recipe.
+
+Selection runs before arrivals are drawn, so `--max-sessions 200` offers the
+same rate as the full file instead of its densest 200-session slice.
+
+Downstream, `session_runner --rate` rescales the recorded timeline and
+`--arrival-mode saturated` discards it. Neither can tell you what rate the file
+was generated at — read the manifest.
 
 ## Running
 
