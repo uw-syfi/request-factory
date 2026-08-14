@@ -1240,6 +1240,42 @@ contaminated curve reported as a clean one is the failure worth preventing here.
 SGLang is `unsupported`: it has `/flush_cache`, but not with the same meaning on
 every version, and a wrong guess would report a reset that never happened.
 
+## Plotting a sweep — `viz/`
+
+An optional Python sidecar with its own `pyproject.toml`, run under `uv`. It is
+never invoked by a sweep and nothing in `src/` knows it exists: a missing
+plotting dependency must not be able to cost anyone a measurement.
+
+```bash
+cd viz
+uv run viz ../out/sweep            # or the sweep.json inside it
+```
+
+Four figures, written beside the report under `figures/`:
+
+| File | Shows |
+|---|---|
+| `throughput.png` | delivered steps against offered load, with the knee bracket or peak plateau shaded, and the dashed reference a perfect server would have followed |
+| `attainment.png` | SLO attainment against offered load — the run's objective and the rows' own deadlines as separate series, never merged |
+| `latency.png` | TTFT, TPOT and end-to-end distributions per rate, as boxes with p99 marked |
+| `arrivals_rate_*.png` | when each token actually arrived, per request, for the lowest and highest rates measured |
+
+What the figures will not do is as much the point as what they will. A metric no
+point reported produces a figure saying so rather than empty axes; a null point
+is counted, never interpolated across; a knee that was `never_crossed` is not
+drawn at the edge of the range; and every figure prints the sweep's caveats —
+cache contamination, dropped timelines, reused points — under the axes, so a
+contaminated run cannot be screenshotted without them.
+
+The token-arrival figure is drawn as a **step** function with a marker per
+arrival, because a chunk carrying four ids is one observable instant and not
+four. The flat treads are the waits and the risers are the arrivals; the riser
+height is the chunk size.
+
+```bash
+uv run pytest                      # the transforms; the plots are checked by eye
+```
+
 ## Metrics
 
 ### Timing boundaries
@@ -1289,6 +1325,25 @@ throughput rather than as an error. Check `failed_steps` and
 `run_duration_ms` is also a client-side span across wall-clock timestamps, not
 a server-side serving window: it includes trace arrival gaps, tool waits, and
 any time spent blocked on `--max-concurrency`.
+
+### Offered units against delivered steps
+
+The two sides of a saturation test are counted in different things, and the
+conversion is not optional:
+
+```text
+offered_step_rate = rate * steps_per_workload_unit
+```
+
+`--rate` offers **workload units** per second — a session for a session trace, a
+request for an independent one — while every throughput above counts **steps**,
+and a session issues several rounds. `steps_per_workload_unit` is the trace's
+own ratio, reported in `RunMetrics` and on every curve entry, and it says what a
+server that kept up perfectly would have had to deliver.
+
+Comparing the raw numbers instead reads a saturated server as keeping up with
+room to spare, by exactly the mean rounds per session. On a two-round trace that
+put the reported knee at more than twice the true one.
 
 ### Prefix-cache accounting
 
@@ -1406,6 +1461,7 @@ A context-limit skip always ends its session, independently of this flag.
 ├── examples/                 canonical trace + raw tracegen inputs
 ├── skills/                   agent-facing operating guide for a replay
 ├── tools/                    stub server for measuring the client alone
+├── viz/                      optional Python plotting; nothing here depends on it
 ├── src/
 │   ├── lib.rs                the public library: the trace schemas + run_once
 │   ├── schema/

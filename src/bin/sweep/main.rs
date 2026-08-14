@@ -217,7 +217,14 @@ struct ReportPoint {
 
 #[derive(Debug, Serialize)]
 struct CurveEntry {
+    /// Offered load, in workload units per second — sessions for a session
+    /// trace. Not the same currency as the throughputs below.
     rate: f64,
+    /// The conversion between the two. Multiply `rate` by this to get the
+    /// steps per second a server that kept up perfectly would have delivered;
+    /// that, not `rate` itself, is what `request_throughput_per_s` is measured
+    /// against.
+    steps_per_workload_unit: f64,
     output_token_throughput_per_s: Option<f64>,
     request_throughput_per_s: Option<f64>,
     ttft_ms_p50: Option<f64>,
@@ -461,6 +468,7 @@ fn assemble(
         .iter()
         .map(|point| CurveEntry {
             rate: point.record.rate,
+            steps_per_workload_unit: point.record.metrics.steps_per_workload_unit,
             output_token_throughput_per_s: point.record.metrics.output_token_throughput_per_s,
             request_throughput_per_s: point.record.metrics.request_throughput_per_s,
             ttft_ms_p50: point.record.metrics.ttft_ms_p50,

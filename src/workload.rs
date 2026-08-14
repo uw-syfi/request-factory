@@ -66,6 +66,37 @@ impl WorkloadSummary {
         }
     }
 
+    /// Workload units this trace offers — what `--rate` counts.
+    ///
+    /// A session, not a round: `--rate` rescales session arrivals, and a
+    /// session's later rounds are submitted by the session itself as it goes.
+    pub(crate) fn workload_units(&self) -> usize {
+        match self {
+            Self::Sessions(summary) => summary.sessions,
+            Self::IndependentRequests(summary) => summary.requests,
+        }
+    }
+
+    /// Steps one workload unit contributes, on average.
+    ///
+    /// The conversion between the two rates anyone comparing offered load to
+    /// delivered work needs. `--rate` is in units per second and a run's
+    /// throughput is in steps per second; on a session trace averaging two
+    /// rounds each, those differ by a factor of two, and comparing them
+    /// directly reads a saturated server as keeping up with room to spare.
+    ///
+    /// It is the trace's ratio, not the run's: it says what a server that kept
+    /// up perfectly would have to deliver, which is exactly the reference a
+    /// saturation test needs. One for an independent trace, where a unit *is* a
+    /// step.
+    pub(crate) fn steps_per_workload_unit(&self) -> f64 {
+        let units = self.workload_units();
+        if units == 0 {
+            return 1.0;
+        }
+        self.total_steps() as f64 / units as f64
+    }
+
     pub(crate) fn print(&self) {
         match self {
             Self::Sessions(summary) => summary.print(),

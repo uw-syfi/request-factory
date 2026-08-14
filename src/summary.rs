@@ -350,6 +350,16 @@ pub struct RunMetrics {
     /// Nonzero means the per-event timeline is a sample of this point rather
     /// than a record of it.
     pub timeline_dropped_requests: usize,
+    /// Workload units the trace offered — sessions for a session trace,
+    /// requests for an independent one. The unit `--rate` counts.
+    pub workload_units: usize,
+    /// Steps one workload unit contributes, on average.
+    ///
+    /// Carried so a consumer can compare an offered *unit* rate against a
+    /// delivered *step* throughput without having to load the trace. On a
+    /// session trace averaging two rounds each these differ by a factor of two,
+    /// and the two are easy to mistake for one quantity.
+    pub steps_per_workload_unit: f64,
 }
 
 impl RunSummary {
@@ -376,6 +386,8 @@ impl RunSummary {
                 .and_then(|slo| slo.declared_deadline)
                 .and_then(|deadline| deadline.attainment),
             timeline_dropped_requests: self.timeline.dropped_requests,
+            workload_units: self.workload.workload_units(),
+            steps_per_workload_unit: self.workload.steps_per_workload_unit(),
         }
     }
 }

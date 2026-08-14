@@ -35,6 +35,15 @@ pub enum Boundary {
     /// judged. It is also the more direct statement of the thing: a saturated
     /// server is one that cannot complete work as fast as it arrives.
     ///
+    /// The two sides are counted in different things and must be converted
+    /// before they can be compared. `--rate` offers *workload units* per second
+    /// — sessions for a session trace — while throughput is delivered *steps*
+    /// per second, and a session issues several rounds. So the reference is
+    /// `rate * steps_per_workload_unit`: what a server that kept up perfectly
+    /// would have had to deliver. Comparing the raw numbers instead reads a
+    /// saturated server as keeping up with room to spare, by exactly the mean
+    /// rounds per session.
+    ///
     /// One measurement artifact to know about. The run window runs from the
     /// first submission to the last completion, so it always includes one
     /// request's latency after the last arrival. At rates where the trace's
@@ -83,12 +92,23 @@ impl Boundary {
                         candidate.rate
                     );
                 };
-                let required = candidate.rate * (1.0 - max_shortfall);
+                let steps_per_unit = candidate.metrics.steps_per_workload_unit;
+                if !(steps_per_unit.is_finite() && steps_per_unit > 0.0) {
+                    bail!(
+                        "the run at rate {:.6}/s reported {steps_per_unit} steps per workload \
+                         unit, so its offered rate cannot be converted into the steps its \
+                         throughput is counted in; check its point directory",
+                        candidate.rate
+                    );
+                }
+                let offered_steps = candidate.rate * steps_per_unit;
+                let required = offered_steps * (1.0 - max_shortfall);
                 Ok(Verdict {
                     crossed: delivered < required,
                     reason: format!(
-                        "delivered {delivered:.4}/s against {:.4}/s offered; keeping up needs \
-                         {required:.4}/s (within {:.0}%)",
+                        "delivered {delivered:.4} steps/s against {:.4} units/s offered × \
+                         {steps_per_unit:.4} steps/unit = {offered_steps:.4} steps/s; keeping up \
+                         needs {required:.4} (within {:.0}%)",
                         candidate.rate,
                         max_shortfall * 100.0,
                     ),
@@ -139,11 +159,18 @@ impl Boundary {
 mod tests {
     use super::*;
 
+    /// An independent trace: one step per workload unit, so offered and
+    /// delivered are already in the same currency.
     fn delivering(rate: f64, delivered: f64) -> Measured {
+        delivering_rounds(rate, delivered, 1.0)
+    }
+
+    fn delivering_rounds(rate: f64, delivered: f64, steps_per_workload_unit: f64) -> Measured {
         Measured {
             rate,
             metrics: RunMetrics {
                 request_throughput_per_s: Some(delivered),
+                steps_per_workload_unit,
                 ..RunMetrics::default()
             },
         }
@@ -205,6 +232,43 @@ mod tests {
 
         assert!(strict.judge(&point).unwrap().crossed);
         assert!(!loose.judge(&point).unwrap().crossed);
+    }
+
+    /// The defect this conversion exists to prevent, in the numbers that
+    /// exposed it: a stub server plateauing at ~129 rounds/s under a trace
+    /// averaging 2.01 rounds per session. Offered 40 sessions/s it is keeping
+    /// up; offered 80 it is not. Comparing the raw numbers called both of them
+    /// comfortable and moved the reported knee to 145 sessions/s — more than
+    /// twice the truth, because 129 rounds/s *is* 64 sessions/s.
+    #[test]
+    fn a_session_trace_is_judged_in_rounds_offered_not_sessions_offered() {
+        let boundary = Boundary::MaxSustainableRate {
+            max_shortfall: 0.10,
+        };
+        let rounds_per_session = 2.01;
+
+        let below = boundary
+            .judge(&delivering_rounds(40.0, 80.0, rounds_per_session))
+            .unwrap();
+        let above = boundary
+            .judge(&delivering_rounds(80.0, 129.6, rounds_per_session))
+            .unwrap();
+
+        assert!(!below.crossed, "{}", below.reason);
+        assert!(above.crossed, "{}", above.reason);
+        // Raw, the same point reads as delivering 129.6 against 80 offered.
+        assert!(!boundary.judge(&delivering(80.0, 129.6)).unwrap().crossed);
+    }
+
+    #[test]
+    fn a_ratio_that_cannot_convert_the_rate_fails_rather_than_guessing_one() {
+        // Zero is what an older point record deserializes to. Treating it as 1
+        // would apply the independent-trace rule to a session trace silently.
+        let boundary = Boundary::MaxSustainableRate {
+            max_shortfall: 0.10,
+        };
+
+        assert!(boundary.judge(&delivering_rounds(10.0, 20.0, 0.0)).is_err());
     }
 
     #[test]
