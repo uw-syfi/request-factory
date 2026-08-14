@@ -29,6 +29,58 @@ use crate::tokens::{build_token_pool, load_tokenizer};
 use crate::trace::{load_workload, ReplayWorkload};
 use crate::workload::WorkloadSummary;
 
+/// Tokenizer and synthetic corpus, kept across runs that can share them.
+///
+/// This is what makes a sweep of N points cost one tokenization instead of N.
+/// The corpus is the expensive part by a wide margin — a hundred million tokens
+/// — and it depends only on the tokenizer, the text file, and the pool size, none
+/// of which a rate sweep varies.
+#[derive(Default)]
+pub struct CorpusCache {
+    entry: Option<CachedCorpus>,
+}
+
+struct CachedCorpus {
+    /// Everything the built pool depends on. Compared rather than assumed: a
+    /// caller that varies the tokenizer between points must get a rebuilt pool,
+    /// not silently reused content in the wrong token space.
+    key: (String, String, usize),
+    tokenizer: Arc<tokenizers::Tokenizer>,
+    token_pool: Arc<Vec<u32>>,
+}
+
+impl CorpusCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get_or_build(
+        &mut self,
+        tokenizer_path: &str,
+        text_file: &str,
+        pool_limit: usize,
+    ) -> Result<(Arc<tokenizers::Tokenizer>, Arc<Vec<u32>>)> {
+        let key = (
+            tokenizer_path.to_string(),
+            text_file.to_string(),
+            pool_limit,
+        );
+        if let Some(entry) = self.entry.as_ref() {
+            if entry.key == key {
+                return Ok((entry.tokenizer.clone(), entry.token_pool.clone()));
+            }
+        }
+        let tokenizer = Arc::new(load_tokenizer(tokenizer_path)?);
+        let token_pool = Arc::new(build_token_pool(text_file, tokenizer.as_ref(), pool_limit)?);
+        self.entry = Some(CachedCorpus {
+            key,
+            tokenizer: tokenizer.clone(),
+            token_pool: token_pool.clone(),
+        });
+        Ok((tokenizer, token_pool))
+    }
+}
+
 /// Execute one workload and return its summary.
 ///
 /// Writes `--log-path` and, when requested, `--summary-path`; the same summary is
@@ -36,6 +88,14 @@ use crate::workload::WorkloadSummary;
 /// wrote. A `--dry-run` returns after the static workload summary, without
 /// loading tokens or contacting a server.
 pub async fn run_once(args: Args) -> Result<RunSummary> {
+    run_once_reusing(args, &mut CorpusCache::new()).await
+}
+
+/// [`run_once`], reusing a corpus across calls.
+///
+/// The cache is the caller's, so a sweep decides how long it lives and nothing
+/// global outlives a run that did not ask for it.
+pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<RunSummary> {
     // Per-process, and idempotent: a sweep calling this once per point costs
     // nothing, and forgetting it once would cap a large run at the default
     // descriptor limit.
@@ -77,7 +137,6 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
         return Ok(summary);
     }
 
-    let tokenizer = Arc::new(load_tokenizer(&args.tokenizer)?);
     // Size the synthetic token pool to the workload by default: it must exceed the longest
     // prompt so no single request repeats content, and stay larger than the session count so
     // per-session seed offsets stay distinct (otherwise distant sessions draw identical content
@@ -91,11 +150,8 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
             .max(workload.unit_count())
             .max(MIN_TOKEN_POOL)
     });
-    let token_pool = Arc::new(build_token_pool(
-        &args.text_file,
-        tokenizer.as_ref(),
-        pool_limit,
-    )?);
+    let (tokenizer, token_pool) =
+        corpus.get_or_build(&args.tokenizer, &args.text_file, pool_limit)?;
     if token_pool.len() < workload_summary.max_prompt_len() {
         eprintln!(
             "warning: token pool ({} tokens) is smaller than the longest prompt ({} tokens); \

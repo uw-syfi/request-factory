@@ -133,6 +133,11 @@ was generated at — read the manifest.
 
 # 5. Replay a trace carrying its own per-round deadlines.
 #    ... --trace-tags slo        (the file must then have deadline_ms + priority)
+
+# 6. Find the rate where the server stops keeping up. Ramps, bisects, densifies.
+./target/release/sweep --mode max-throughput --out out/sweep \
+  --start-rate 5 --max-rate 800 \
+  <every session_runner flag above, except --rate>
 ```
 
 `--tokenizer` must match the served model: it sizes the synthetic corpus in the
@@ -182,6 +187,15 @@ server's own token space.
 - `slo.declared_deadline` counts only the rows that set `deadline_ms`. Read
   `declared_steps` against the run's total before quoting its rate: an
   almost-empty column produces a rate over a handful of rows.
+- A sweep's `knee.outcome` of `never_crossed` or `always_crossed` is a **result**,
+  not a failure: the knee is outside the searched range. Neither reports a rate
+  at the range's edge as the knee. Widen `--max-rate` / `--min-rate` and re-run —
+  completed points are reused, so it costs only the new ones.
+- Check `sweep.json`'s `contamination_warning` before comparing points. Nonzero
+  means some point started warm on its predecessor's content, and the
+  prefix-cache numbers across points are not comparable.
+- The sweep's `points` array is every rate measured, including ones the search
+  discarded on the way; `curve` is the same points sorted by rate. Plot `curve`.
 
 ## Troubleshooting
 

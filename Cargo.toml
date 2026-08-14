@@ -22,6 +22,11 @@ name = "tracegen"
 path = "src/bin/tracegen/main.rs"
 required-features = ["runtime"]
 
+[[bin]]
+name = "sweep"
+path = "src/bin/sweep/main.rs"
+required-features = ["runtime"]
+
 [features]
 default = ["runtime"]
 

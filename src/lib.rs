@@ -50,8 +50,8 @@ mod workload;
 #[cfg(feature = "runtime")]
 pub use cli::{Args, ArrivalMode, BackendKind};
 #[cfg(feature = "runtime")]
-pub use runner::run_once;
+pub use runner::{run_once, run_once_reusing, CorpusCache};
 #[cfg(feature = "runtime")]
-pub use summary::RunSummary;
+pub use summary::{RunMetrics, RunSummary};
 #[cfg(feature = "runtime")]
 pub use trace::TraceFormat;

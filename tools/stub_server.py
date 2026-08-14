@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """A vLLM-shaped SSE stub, for measuring the client against a server that isn't there.
 
-It exists to answer one question that a real server cannot: does recording the
-per-event timeline slow down submission? A real server's own jitter is far larger
-than the effect being looked for, so the reference has to be a server whose reply
-timing is fixed by construction.
+It exists to answer questions a real server cannot. Does recording the per-event
+timeline slow down submission? A real server's own jitter is far larger than the
+effect being looked for, so the reference has to be a server whose reply timing
+is fixed by construction. And does the adaptive sweep find the knee? Only a
+server whose saturation point is known by arithmetic can answer that -- see
+`--capacity`.
 
 Speaks just enough of the `vllm-tokens` protocol: `/inference/v1/generate`
 streaming one token id per SSE chunk, a terminal usage block with prompt-token
 details (so the prefix-cache preflight passes), and `[DONE]`.
 
-    uv run python tools/stub_server.py --port 8123 [--chunk-delay-ms 0]
+    uv run python tools/stub_server.py --port 8123 [--chunk-delay-ms 0] [--capacity 0]
 """
 
 from __future__ import annotations
@@ -21,9 +23,13 @@ import json
 
 
 class Stub:
-    def __init__(self, chunk_delay_ms: float, tokens_per_chunk: int) -> None:
+    def __init__(self, chunk_delay_ms: float, tokens_per_chunk: int, capacity: int) -> None:
         self.chunk_delay_s = chunk_delay_ms / 1000.0
         self.tokens_per_chunk = tokens_per_chunk
+        # A server with no capacity limit never saturates, so a sweep against it
+        # has no knee to find. With one, the knee is arithmetic:
+        #   capacity / (output_len * chunk_delay_s) requests per second.
+        self.slots = asyncio.Semaphore(capacity) if capacity > 0 else None
         # The preflight sends one prompt twice and requires the second reply to
         # report cached tokens. Remembering what was asked is the whole feature.
         self.seen_prompts: set[int] = set()
@@ -52,6 +58,16 @@ class Stub:
             writer.close()
 
     async def reply(self, writer: asyncio.StreamWriter, body: bytes) -> None:
+        if self.slots is None:
+            await self.serve(writer, body)
+            return
+        # Held across the whole response, so an over-offered request queues
+        # rather than being served slower -- which is what a real scheduler with
+        # a fixed batch does, and what makes the knee sharp.
+        async with self.slots:
+            await self.serve(writer, body)
+
+    async def serve(self, writer: asyncio.StreamWriter, body: bytes) -> None:
         request = json.loads(body) if body else {}
         prompt_ids = request.get("token_ids") or []
         max_tokens = int(request.get("sampling_params", {}).get("max_tokens", 1))
@@ -113,9 +129,19 @@ async def main() -> None:
         help="Wall time between streamed chunks. Zero replies as fast as the socket allows.",
     )
     parser.add_argument("--tokens-per-chunk", type=int, default=1)
+    parser.add_argument(
+        "--capacity",
+        type=int,
+        default=0,
+        help=(
+            "Concurrent requests served; further ones queue. 0 is unlimited, which "
+            "never saturates. With a limit the capacity is capacity / (output_len * "
+            "chunk_delay_ms / 1000) requests per second."
+        ),
+    )
     args = parser.parse_args()
 
-    stub = Stub(args.chunk_delay_ms, args.tokens_per_chunk)
+    stub = Stub(args.chunk_delay_ms, args.tokens_per_chunk, args.capacity)
     server = await asyncio.start_server(stub.handle, args.host, args.port)
     print(f"stub listening on http://{args.host}:{args.port}", flush=True)
     async with server:

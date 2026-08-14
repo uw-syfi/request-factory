@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
 use tokio::sync::mpsc;
@@ -320,6 +320,64 @@ pub struct RunSummary {
     /// objective was declared. Serialized as null rather than omitted, so a
     /// consumer can tell "no SLO" apart from "an older summary format".
     pub slo: Option<SloSummary>,
+}
+
+/// The handful of numbers a curve is made of.
+///
+/// A named contract rather than public fields on every summary struct: a sweep
+/// is a different program from a run, and what it needs from a run is a short,
+/// stable list. Everything else in the summary stays the run's own business.
+/// `Deserialize` as well as `Serialize`, because a resumed sweep reads points
+/// it wrote in an earlier process: the metrics are a durable record, not only a
+/// report.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct RunMetrics {
+    pub attempted_steps: usize,
+    pub success_steps: usize,
+    pub failed_steps: usize,
+    pub run_duration_ms: Option<f64>,
+    pub request_throughput_per_s: Option<f64>,
+    pub output_token_throughput_per_s: Option<f64>,
+    pub ttft_ms_p50: Option<f64>,
+    pub ttft_ms_p90: Option<f64>,
+    pub tpot_ms_p50: Option<f64>,
+    pub tpot_ms_p90: Option<f64>,
+    /// Fraction of steps meeting every bound in force. `None` when the run was
+    /// held to no objective at all.
+    pub slo_attainment: Option<f64>,
+    /// Fraction of the rows that declared their own deadline and met it.
+    pub declared_deadline_attainment: Option<f64>,
+    /// Nonzero means the per-event timeline is a sample of this point rather
+    /// than a record of it.
+    pub timeline_dropped_requests: usize,
+}
+
+impl RunSummary {
+    pub fn metrics(&self) -> RunMetrics {
+        let common = match &self.replay {
+            ReplaySummary::Sessions { common, .. }
+            | ReplaySummary::IndependentRequests { common } => common,
+        };
+        RunMetrics {
+            attempted_steps: common.attempted_steps,
+            success_steps: common.success_steps,
+            failed_steps: common.failed_steps,
+            run_duration_ms: common.run_duration_ms,
+            request_throughput_per_s: common.request_throughput_per_s,
+            output_token_throughput_per_s: common.output_token_throughput_per_s,
+            ttft_ms_p50: common.ttft_ms_p50,
+            ttft_ms_p90: common.ttft_ms_p90,
+            tpot_ms_p50: common.tpot_ms_p50,
+            tpot_ms_p90: common.tpot_ms_p90,
+            slo_attainment: self.slo.as_ref().and_then(|slo| slo.attainment),
+            declared_deadline_attainment: self
+                .slo
+                .as_ref()
+                .and_then(|slo| slo.declared_deadline)
+                .and_then(|deadline| deadline.attainment),
+            timeline_dropped_requests: self.timeline.dropped_requests,
+        }
+    }
 }
 
 /// What draining the log stream produced.

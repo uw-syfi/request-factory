@@ -1034,6 +1034,106 @@ slo attainment | source=Global steps=48 overall=0.6667 |
 trace schemas rather than in the runtime, because a measured replay and a
 simulated run must report the same number for the same trace.
 
+## Rate sweeps — `sweep`
+
+A grid sweep asks you to know the answer before you start: too coarse and the
+knee falls in a gap, too fine and most of the points are spent far from it. The
+`sweep` binary ramps by doubling until the boundary flips, bisects back to locate
+it, then spends its remaining points **at** the knee.
+
+```bash
+cargo build --release --bin sweep
+
+./target/release/sweep --mode max-throughput --out out/sweep \
+  --start-rate 5 --max-rate 800 --tolerance 0.05 --densify-points 3 \
+  --trace trace/execution.csv --trace-format session \
+  --text-file corpus.txt --tokenizer <hf-model-or-path> --model <served-name> \
+  --base-url http://127.0.0.1:8000 --backend vllm-tokens
+```
+
+Every point is a full run in **this process**, which is what lets a twenty-point
+sweep pay for the tokenizer and the hundred-million-token synthetic corpus once
+instead of twenty times.
+
+### Modes
+
+| `--mode` | Crossed when |
+| --- | --- |
+| `max-throughput` | delivered request throughput fell more than `--max-shortfall` behind the offered rate |
+| `max-rate-under-slo` | SLO attainment fell below `--target-attainment` |
+| `grid` | never — `--rates 1,2,4,8` are run and reported, no search |
+
+**A boundary judges one point, alone** — no history, no neighbours. That
+restriction is deliberate. "Throughput stopped rising over the best seen so far"
+reads like the textbook definition of saturation and is order-dependent: the same
+rate judged before and after a higher one gives opposite answers, and everything
+a bisection then concludes is an artifact of visit order. Stating it as
+*delivered against offered* is both order-independent and the more direct claim —
+a saturated server is one that cannot complete work as fast as it arrives.
+
+One artifact to know about in `max-throughput`: the run window runs from the
+first submission to the last completion, so it always includes one request's
+latency after the last arrival. Delivered throughput therefore falls short of
+offered by roughly `latency × rate / units` even on a server that kept up
+perfectly. Use enough workload units that the arrival span dominates that tail.
+
+For `max-rate-under-slo`, `--attainment-metric declared-deadline` watches the
+trace's own per-request deadlines instead of the run-level objective. Either way
+the run must have an objective; a sweep whose every point reports `null`
+attainment fails rather than ramping to the ceiling and announcing a knee it
+never tested for.
+
+### What comes out
+
+`sweep.json` records **every** point in the order it was measured — including
+ones the search discarded — plus the same points sorted by rate as `curve`, the
+phase that asked for each rate, the verdict in words, and the located knee:
+
+```json
+{
+  "knob": "rate",
+  "objective": "request_throughput_per_s",
+  "boundary": { "mode": "max-throughput", "max_shortfall": 0.1 },
+  "knee": {
+    "outcome": "located",
+    "last_good_rate": 47.5,
+    "first_bad_rate": 50.0,
+    "bracket_width": 0.05
+  }
+}
+```
+
+Three outcomes, and the two that are not `located` are findings rather than
+failures: `never_crossed` means the knee is above `--max-rate`, and
+`always_crossed` means it is below `--min-rate`. Neither is reported as a knee at
+the range's edge, because that would be a fabrication.
+
+Each point gets its own directory under `points/rate_*/` with the full
+`requests.jsonl`, `summary.json` and `timeline.parquet` of that run, plus a
+`point.json` written **last and only on success** — its presence is what a
+resumed sweep reads as "already done". Re-running the same command reuses those
+points; `--no-resume` re-measures everything.
+
+### Server state between points
+
+Point *k+1* would otherwise start warm on point *k*'s content, and its measured
+prefix-cache rate would not be comparable to anything. The sweep calls the
+endpoint's cache reset before each point (vLLM's `/reset_prefix_cache`, which
+sits on the server root beside the API rather than inside it, so a `/v1` base URL
+is stripped) and records per point what happened:
+
+| `cache_reset.state` | meaning |
+| --- | --- |
+| `done` | the endpoint accepted the reset |
+| `unsupported` | this backend exposes no reset this repo has verified |
+| `failed` | the endpoint has one and it did not work |
+
+Anything other than `done` on any point produces a `contamination_warning` in
+`sweep.json` and on stderr, naming how many points were affected — a
+contaminated curve reported as a clean one is the failure worth preventing here.
+SGLang is `unsupported`: it has `/flush_cache`, but not with the same meaning on
+every version, and a wrong guess would report a reset that never happened.
+
 ## Metrics
 
 ### Timing boundaries
@@ -1224,6 +1324,11 @@ A context-limit skip always ends its session, independently of this flag.
 │   │   ├── main.rs           raw trace -> canonical trace + manifest
 │   │   ├── arrivals.rs       seeded arrival synthesis + session selection
 │   │   └── policy.rs         context-policy arithmetic (generation-time only)
+│   ├── bin/sweep/
+│   │   ├── main.rs           CLI, orchestration, sweep.json
+│   │   ├── search.rs         ramp -> bisect -> densify, as a state machine
+│   │   ├── boundary.rs       what "crossed" means, judged one point at a time
+│   │   └── point.rs          one point: reset the server, run, record, resume
 │   ├── executor/
 │   │   ├── mod.rs            run policy, shared state, counters, status task
 │   │   ├── admission.rs      declaration-order admission under a cap
