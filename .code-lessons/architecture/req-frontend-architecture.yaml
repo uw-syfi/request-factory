@@ -1,0 +1,668 @@
+schema_version: 1
+
+lesson:
+  id: req-frontend-architecture
+  title: "req-frontend：从 typed trace 到可审计 replay"
+  description: >-
+    一条永久维护的仓库级阅读路径：先建立 crate 与 trace contract 的边界，再沿
+    workload preparation、release/execution、backend streaming、observability 走完一次
+    replay，最后阅读 tracegen、sweep、viz 与 selfcheck 如何复用并验证同一套公开契约。
+    重点不是逐文件枚举，而是指出每类事实的唯一 owner、跨层数据形态，以及避免
+    measurement 看似合理却语义错误的 fail-fast 边界。
+
+  metadata:
+    type: architecture
+    lifecycle: permanent
+
+  chapters:
+    - id: repository-boundary
+      title: 第一章：仓库边界与可执行入口
+
+      steps:
+        - id: crate-products
+          title: 一个 library，四个 Rust binaries，一个独立 Python viz
+
+          primary:
+            file: Cargo.toml
+            range:
+              start_line: 8
+              end_line: 56
+
+          explanation: |
+            `req_frontend` library 是共享 contract 与 replay engine；`req-frontend`、
+            `tracegen`、`sweep`、`selfcheck` 是四个薄厚不同的产品入口。`runtime`
+            feature 把网络执行依赖与 schema-only consumers 分开；[library façade](code-ref:library-facade)
+            则明确哪些模块在无 runtime 时仍可复用。Python [viz package](code-ref:viz-boundary)
+            只消费持久化产物，不进入长时间 sweep 的成功路径。
+
+          key_points:
+            - "Cargo.toml 是产品边界：新增 binary 或 runtime coupling 应先在这里显式出现。"
+            - "schema-only build 可以读取和生成 canonical trace，而无需 HTTP/Tokio execution stack。"
+
+          related:
+            - id: library-facade
+              title: shared crate 的 feature-gated module surface
+              location:
+                file: src/lib.rs
+                range:
+                  start_line: 1
+                  end_line: 59
+            - id: viz-boundary
+              title: viz 是失败隔离的离线 consumer
+              location:
+                file: viz/README.md
+                range:
+                  start_line: 1
+                  end_line: 32
+
+        - id: cli-axes
+          title: CLI 把协议、trace、release、SLO 与观测轴显式组合
+
+          primary:
+            file: src/cli.rs
+            range:
+              start_line: 8
+              end_line: 160
+
+          explanation: |
+            `Args` 是一次 replay 的公开组合面：backend 选择、trace declaration、arrival
+            mode/rate、context cap、SLO、timeline 与输出路径都在启动时确定。release mode
+            不在 CLI 内另造 enum，而是复用 [ArrivalMode contract](code-ref:arrival-mode-contract)，
+            使 VibeSim 等 schema-only consumers 与真实 replay 使用同一组字符串和值。
+
+          related:
+            - id: arrival-mode-contract
+              title: shared open-loop 与 closed-loop release vocabulary
+              location:
+                file: src/release.rs
+                range:
+                  start_line: 1
+                  end_line: 45
+
+    - id: trace-contract
+      title: 第二章：trace declaration 与 canonical schema
+
+      steps:
+        - id: declaration-before-data
+          title: TraceDeclaration 在打开 CSV 前固定 kind、tags 与 source schema
+
+          primary:
+            file: src/schema/mod.rs
+            range:
+              start_line: 63
+              end_line: 126
+
+          explanation: |
+            `TraceKind` 决定 workload family 与 autoregressive 性质；后续的
+            [TraceDeclaration](code-ref:trace-declaration) 把 kind、orthogonal tags 和 source
+            schema 组合，并用 exact header 验证阻止“碰巧能反序列化”的输入进入执行。
+            scheduling、SLO、media、omni 都是 declaration 驱动的 typed columns，不是 loose
+            optional payload。
+
+          key_points:
+            - "文件宣称自己是什么，与文件实际有哪些列，必须在加载前一致。"
+            - "TraceTag 表达正交能力；TraceKind 表达 request family，二者不可互相替代。"
+
+          related:
+            - id: trace-declaration
+              title: declaration parse、expected columns 与 exact header gate
+              location:
+                file: src/schema/mod.rs
+                range:
+                  start_line: 227
+                  end_line: 388
+            - id: scheduling-columns
+              title: priority 与 deadline 的 typed validation
+              location:
+                file: src/schema/scheduling.rs
+                range:
+                  start_line: 24
+                  end_line: 67
+
+        - id: canonical-session-schema
+          title: session-execution-v2 是生成器、replay 与 simulator 的 canonical handoff
+
+          primary:
+            file: src/schema/session_execution_v2.rs
+            range:
+              start_line: 26
+              end_line: 180
+
+          explanation: |
+            `ExecutionRow` 与闭合的 `COLUMNS` 列表共同定义 durable CSV contract；`load`
+            先验证 header，再把 raw rows 转为 `DeclaredRow` 并检查 session/round/prefix/tool-wait
+            invariants。生成侧通过 [PlanRow and writer](code-ref:canonical-writer) 输出同一 schema，
+            避免第三个 consumer 复制 CSV 拼装逻辑。
+
+          key_points:
+            - "prefix_len 是 trace-declared cache-eligible prefix，不是 observed cache hit。"
+            - "arrival time 与 tool wait 都是输入事实；实际 release lag 是运行时观测。"
+
+          related:
+            - id: canonical-writer
+              title: planned row 到 canonical CSV 的唯一 writer
+              location:
+                file: src/schema/session_execution_v2.rs
+                range:
+                  start_line: 291
+                  end_line: 360
+            - id: request-shape-contracts
+              title: media extent、decoding 与 omni segments
+              location:
+                file: src/schema/omni.rs
+                range:
+                  start_line: 19
+                  end_line: 72
+
+        - id: slo-contract
+          title: SLO 同时保留 objective、per-metric verdict 与 aggregate attainment
+
+          primary:
+            file: src/schema/slo.rs
+            range:
+              start_line: 27
+              end_line: 220
+
+          explanation: |
+            `SloSpec` 解析 run-level objective；measurement、metric verdict、deadline
+            attainment 与 summary 是分层 durable 类型。`SloSummary::add` 在每条 StepLog
+            到达时折叠同一组判据；[SLO source resolution](code-ref:slo-source-resolution)
+            定义 CLI 与 sidecar 的优先级，避免不同入口悄悄采用不同目标。
+
+          related:
+            - id: slo-source-resolution
+              title: inline objective 与 sidecar 的解析优先级
+              location:
+                file: src/slo_source.rs
+                range:
+                  start_line: 28
+                  end_line: 94
+            - id: slo-fold
+              title: per-step judge 与 summary aggregation
+              location:
+                file: src/schema/slo.rs
+                range:
+                  start_line: 232
+                  end_line: 384
+
+    - id: workload-preparation
+      title: 第三章：从 trace rows 到可提交 prompts
+
+      steps:
+        - id: workload-loader
+          title: TraceFormat 选择 loader，ReplayWorkload 统一两种 release unit
+
+          primary:
+            file: src/trace/mod.rs
+            range:
+              start_line: 15
+              end_line: 117
+
+          explanation: |
+            loader 依据已解析 declaration 分派 session 或 independent trace，拒绝当前执行
+            backend 尚不支持的 family。`ReplayWorkload` 保留 session 与 independent 的不同
+            release unit，只在确有共同语义的地方提供统一操作；[rate scaling](code-ref:rate-scaling)
+            改写 arrival timeline，但不会把 session rounds 当成独立 arrivals。
+
+          related:
+            - id: rate-scaling
+              title: arrival-rate adjustment 与 target-rate validation
+              location:
+                file: src/trace/mod.rs
+                range:
+                  start_line: 118
+                  end_line: 205
+            - id: session-step-shape
+              title: session round 与 context cap
+              location:
+                file: src/trace/session.rs
+                range:
+                  start_line: 12
+                  end_line: 95
+            - id: independent-shape
+              title: independent request record
+              location:
+                file: src/trace/independent.rs
+                range:
+                  start_line: 11
+                  end_line: 54
+
+        - id: workload-currency
+          title: WorkloadSummary 明确 units 与 delivered steps 不是同一货币
+
+          primary:
+            file: src/workload.rs
+            range:
+              start_line: 10
+              end_line: 99
+
+          explanation: |
+            session trace 的一个 workload unit 是 session，但 throughput 统计的是 rounds/steps；
+            independent trace 才是一 unit 一 step。`steps_per_workload_unit` 把这个转换作为
+            summary contract 持久化，供 sweep boundary 与 plot 使用，而不是让 consumer 猜测。
+
+        - id: prompt-construction
+          title: TokenProvider 与 PromptBuilder 保持 exact token identity 和 session chaining
+
+          primary:
+            file: src/tokens.rs
+            range:
+              start_line: 11
+              end_line: 103
+
+          explanation: |
+            `TokenProvider` 从共享 corpus 提供稳定 token windows；`PromptBuilder` 用前轮实际
+            output 构造下一轮 prompt，并同时返回 planned/actual prefix facts。tokenizer 与大
+            token pool 由 [corpus construction](code-ref:corpus-construction) 一次构建并可跨 sweep
+            points 复用，防止 client decode/re-encode 改变 server cache key。
+
+          related:
+            - id: corpus-construction
+              title: tokenizer loading 与 bounded token-pool build
+              location:
+                file: src/tokens.rs
+                range:
+                  start_line: 105
+                  end_line: 175
+
+    - id: replay-runtime
+      title: 第四章：一次 replay 的控制面与 release 语义
+
+      steps:
+        - id: run-orchestrator
+          title: run_once_reusing 按 fail-fast 顺序组装整次运行
+
+          primary:
+            file: src/runner.rs
+            range:
+              start_line: 85
+              end_line: 185
+
+          explanation: |
+            orchestrator 先验证 CLI/declaration/SLO 并加载 workload，dry-run 在任何 tokenization
+            或网络访问前返回；真实运行才构建 corpus/client、执行 prefix-cache preflight，
+            然后创建 bounded timeline channel。后半段的 [task assembly](code-ref:run-task-assembly)
+            把 logging、status、executor 与 summary drain 的生命周期统一收束。
+
+          key_points:
+            - "失败越接近静态 contract，越应在昂贵准备和网络请求之前暴露。"
+            - "CorpusCache 由 caller 持有；sweep 可复用，但单次 run 不留下 global state。"
+
+          related:
+            - id: run-task-assembly
+              title: executor、log writer、timeline writer 与 final summary join
+              location:
+                file: src/runner.rs
+                range:
+                  start_line: 183
+                  end_line: 295
+
+        - id: executor-state
+          title: RunPolicy 与 AppState 是共享执行预算，Stats 只保存运行观测
+
+          primary:
+            file: src/executor/mod.rs
+            range:
+              start_line: 27
+              end_line: 139
+
+          explanation: |
+            `RunPolicy` 固定 semaphore、arrival mode 与 timeout；`AppState` 聚合 immutable
+            client/token source/policy、共享 counters 与 sinks。session/independent executors
+            只实现各自 dependency/release loop；[AdmissionOrder](code-ref:admission-order)
+            确保 closed-loop turn 与并发 permit 的获取顺序不会形成资源循环等待。
+
+          related:
+            - id: admission-order
+              title: closed-loop turn 与 request permit 的顺序 guard
+              location:
+                file: src/executor/admission.rs
+                range:
+                  start_line: 28
+                  end_line: 82
+            - id: session-executor
+              title: session 内 rounds 串行并处理 arrival/tool wait
+              location:
+                file: src/executor/session.rs
+                range:
+                  start_line: 14
+                  end_line: 123
+            - id: independent-executor
+              title: independent arrivals 无 session dependency
+              location:
+                file: src/executor/independent.rs
+                range:
+                  start_line: 16
+                  end_line: 88
+
+    - id: backend-streaming
+      title: 第五章：backend adapter 与 streaming measurement
+
+      steps:
+        - id: normalized-backend
+          title: Backend trait 把 wire protocol 归一为 GenRequest 与 StreamEvent
+
+          primary:
+            file: src/backend/mod.rs
+            range:
+              start_line: 36
+              end_line: 114
+
+          explanation: |
+            shared engine 只认识 exact token prompt、normalized request、usage 和 stream events；
+            OpenAI、vLLM、SGLang 差异由 [wire registry](code-ref:wire-registry) 在启动时选择。
+            因此 metrics/integrity/session carry-forward 只实现一次，不会随 backend 漂移。
+
+          related:
+            - id: wire-registry
+              title: backend factory 与 usage normalization helpers
+              location:
+                file: src/backend/wire/mod.rs
+                range:
+                  start_line: 1
+                  end_line: 42
+            - id: wire-openai
+              title: OpenAI payload 与 SSE decode adapter
+              location:
+                file: src/backend/wire/openai.rs
+                range:
+                  start_line: 7
+                  end_line: 82
+            - id: wire-vllm
+              title: vLLM token-id streaming adapter
+              location:
+                file: src/backend/wire/vllm.rs
+                range:
+                  start_line: 8
+                  end_line: 105
+            - id: wire-sglang
+              title: SGLang payload 与 stream adapter
+              location:
+                file: src/backend/wire/sglang.rs
+                range:
+                  start_line: 22
+                  end_line: 117
+
+        - id: generation-client
+          title: GenerationClient 从 send instant 计时并在 wire completion 前封钟
+
+          primary:
+            file: src/backend/client.rs
+            range:
+              start_line: 23
+              end_line: 145
+
+          explanation: |
+            client 构造 backend-specific endpoint，但 `run_step` 直接发送 raw token IDs。
+            monotonic `send_instant` 是 TTFT 起点，response-complete clock 在 output
+            re-tokenization/log shaping 之前结束。stream fold 交给
+            [StreamAccumulator](code-ref:stream-accumulator)，随后 prompt-echo integrity gate
+            决定 output 是否可安全 carry 到下一轮。
+
+          key_points:
+            - "trace release lag 与 server TTFT 是两个独立观测，不能共享起点。"
+            - "文本重编码是 diagnostic/fallback，不得成为 exact prompt cache key 的来源。"
+
+          related:
+            - id: stream-accumulator
+              title: chunks、token events、usage 与 timeline 的单次 fold
+              location:
+                file: src/backend/stream.rs
+                range:
+                  start_line: 26
+                  end_line: 154
+            - id: prompt-integrity
+              title: prompt echo 的 proven/none/unexplained classification
+              location:
+                file: src/backend/integrity.rs
+                range:
+                  start_line: 13
+                  end_line: 67
+            - id: cache-preflight
+              title: 在正式 workload 前验证 server cache usage contract
+              location:
+                file: src/backend/preflight.rs
+                range:
+                  start_line: 13
+                  end_line: 102
+
+    - id: observability
+      title: 第六章：日志、timeline、summary 与 SLO 的单一事实链
+
+      steps:
+        - id: step-log
+          title: StepLog 同时保存 source identity、declared scheduling 与 measured outcome
+
+          primary:
+            file: src/record.rs
+            range:
+              start_line: 16
+              end_line: 160
+
+          explanation: |
+            `SourceRecord` 保留 session round 或 independent request 的原始身份与 release facts；
+            `GenerationOutcome` 保存 client timing、integrity、server usage 与 completion。构造器
+            [bind source to outcome](code-ref:step-log-constructors) 而不让 backend 层知道 trace
+            family，JSONL 因而是公开、versioned 的测量 contract。
+
+          related:
+            - id: step-log-constructors
+              title: 两种 source 到同一 StepLog 的 typed constructors
+              location:
+                file: src/record.rs
+                range:
+                  start_line: 162
+                  end_line: 280
+
+        - id: timeline-channel
+          title: TimelineSink 以 request 为单位 try_send，测量路径不被慢磁盘反压
+
+          primary:
+            file: src/timeline.rs
+            range:
+              start_line: 54
+              end_line: 187
+
+          explanation: |
+            每个 request 收集自己的 timestamped events，完成后作为一个 `RequestTimeline`
+            投递到 bounded channel；满时丢整条 request timeline 并累计 dropped count，而不是
+            阻塞 submission。独立 writer 用 [Arrow schema](code-ref:timeline-writer) 编码，summary
+            明确标注 sample 不完整。
+
+          related:
+            - id: timeline-writer
+              title: stable Arrow columns 与 writer flush ownership
+              location:
+                file: src/timeline/writer.rs
+                range:
+                  start_line: 39
+                  end_line: 180
+
+        - id: summary-fold
+          title: JSONL writer 在同一遍数据上折叠 replay statistics 与 SLO
+
+          primary:
+            file: src/summary.rs
+            range:
+              start_line: 313
+              end_line: 438
+
+          explanation: |
+            `RunSummary` 是完整 run artifact；`RunMetrics` 是 sweep 可长期读取的短稳定 contract，
+            包含 unit-to-step conversion 与 timeline loss。`write_logs` 每收到一个 StepLog 同时
+            更新 replay measurements 和 SLO，避免两个必须一致的报表走两套统计路径。
+
+    - id: offline-workflows
+      title: 第七章：tracegen、sweep 与 viz 是同一 contract 的离线 consumers
+
+      steps:
+        - id: tracegen-registry
+          title: Generator registry 隔离来源参数，共享 canonical output path
+
+          primary:
+            file: src/bin/tracegen/generator/mod.rs
+            range:
+              start_line: 30
+              end_line: 70
+
+          explanation: |
+            每个 generator 只负责产生 canonical `ExecutionRow` 与可重现 parameters；shared
+            tracegen main 统一写 CSV、manifest、plan 和 hashes。registry 使用 subcommands，
+            使 coding-session 与 synthetic 的 flags 不会混成 nullable union；二者分别通过
+            [recorded materializer](code-ref:coding-generator) 与 [distribution generator](code-ref:synthetic-generator)
+            实现同一 trait。
+
+          related:
+            - id: tracegen-output
+              title: shared manifest、plan 与 checksum orchestration
+              location:
+                file: src/bin/tracegen/main.rs
+                range:
+                  start_line: 44
+                  end_line: 176
+            - id: coding-generator
+              title: coding-agent sessions 到 canonical rows
+              location:
+                file: src/bin/tracegen/generator/coding_session.rs
+                range:
+                  start_line: 122
+                  end_line: 235
+            - id: synthetic-generator
+              title: distributions 到 deterministic synthetic sessions
+              location:
+                file: src/bin/tracegen/generator/synthetic.rs
+                range:
+                  start_line: 92
+                  end_line: 188
+
+        - id: sweep-search
+          title: Search state machine 只选择 rates，不执行 measurement
+
+          primary:
+            file: src/bin/sweep/search.rs
+            range:
+              start_line: 91
+              end_line: 190
+
+          explanation: |
+            `Search` 由 caller 驱动 `next_rate`/`record`，依次 ramp、bisect、densify；它不接触
+            network 或 filesystem，因此 bracket policy 可被确定性测试。每个 rate 的执行与
+            resume contract 归 [point runner](code-ref:sweep-point)，是否 crossed 归
+            [boundary](code-ref:sweep-boundary)，两者不会侵入 search state machine。
+
+          related:
+            - id: sweep-point
+              title: point directory、completed record 与 run reuse
+              location:
+                file: src/bin/sweep/point.rs
+                range:
+                  start_line: 23
+                  end_line: 145
+            - id: sweep-boundary
+              title: saturation/SLO verdict 与 offered-unit conversion
+              location:
+                file: src/bin/sweep/boundary.rs
+                range:
+                  start_line: 22
+                  end_line: 157
+
+        - id: visualization
+          title: viz 只读 durable sweep/JSONL/Arrow artifacts，并复用同一单位换算
+
+          primary:
+            file: viz/src/req_frontend_viz/load.py
+            range:
+              start_line: 33
+              end_line: 178
+
+          explanation: |
+            loader 将 sweep report 与 point directories 解析为 typed Python dataclasses，并
+            保留 knee、unit label、steps-per-unit、SLO 与 contamination caveats。绘图层的
+            [throughput and attainment](code-ref:sweep-plots) 只接收这些 durable values；它不
+            重跑 Rust 逻辑，也不会让 plotting dependency 决定 sweep 成败。
+
+          related:
+            - id: sweep-plots
+              title: throughput、attainment、latency 与 token-arrival figures
+              location:
+                file: viz/src/req_frontend_viz/plots.py
+                range:
+                  start_line: 67
+                  end_line: 289
+            - id: viz-cli
+              title: artifact selection 与 output layout
+              location:
+                file: viz/src/req_frontend_viz/cli.py
+                range:
+                  start_line: 21
+                  end_line: 116
+
+    - id: executable-fidelity
+      title: 第八章：selfcheck 把 measurement claims 变成可执行维护契约
+
+      steps:
+        - id: selfcheck-orchestrator
+          title: harness owns fixtures、stub timing、cache state 与 report lifecycle
+
+          primary:
+            file: src/bin/selfcheck/main.rs
+            range:
+              start_line: 90
+              end_line: 158
+
+          explanation: |
+            selfcheck 自己生成 fixtures、启动被精确配置的 stub、复用 corpus，并在 prefix
+            timing checks 前重启 stub 来隔离 cache contents。它依次验证 release、timeline、
+            TTFT/TPOT、usage/prefix 等 claims，最后输出 durable `selfcheck.json`，任何失败都
+            令进程非零退出。具体 release check 展示了 [ground-truth comparison](code-ref:release-fidelity-check)。
+
+          key_points:
+            - "harness 必须拥有 server configuration；外部手启 stub 不能构成 ground truth。"
+            - "不同 timing knobs 防止把 TTFT 与 TPOT 写反后仍偶然通过。"
+
+          related:
+            - id: release-fidelity-check
+              title: scheduled arrival 对 actual submission 的 p99 与 span assertions
+              location:
+                file: src/bin/selfcheck/main.rs
+                range:
+                  start_line: 160
+                  end_line: 250
+            - id: generated-fixtures
+              title: arithmetic constants 与 trace rows 同源的 fixtures
+              location:
+                file: src/bin/selfcheck/fixture.rs
+                range:
+                  start_line: 20
+                  end_line: 152
+            - id: owned-stub
+              title: stub lifecycle 与 readiness ownership
+              location:
+                file: src/bin/selfcheck/stub.rs
+                range:
+                  start_line: 18
+                  end_line: 109
+
+        - id: explicit-checks
+          title: Check 记录 claim、measurement、expected value 与 visible tolerance
+
+          primary:
+            file: src/bin/selfcheck/check.rs
+            range:
+              start_line: 15
+              end_line: 128
+
+          explanation: |
+            fidelity check 不是匿名 boolean：`Bound` 明确 upper/lower/interval tolerance，`Check`
+            同时序列化人可争论的 claim、observed value、expected bound 与 evidence。record reader
+            通过 [public-schema re-declaration](code-ref:selfcheck-record-reader) 而非复用 writer
+            private type 读取 JSONL，因此字段 rename/disappearance 会成为真正的契约失败。
+
+          related:
+            - id: selfcheck-record-reader
+              title: 独立声明并验证 StepLog schema version
+              location:
+                file: src/bin/selfcheck/record.rs
+                range:
+                  start_line: 19
+                  end_line: 108
