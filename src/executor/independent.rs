@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::backend::{context_limit_skip_result, Prompt};
-use crate::executor::AppState;
+use crate::executor::{CommonState, TextGenerationState};
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
 use crate::schema::format::text_generation::independent::IndependentRequest;
@@ -14,15 +14,15 @@ use crate::tokens::TokenProvider;
 /// executor: independent requests have no round ordering, prefix carry-forward,
 /// or tool wait semantics.
 pub(crate) async fn run_independent_request(
-    state: Arc<AppState>,
+    state: Arc<TextGenerationState>,
     log_tx: mpsc::Sender<StepLog>,
-    // Travels with the task rather than living on `AppState`; see `run_session`.
+    // Travels with the task rather than living in shared state; see `run_session`.
     timeline_sink: Option<TimelineSink>,
     request_ordinal: usize,
     request: IndependentRequest,
 ) {
     let arrival_release_lag_ms = wait_for_arrival(&state, request.arrival_time).await;
-    let _concurrency_permit = state.acquire_capacity_slot(request_ordinal).await;
+    let _concurrency_permit = state.common.acquire_capacity_slot(request_ordinal).await;
     let mut token_provider = match TokenProvider::new(
         state.token_pool.clone(),
         request_ordinal.wrapping_mul(9_973),
@@ -30,15 +30,16 @@ pub(crate) async fn run_independent_request(
         Ok(provider) => provider,
         Err(err) => {
             eprintln!("request {}: {err}", request.id);
-            state.stats.record_unit_done();
+            state.common.stats.record_unit_done();
             return;
         }
     };
     let prompt_ids = token_provider.take(request.input_len);
     let prompt = Prompt::Tokens(&prompt_ids);
     let request_id = format!("independent_{}", request.id);
-    state.stats.record_submit();
+    state.common.stats.record_submit();
     let result = if state
+        .common
         .policy
         .skips_at_context_limit(prompt.token_len(), request.output_len)
     {
@@ -46,7 +47,7 @@ pub(crate) async fn run_independent_request(
             request_id,
             prompt.token_len(),
             request.output_len,
-            state.policy.max_model_len(),
+            state.common.policy.max_model_len(),
         )
     } else {
         state
@@ -68,11 +69,15 @@ pub(crate) async fn run_independent_request(
     );
     let success = log.outcome.is_success();
     let _ = log_tx.send(log).await;
-    state.stats.record_result(success);
-    state.stats.record_unit_done();
+    state.common.stats.record_result(success);
+    state.common.stats.record_unit_done();
 }
 
-async fn wait_for_arrival(state: &AppState, arrival_time_ms: f64) -> f64 {
+async fn wait_for_arrival(state: &TextGenerationState, arrival_time_ms: f64) -> f64 {
+    wait_for_common_arrival(&state.common, arrival_time_ms).await
+}
+
+pub(crate) async fn wait_for_common_arrival(state: &CommonState, arrival_time_ms: f64) -> f64 {
     if state.policy.arrival_mode == ArrivalMode::Saturated {
         return 0.0;
     }

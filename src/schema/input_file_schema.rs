@@ -16,6 +16,12 @@ pub struct InputFileSchema {
 
 impl InputFileSchema {
     pub fn new(input_file_format: InputFileFormat, tags: Vec<TraceTag>) -> Result<Self> {
+        if input_file_format.is_json_lines() && !tags.is_empty() {
+            bail!(
+                "input file format {:?} carries nested request metadata and does not accept CSV trace tags",
+                input_file_format.name()
+            );
+        }
         let request_family = input_file_format.request_family();
         let mut unique_tags = Vec::with_capacity(tags.len());
         for tag in tags {

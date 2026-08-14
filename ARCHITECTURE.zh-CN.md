@@ -116,6 +116,22 @@ InputFileSchema {
 - `TraceTag` 增加与 family 正交的 column bundle，例如 `slo` 或 `priority`；
 - `InputFileSchema` 是 base format 与合法 tags 合并后的精确 header contract。
 
+### Benchmark 边界按 modality 组合
+
+现有 CSV format 继续精确描述 trace artifact；新的 asset-backed benchmark
+adapter 则把源数据转换为 `RequestSpec`。它的输入和输出是相互独立的 typed
+list，均支持 text、image、audio、video 与 tensor，并允许混合或重复输入。
+
+Backend 使用 `CapabilityProfile` 声明可接受的输入集合、可生成的输出集合，
+以及是否支持混合输入和多个输出。因此扩展成本是 input encoder、output
+observer 和 protocol adapter 的加和，而不是 modality pair 的矩阵。只有当模型
+确实存在耦合语义时，才增加 pair-specific validation。
+
+Asset-backed executor 把通用调度状态与自己的 client、`AssetStore` 组合；
+text executor 则与 tokenizer 和 synthetic token pool 组合。这样媒体 workload
+不会继承 text-only 的 corpus、prefix-cache preflight 或启动要求。稳定 contract
+与扩展步骤见 [Adding modality-compositional benchmarks](docs/ADDING_BENCHMARKS.md)。
+
 例如 `text-generation-session-execution-v2` 已经同时表达 text generation family 和
 session execution layout。系统中不存在 `SessionExecutionV2 + ImageToText` 这样的半组合
 状态，也不会根据 header 猜 family。

@@ -8,6 +8,7 @@ pub mod audio_to_text;
 pub mod image_to_text;
 pub mod image_to_video;
 mod load_utils;
+pub mod multimodal_independent;
 pub mod omni_generation;
 pub mod text_generation;
 pub mod text_to_image;
@@ -33,6 +34,7 @@ pub enum InputFileFormat {
     TextToSpeechIndependent,
     ImageToVideoIndependent,
     OmniGenerationIndependent,
+    MultimodalIndependentV1,
 }
 
 impl InputFileFormat {
@@ -47,6 +49,7 @@ impl InputFileFormat {
         "text-to-speech-independent",
         "image-to-video-independent",
         "omni-generation-independent",
+        "multimodal-independent-v1",
     ];
 
     pub fn parse(name: &str) -> Result<Self> {
@@ -61,6 +64,7 @@ impl InputFileFormat {
             "text-to-speech-independent" => Self::TextToSpeechIndependent,
             "image-to-video-independent" => Self::ImageToVideoIndependent,
             "omni-generation-independent" => Self::OmniGenerationIndependent,
+            "multimodal-independent-v1" => Self::MultimodalIndependentV1,
             other => bail!(
                 "unknown input file format {other:?} (expected one of {:?})",
                 Self::CHOICES
@@ -85,6 +89,7 @@ impl InputFileFormat {
             Self::TextToSpeechIndependent => RequestFamily::TextToSpeech,
             Self::ImageToVideoIndependent => RequestFamily::ImageToVideo,
             Self::OmniGenerationIndependent => RequestFamily::OmniGeneration,
+            Self::MultimodalIndependentV1 => RequestFamily::OmniGeneration,
         }
     }
 
@@ -100,11 +105,18 @@ impl InputFileFormat {
             Self::TextToSpeechIndependent => text_to_speech::COLUMNS,
             Self::ImageToVideoIndependent => image_to_video::COLUMNS,
             Self::OmniGenerationIndependent => omni_generation::COLUMNS,
+            // JSON Lines has no file-wide header. Its complete nested schema is
+            // RequestSpec and is validated record by record by its loader.
+            Self::MultimodalIndependentV1 => &[],
         }
     }
 
     pub fn has_session_topology(self) -> bool {
         self == Self::TextGenerationSessionExecutionV2
+    }
+
+    pub fn is_json_lines(self) -> bool {
+        self == Self::MultimodalIndependentV1
     }
 }
 

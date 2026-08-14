@@ -15,7 +15,8 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::backend::GenerationClient;
 use crate::cli::Args;
 use crate::executor::{
-    run_independent_request, run_session, status_task, AdmissionOrder, AppState, RunPolicy, Stats,
+    run_independent_request, run_session, status_task, AdmissionOrder, CommonState, RunPolicy,
+    Stats, TextGenerationState,
 };
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
@@ -196,20 +197,22 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
         (None, None)
     };
 
-    let state = Arc::new(AppState {
-        policy: RunPolicy::from_args(&args),
+    let state = Arc::new(TextGenerationState {
         client,
         token_pool,
-        stats: Arc::new(Stats::default()),
-        run_start: Instant::now(),
-        concurrency_semaphore: args
-            .max_concurrency
-            .map(|limit| Arc::new(Semaphore::new(limit))),
-        // Only under a cap, because it exists to order contention and there is
-        // none without one.
-        admission_order: args
-            .max_concurrency
-            .map(|_| Arc::new(AdmissionOrder::new(workload.unit_count()))),
+        common: CommonState {
+            policy: RunPolicy::from_args(&args),
+            stats: Arc::new(Stats::default()),
+            run_start: Instant::now(),
+            concurrency_semaphore: args
+                .max_concurrency
+                .map(|limit| Arc::new(Semaphore::new(limit))),
+            // Only under a cap, because it exists to order contention and there is
+            // none without one.
+            admission_order: args
+                .max_concurrency
+                .map(|_| Arc::new(AdmissionOrder::new(workload.unit_count()))),
+        },
     });
 
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
@@ -220,11 +223,11 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
         slo_summary,
     ));
     let status_handle = tokio::spawn(status_task(
-        state.stats.clone(),
+        state.common.stats.clone(),
         workload.unit_count(),
         total_steps,
         unit_label,
-        state.run_start,
+        state.common.run_start,
     ));
 
     let mut join_set = tokio::task::JoinSet::new();
@@ -277,7 +280,7 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
 
     let folded = log_task.await?;
     status_handle.await?;
-    let runtime_global_queue_depth_peak = state.stats.runtime_global_queue_depth_peak();
+    let runtime_global_queue_depth_peak = state.common.stats.runtime_global_queue_depth_peak();
     let timeline_summary = match timeline_task {
         Some(task) => task.await?,
         None => TimelineSummary::default(),

@@ -66,11 +66,12 @@ impl RunPolicy {
     }
 }
 
-/// Shared, immutable-per-run state handed to every workload-unit executor.
-pub(crate) struct AppState {
+/// Modality-independent scheduling and measurement state.
+///
+/// New request families compose this with their own client and input store;
+/// they do not inherit text generation's tokenizer or synthetic token pool.
+pub(crate) struct CommonState {
     pub(crate) policy: RunPolicy,
-    pub(crate) client: Arc<GenerationClient>,
-    pub(crate) token_pool: Arc<Vec<u32>>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) run_start: Instant,
     pub(crate) concurrency_semaphore: Option<Arc<Semaphore>>,
@@ -79,7 +80,7 @@ pub(crate) struct AppState {
     pub(crate) admission_order: Option<Arc<AdmissionOrder>>,
 }
 
-impl AppState {
+impl CommonState {
     /// Take one capacity slot, in declaration order.
     ///
     /// The returned permit owns the slot for as long as it is alive — for a
@@ -103,6 +104,13 @@ impl AppState {
         };
         semaphore.clone().acquire_owned().await.ok()
     }
+}
+
+/// State used only by the existing token-id text replay executors.
+pub(crate) struct TextGenerationState {
+    pub(crate) common: CommonState,
+    pub(crate) client: Arc<GenerationClient>,
+    pub(crate) token_pool: Arc<Vec<u32>>,
 }
 
 /// Lock-free progress counters shared with the status reporter.
