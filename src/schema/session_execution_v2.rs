@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,42 @@ pub fn plan(rows: &[ExecutionRow]) -> Vec<PlanRow> {
             tool_wait_after_ms: format_milliseconds(row.tool_wait_after_ms),
         })
         .collect()
+}
+
+/// Write a canonical trace, header and all.
+///
+/// Here rather than in the generator that happens to run today: the byte
+/// formatting *is* the format. Two consumers must read the same milliseconds, so
+/// there is one place that writes them, and a second generator cannot introduce
+/// a second spelling of an instant.
+///
+/// Deliberately takes rows that have already been validated rather than
+/// validating here — a caller that writes an invalid trace should learn it from
+/// [`validate`], by name, not from a writer refusing halfway through a file.
+pub fn write_csv(path: &Path, rows: &[ExecutionRow]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+    let mut writer = csv::Writer::from_path(path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    writer.write_record(COLUMNS)?;
+    for row in rows {
+        writer.write_record([
+            row.request_id.as_str(),
+            row.session_id.as_str(),
+            &row.round_idx.to_string(),
+            &format_milliseconds(row.arrival_time_ms),
+            &row.prefix_len.to_string(),
+            &row.input_len.to_string(),
+            &row.output_len.to_string(),
+            &format_milliseconds(row.tool_wait_after_ms),
+        ])?;
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]

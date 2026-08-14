@@ -978,21 +978,20 @@ arranged so the recording is too:
   Not an async task: zstd is blocking CPU work, and on a runtime worker it
   competes with the requests being timed. That was measurable — see below.
 
-Measured against `tools/stub_server.py`, which replies with fixed timing so the
-client is the only variable. 6 runs each way, 3000 requests, alternating, on the
-`arrival_release_lag_ms` this client already records *before* the concurrency
-semaphore:
+This claim is maintained by `selfcheck`, not by a pasted benchmark table. It
+alternates timeline-on and timeline-off runs against `tools/stub_server.py`,
+then checks the p50/p99 difference and requires zero dropped request timelines:
 
-| | p50 | p90 | p99 | mean |
-| --- | --- | --- | --- | --- |
-| writer on a runtime worker | +0.130 | +0.163 | +0.273 | +0.111 |
-| writer on its own thread | −0.029 | +0.005 | +0.075 | −0.019 |
+```bash
+cargo run --release --bin selfcheck -- \
+  --tokenizer /path/to/tokenizer.json \
+  --out "$TMPDIR/req-frontend-selfcheck"
+```
 
-(Milliseconds added by turning the timeline on, pooled over 18,000 requests per
-condition.) The first row is a small but consistently positive bias at every
-percentile; the second is noise around zero, and a run-level Mann-Whitney over
-the six per-run medians gives p = 1.000. Zero dropped timelines in all twelve
-runs.
+The same harness separately checks scheduled release lag, rate scaling, TTFT,
+TPOT, end-to-end time, prompt/output lengths, server/client token accounting,
+and planned prefix hits. Every result, expected bound, and tolerance rationale
+is written to `selfcheck.json`; any failed claim makes the command exit nonzero.
 
 `timeline.dropped_requests` in the run summary is nonzero exactly when the file
 is a sample of the run rather than a record of it. A run also prints a warning
@@ -1464,6 +1463,7 @@ A context-limit skip always ends its session, independently of this flag.
 ├── viz/                      optional Python plotting; nothing here depends on it
 ├── src/
 │   ├── lib.rs                the public library: the trace schemas + run_once
+│   ├── release.rs            shared trace-timed/saturated eligibility vocabulary
 │   ├── schema/
 │   │   ├── mod.rs            trace kinds, tags, column blocks, header check
 │   │   ├── media.rs          image/video/audio extents, decoding strategy
@@ -1497,6 +1497,7 @@ A context-limit skip always ends its session, independently of this flag.
 │   │   ├── peak.rs           ramp past it: locate a maximum and its plateau
 │   │   ├── boundary.rs       what "crossed" means, judged one point at a time
 │   │   └── point.rs          one point: reset the server, run, record, resume
+│   ├── bin/selfcheck/            executable fidelity claims against the stub
 │   ├── executor/
 │   │   ├── mod.rs            run policy, shared state, counters, status task
 │   │   ├── admission.rs      declaration-order admission under a cap

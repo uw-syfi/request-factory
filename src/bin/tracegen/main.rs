@@ -32,9 +32,7 @@ use serde::Serialize;
 
 use generator::Registry;
 use req_frontend::schema::session_execution_v2 as v2;
-use req_frontend::schema::session_execution_v2::{
-    format_milliseconds, ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME,
-};
+use req_frontend::schema::session_execution_v2::{ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -119,7 +117,7 @@ fn main() -> Result<()> {
     v2::validate(&generated.rows).context("generated trace failed canonical validation")?;
 
     let out = generator.out();
-    write_trace(out, &generated.rows)?;
+    v2::write_csv(out, &generated.rows)?;
     let manifest_path = sibling(out, "manifest.json");
     let plan_path = sibling(out, "plan.json");
     fs::write(
@@ -147,41 +145,6 @@ fn main() -> Result<()> {
         manifest_path.display(),
         plan_path.display()
     );
-    Ok(())
-}
-
-fn write_trace(path: &Path, rows: &[ExecutionRow]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-    }
-    let mut writer = csv::Writer::from_path(path)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    writer.write_record([
-        "request_id",
-        "session_id",
-        "round_idx",
-        "arrival_time_ms",
-        "prefix_len",
-        "input_len",
-        "output_len",
-        "tool_wait_after_ms",
-    ])?;
-    for row in rows {
-        writer.write_record([
-            row.request_id.as_str(),
-            row.session_id.as_str(),
-            &row.round_idx.to_string(),
-            &format_milliseconds(row.arrival_time_ms),
-            &row.prefix_len.to_string(),
-            &row.input_len.to_string(),
-            &row.output_len.to_string(),
-            &format_milliseconds(row.tool_wait_after_ms),
-        ])?;
-    }
-    writer.flush()?;
     Ok(())
 }
 

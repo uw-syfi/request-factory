@@ -12,7 +12,8 @@ Speaks just enough of the `vllm-tokens` protocol: `/inference/v1/generate`
 streaming one token id per SSE chunk, a terminal usage block with prompt-token
 details (so the prefix-cache preflight passes), and `[DONE]`.
 
-    uv run python tools/stub_server.py --port 8123 [--chunk-delay-ms 0] [--capacity 0]
+    uv run python tools/stub_server.py --port 8123 \
+        [--prefill-delay-ms 0] [--chunk-delay-ms 0] [--capacity 0]
 """
 
 from __future__ import annotations
@@ -23,16 +24,34 @@ import json
 
 
 class Stub:
-    def __init__(self, chunk_delay_ms: float, tokens_per_chunk: int, capacity: int) -> None:
+    def __init__(
+        self,
+        chunk_delay_ms: float,
+        prefill_delay_ms: float,
+        tokens_per_chunk: int,
+        capacity: int,
+    ) -> None:
         self.chunk_delay_s = chunk_delay_ms / 1000.0
+        # Separate from the inter-chunk gap, and paid once before the first
+        # chunk. That makes the client's TTFT and its TPOT independently
+        # checkable: with one knob they are the same number, and a client that
+        # confused the two would still agree with the server.
+        self.prefill_delay_s = prefill_delay_ms / 1000.0
         self.tokens_per_chunk = tokens_per_chunk
         # A server with no capacity limit never saturates, so a sweep against it
         # has no knee to find. With one, the knee is arithmetic:
         #   capacity / (output_len * chunk_delay_s) requests per second.
         self.slots = asyncio.Semaphore(capacity) if capacity > 0 else None
-        # The preflight sends one prompt twice and requires the second reply to
-        # report cached tokens. Remembering what was asked is the whole feature.
-        self.seen_prompts: set[int] = set()
+        # A real prefix cache, not a memo of whole prompts. The difference
+        # matters: the client's central claim is that round k+1 reuses round k's
+        # conversation, and a server that only recognizes an exact repeat cannot
+        # tell a correct client from one that rebuilds the prefix differently.
+        #
+        # Stored as rolling hashes of every prefix rather than a trie of ids.
+        # The set is then prefix-closed by construction, so the longest hit can
+        # be found by binary search, and one seen prefix costs one integer no
+        # matter how many prompts share it.
+        self.seen_prefixes: set[int] = set()
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -72,9 +91,14 @@ class Stub:
         prompt_ids = request.get("token_ids") or []
         max_tokens = int(request.get("sampling_params", {}).get("max_tokens", 1))
 
-        fingerprint = hash(tuple(prompt_ids))
-        cached = len(prompt_ids) if fingerprint in self.seen_prompts else 0
-        self.seen_prompts.add(fingerprint)
+        cached = self.remember(prompt_ids)
+        # The two-call probe is a capability check, not workload warmup. Once
+        # its second call proves a full hit, leave the cache empty so the first
+        # measured request cannot inherit probe content.
+        reset_after_response = (
+            request.get("request_id") == "req-frontend-prefix-cache-preflight"
+            and cached == len(prompt_ids)
+        )
 
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
@@ -84,14 +108,33 @@ class Stub:
             b"Transfer-Encoding: chunked\r\n\r\n"
         )
 
+        # Delays are paid *before* each chunk, which is what a real server does
+        # and what makes the arithmetic checkable end to end:
+        #   ttft  = prefill_delay
+        #   gap   = chunk_delay
+        #   total = prefill_delay + (chunks - 1) * chunk_delay
+        # Sleeping after the last chunk instead would put one extra gap in the
+        # total that no client could attribute to anything.
+        if self.prefill_delay_s:
+            await asyncio.sleep(self.prefill_delay_s)
         emitted = 0
+        generated_ids: list[int] = []
         while emitted < max_tokens:
+            if emitted and self.chunk_delay_s:
+                await asyncio.sleep(self.chunk_delay_s)
             count = min(self.tokens_per_chunk, max_tokens - emitted)
             ids = list(range(emitted, emitted + count))
             await self.send_event(writer, {"choices": [{"index": 0, "token_ids": ids}]})
+            generated_ids.extend(ids)
             emitted += count
-            if self.chunk_delay_s:
-                await asyncio.sleep(self.chunk_delay_s)
+
+        # A serving engine retains the decode KV as well as the prefill KV. A
+        # later conversation round therefore reuses the previous prompt *and*
+        # its generated answer. Recording only prompt_ids would make the stub
+        # report a short hit even when the client carried the exact output ids
+        # it was sent.
+        if not reset_after_response:
+            self.store(prompt_ids + generated_ids)
 
         await self.send_event(
             writer,
@@ -110,6 +153,46 @@ class Stub:
         await self.send_chunk(writer, b"data: [DONE]\n\n")
         await self.send_chunk(writer, b"")
         await writer.drain()
+        if reset_after_response:
+            self.seen_prefixes.clear()
+
+    # Mersenne prime modulus and a fixed base: a 61-bit rolling hash. A
+    # collision would over-report a cache hit, which is why the modulus is this
+    # large -- at trace scale the probability is far below the rate at which a
+    # real server's cache is evicted underneath a measurement anyway.
+    MODULUS = (1 << 61) - 1
+    BASE = 0x1F1F_1F1F_1F1F_1F1F
+
+    def prefix_hashes(self, prompt_ids: list[int]) -> list[int]:
+        """Hash of every prefix, in one pass."""
+        rolling = 0
+        hashes = []
+        for token_id in prompt_ids:
+            rolling = (rolling * self.BASE + token_id + 1) % self.MODULUS
+            hashes.append(rolling)
+        return hashes
+
+    def remember(self, prompt_ids: list[int]) -> int:
+        """Longest prefix of this prompt already seen, then record the whole thing.
+
+        Binary search is valid because the set is prefix-closed: if a prefix of
+        length L was inserted, so was every shorter one. So the matched lengths
+        are exactly 0..cached, and the boundary can be found in log time.
+        """
+        hashes = self.prefix_hashes(prompt_ids)
+        low, high = 0, len(hashes)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if hashes[middle - 1] in self.seen_prefixes:
+                low = middle
+            else:
+                high = middle - 1
+        self.seen_prefixes.update(hashes)
+        return low
+
+    def store(self, token_ids: list[int]) -> None:
+        """Record every prefix of a sequence whose KV is now resident."""
+        self.seen_prefixes.update(self.prefix_hashes(token_ids))
 
     async def send_event(self, writer: asyncio.StreamWriter, payload: dict) -> None:
         await self.send_chunk(writer, f"data: {json.dumps(payload)}\n\n".encode())
@@ -128,6 +211,12 @@ async def main() -> None:
         default=0.0,
         help="Wall time between streamed chunks. Zero replies as fast as the socket allows.",
     )
+    parser.add_argument(
+        "--prefill-delay-ms",
+        type=float,
+        default=0.0,
+        help="Wall time before the first chunk. The ground truth a client's TTFT is checked against.",
+    )
     parser.add_argument("--tokens-per-chunk", type=int, default=1)
     parser.add_argument(
         "--capacity",
@@ -135,13 +224,19 @@ async def main() -> None:
         default=0,
         help=(
             "Concurrent requests served; further ones queue. 0 is unlimited, which "
-            "never saturates. With a limit the capacity is capacity / (output_len * "
-            "chunk_delay_ms / 1000) requests per second."
+            "never saturates. With a limit the capacity is capacity / occupancy "
+            "requests per second, where occupancy is prefill_delay + (chunks - 1) * "
+            "chunk_delay in seconds."
         ),
     )
     args = parser.parse_args()
 
-    stub = Stub(args.chunk_delay_ms, args.tokens_per_chunk, args.capacity)
+    stub = Stub(
+        args.chunk_delay_ms,
+        args.prefill_delay_ms,
+        args.tokens_per_chunk,
+        args.capacity,
+    )
     server = await asyncio.start_server(stub.handle, args.host, args.port)
     print(f"stub listening on http://{args.host}:{args.port}", flush=True)
     async with server:

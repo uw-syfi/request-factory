@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::backend::{context_limit_skip_result, GenerationResult, Prompt};
-use crate::cli::ArrivalMode;
 use crate::executor::AppState;
 use crate::record::StepLog;
+use crate::release::ArrivalMode;
 use crate::timeline::{RequestTimeline, TimelineSink};
 use crate::tokens::{PromptBuild, PromptBuilder, TokenProvider};
 use crate::trace::SessionStep;

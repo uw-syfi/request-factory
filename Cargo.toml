@@ -27,6 +27,11 @@ name = "sweep"
 path = "src/bin/sweep/main.rs"
 required-features = ["runtime"]
 
+[[bin]]
+name = "selfcheck"
+path = "src/bin/selfcheck/main.rs"
+required-features = ["runtime"]
+
 [features]
 default = ["runtime"]
 

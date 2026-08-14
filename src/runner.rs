@@ -13,11 +13,12 @@ use std::time::Instant;
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::backend::GenerationClient;
-use crate::cli::{Args, ArrivalMode};
+use crate::cli::Args;
 use crate::executor::{
     run_independent_request, run_session, status_task, AdmissionOrder, AppState, RunPolicy, Stats,
 };
 use crate::record::StepLog;
+use crate::release::ArrivalMode;
 use crate::schema::slo::SloSummary;
 use crate::schema::{TraceDeclaration, TraceTag};
 use crate::slo_source;

@@ -3,3 +3,5 @@
 /*_summary.json
 /*.jsonl
 /changes.md
+__pycache__/
+*.py[cod]

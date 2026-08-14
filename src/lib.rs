@@ -17,6 +17,7 @@
 //! generation-time decision owned solely by the `tracegen` binary, and its
 //! outcome is recorded in the manifest beside the file it produced.
 
+pub mod release;
 pub mod schema;
 
 // The runtime is feature-gated so a consumer that only reads trace files -- a
@@ -48,7 +49,8 @@ mod util;
 mod workload;
 
 #[cfg(feature = "runtime")]
-pub use cli::{Args, ArrivalMode, BackendKind};
+pub use cli::{Args, BackendKind};
+pub use release::ArrivalMode;
 #[cfg(feature = "runtime")]
 pub use runner::{run_once, run_once_reusing, CorpusCache};
 #[cfg(feature = "runtime")]

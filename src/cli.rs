@@ -1,24 +1,9 @@
 use clap::{Parser, ValueEnum};
 
+use crate::release::ArrivalMode;
 use crate::trace::TraceFormat;
 
 /// Inference-server wire protocol selected with `--backend`.
-/// Which of the two release axes supplies a unit's start time.
-///
-/// The other axis is `--max-concurrency`. They compose freely: a capped
-/// trace-timed run replays the recorded timeline but never exceeds the cap, and
-/// a capped saturated run is a pure closed-loop generator.
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArrivalMode {
-    /// Replay the trace's own arrival timeline, rescaled by `--rate`.
-    #[value(name = "trace-timed")]
-    TraceTimed,
-    /// Ignore recorded arrivals: every unit is eligible from the start, so a
-    /// unit enters as soon as capacity allows. Without a cap this submits the
-    /// whole workload at once.
-    Saturated,
-}
-
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     /// OpenAI-compatible `/completions` (vLLM, and SGLang's OpenAI endpoint).

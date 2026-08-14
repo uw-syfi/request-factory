@@ -9,7 +9,8 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 
 use crate::backend::GenerationClient;
-use crate::cli::{Args, ArrivalMode};
+use crate::cli::Args;
+use crate::release::ArrivalMode;
 use crate::util::reaches_context_limit;
 
 pub(crate) use admission::AdmissionOrder;
