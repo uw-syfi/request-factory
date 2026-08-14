@@ -1,10 +1,11 @@
 use serde::Serialize;
 
 use crate::schema::slo::SloMeasurement;
+use crate::schema::RequestScheduling;
 use crate::trace::{IndependentRequest, SessionStep};
 use crate::util::prefix_hit_rate;
 
-const STEP_LOG_SCHEMA_VERSION: u32 = 9;
+const STEP_LOG_SCHEMA_VERSION: u32 = 10;
 
 /// One JSONL record: a typed source plus measurements shared by text generation.
 ///
@@ -50,6 +51,36 @@ pub(crate) struct SessionRoundSource {
     pub(crate) output_len_target: usize,
     pub(crate) tool_wait_after_ms: f64,
     pub(crate) arrival_time_ms: f64,
+    /// What the `slo` trace tag declared for this round. Flattened away entirely
+    /// when the trace did not declare it, so a record says "this file carried no
+    /// such column" rather than "this row left it blank".
+    #[serde(flatten)]
+    pub(crate) scheduling: DeclaredScheduling,
+}
+
+/// The `slo` tag's columns as they appear in a record.
+///
+/// A wrapper rather than [`RequestScheduling`] itself, so the log can omit both
+/// fields together: serde's `flatten` cannot skip a struct, but it can skip each
+/// of two `Option`s that were never set.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct DeclaredScheduling {
+    /// The completion budget this row declared for itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) declared_deadline_ms: Option<f64>,
+    /// Carried, never acted on: this client has no queue of its own to reorder,
+    /// and the server is the thing being measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) declared_priority: Option<i64>,
+}
+
+impl From<RequestScheduling> for DeclaredScheduling {
+    fn from(scheduling: RequestScheduling) -> Self {
+        Self {
+            declared_deadline_ms: scheduling.deadline_ms,
+            declared_priority: scheduling.priority,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +94,8 @@ pub(crate) struct IndependentRequestSource {
     /// Measured before the optional concurrency semaphore, so an intentional
     /// client-side concurrency cap is not misreported as runtime scheduler lag.
     pub(crate) arrival_release_lag_ms: f64,
+    #[serde(flatten)]
+    pub(crate) scheduling: DeclaredScheduling,
 }
 
 /// Measurements that have the same meaning for every text-generation source.
@@ -151,6 +184,7 @@ impl StepLog {
                 output_len_target: step.output_len,
                 tool_wait_after_ms: step.tool_wait_after_ms,
                 arrival_time_ms: step.arrival_time,
+                scheduling: step.scheduling.into(),
             }),
             outcome,
         }
@@ -171,14 +205,19 @@ impl StepLog {
                 output_len_target: request.output_len,
                 arrival_time_ms: request.arrival_time,
                 arrival_release_lag_ms,
+                scheduling: request.scheduling.into(),
             }),
             outcome,
         }
     }
 }
 
-impl GenerationOutcome {
+impl StepLog {
     /// This step as an SLO sees it.
+    ///
+    /// On [`StepLog`] rather than on the outcome, because a step's own declared
+    /// deadline comes from the trace row and the measurements come from the
+    /// response: the judgement needs both halves of the record.
     ///
     /// The mapping is deliberately explicit rather than derived by field name,
     /// and it is the same choice the summary's percentiles make: token-id TTFT
@@ -188,14 +227,24 @@ impl GenerationOutcome {
     /// `total_duration_ms` is submission to completion, not the wire-response
     /// window.
     pub(crate) fn slo_measurement(&self) -> SloMeasurement {
+        let scheduling = match &self.source {
+            SourceRecord::SessionRound(source) => &source.scheduling,
+            SourceRecord::IndependentRequest(source) => &source.scheduling,
+        };
         SloMeasurement {
-            succeeded: self.is_success(),
-            ttft_ms: self.first_token_id_ms.or(self.first_token_ms),
-            tpot_ms: self.token_delivery_tpot_ms,
-            e2e_ms: Some(self.total_duration_ms),
+            succeeded: self.outcome.is_success(),
+            ttft_ms: self
+                .outcome
+                .first_token_id_ms
+                .or(self.outcome.first_token_ms),
+            tpot_ms: self.outcome.token_delivery_tpot_ms,
+            e2e_ms: Some(self.outcome.total_duration_ms),
+            declared_deadline_ms: scheduling.declared_deadline_ms,
         }
     }
+}
 
+impl GenerationOutcome {
     pub(crate) fn is_success(&self) -> bool {
         self.status == "SUCCESS"
     }
@@ -248,12 +297,20 @@ mod tests {
             input_len: 4,
             output_len: 3,
             tool_wait_after_ms: 5.0,
+            scheduling: Default::default(),
         };
         let value =
             serde_json::to_value(StepLog::session_round(&step, 12, 8, 4, 0, outcome())).unwrap();
 
         assert_eq!(value["source"]["type"], "session_round");
-        assert_eq!(value["schema_version"], 9);
+        assert_eq!(value["schema_version"], 10);
+        // A trace that declared no `slo` tag leaves no trace of it in the record:
+        // absent, not null, so a reader can tell "the file had no such column"
+        // from "the row left it blank".
+        assert!(value["source"]["data"]
+            .get("declared_deadline_ms")
+            .is_none());
+        assert!(value["source"]["data"].get("declared_priority").is_none());
         assert_eq!(value["source"]["data"]["prefix_len"], 8);
         assert_eq!(value["source"]["data"]["derived_prefix_len"], 8);
         assert_eq!(value["source"]["data"]["derived_append_len"], 4);
@@ -268,6 +325,7 @@ mod tests {
             input_len: 12,
             output_len: 3,
             arrival_time: 0.0,
+            scheduling: Default::default(),
         };
         let value =
             serde_json::to_value(StepLog::independent_request(&request, 12, 0.25, outcome()))

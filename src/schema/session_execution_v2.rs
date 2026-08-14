@@ -14,8 +14,11 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+use super::scheduling::RequestScheduling;
+use super::{TraceDeclaration, TraceTag};
 
 /// Schema name recorded in the manifest and named on the command line. Consumers
 /// select it explicitly; no consumer sniffs headers to discover it.
@@ -96,15 +99,60 @@ pub fn request_id(session_id: &str, round_idx: usize) -> String {
 /// Structural corruption fails here rather than surfacing later as a puzzling
 /// replay: the whole value of this format is that two independent consumers can
 /// trust it without re-deriving anything.
-pub fn load(path: &str) -> Result<Vec<ExecutionRow>> {
+pub fn load(path: &str, declaration: &TraceDeclaration) -> Result<Vec<DeclaredRow>> {
     let mut reader = csv::Reader::from_path(path)
         .with_context(|| format!("failed to open {SCHEMA_NAME} trace: {path}"))?;
+    let headers = reader
+        .headers()
+        .with_context(|| format!("failed to read the header of {path}"))?
+        .clone();
+    // Before a single row: a header that does not match the declaration means
+    // the file is not the thing the run was told to replay, and every row after
+    // it would be parsed under the wrong assumption.
+    declaration
+        .verify_header(headers.iter())
+        .map_err(|mismatch| anyhow!("{path}: {mismatch}"))?;
+
+    let reads_scheduling = declaration.carries(TraceTag::Slo);
     let mut rows: Vec<ExecutionRow> = Vec::new();
-    for record in reader.deserialize() {
-        rows.push(record.context("failed to parse a session-execution-v2 row")?);
+    let mut scheduling: Vec<RequestScheduling> = Vec::new();
+    for (index, record) in reader.records().enumerate() {
+        let line = index + 2; // the header occupies line 1
+        let record = record.with_context(|| format!("{path}: failed to read line {line}"))?;
+        rows.push(
+            record
+                .deserialize(Some(&headers))
+                .context("failed to parse a session-execution-v2 row")?,
+        );
+        let declared = if reads_scheduling {
+            let declared: RequestScheduling = record
+                .deserialize(Some(&headers))
+                .context("failed to parse a session-execution-v2 row")?;
+            declared.validate(&format!("{path} line {line}"))?;
+            declared
+        } else {
+            RequestScheduling::default()
+        };
+        scheduling.push(declared);
     }
     validate(&rows).with_context(|| format!("{path} is not a canonical {SCHEMA_NAME} trace"))?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .zip(scheduling)
+        .map(|(row, scheduling)| DeclaredRow { row, scheduling })
+        .collect())
+}
+
+/// A canonical row together with whatever the file's declared tags added to it.
+///
+/// Two fields rather than a wider row type, because the canonical column set
+/// *is* the format: a tag is something a particular file carries in addition to
+/// its format, and merging the two would make every canonical file grow columns
+/// only some of them want.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeclaredRow {
+    pub row: ExecutionRow,
+    pub scheduling: RequestScheduling,
 }
 
 /// Validate the canonical layout and the per-row invariants.

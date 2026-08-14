@@ -19,6 +19,7 @@ use crate::executor::{
 };
 use crate::record::StepLog;
 use crate::schema::slo::SloSummary;
+use crate::schema::{TraceDeclaration, TraceTag};
 use crate::slo_source;
 use crate::summary::{
     write_logs, write_summary_if_requested, ClientRuntimeSummary, ReplaySummary, RunSummary,
@@ -41,15 +42,25 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
     fdlimit::raise_fd_limit().ok();
     validate(&args)?;
 
-    let mut workload = load_workload(&args.trace, args.trace_format, args.max_items)?;
+    // What the file says it is, before it is opened. Every reader below checks
+    // its header against this rather than trusting whatever columns turn up.
+    let declaration = TraceDeclaration::parse_with_schema(
+        &args.trace_kind,
+        &args.trace_tags,
+        args.trace_format.source_schema().name(),
+    )?;
+    // Resolved before anything is loaded, so a malformed objective fails in a
+    // second rather than after a corpus has been tokenized.
+    let objective = slo_source::resolve(&args.trace, args.slo.as_deref())?;
+    let mut workload = load_workload(&args.trace, &declaration, args.max_items)?;
     let unit_label = workload.unit_label();
     report_arrival_rate(&args, &mut workload, unit_label)?;
 
     let replay_summary = ReplaySummary::empty_for(&workload);
-    // Resolved before anything is loaded, so a malformed objective fails in a
-    // second rather than after a corpus has been tokenized.
-    let slo_summary = slo_source::resolve(&args.trace, args.slo.as_deref())?
-        .map(|(spec, source)| SloSummary::new(spec, source));
+    // A run reports attainment when it was given an objective *or* when the
+    // trace declares per-request deadlines -- a trace that sets its own budgets
+    // and a run that never mentions them would be a column read and discarded.
+    let slo_summary = SloSummary::new(objective, declaration.carries(TraceTag::Slo));
     let workload_summary = WorkloadSummary::from_workload(&workload, args.max_model_len);
     workload_summary.print();
     if args.dry_run {

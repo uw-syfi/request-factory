@@ -1,8 +1,10 @@
 mod independent;
 mod session;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::ValueEnum;
+
+use crate::schema::{SourceSchema, TraceDeclaration, TraceKind, TraceTag};
 
 pub(crate) use independent::IndependentRequest;
 pub(crate) use session::{SessionPlans, SessionStep};
@@ -18,6 +20,16 @@ pub enum TraceFormat {
     /// policy that resolved it ran in `tracegen` and is recorded in the file's
     /// manifest. A raw, unmaterialized CSV is rejected at parse.
     Session,
+}
+
+impl TraceFormat {
+    /// The wire format this selector names in the shared taxonomy.
+    pub(crate) fn source_schema(self) -> SourceSchema {
+        match self {
+            Self::Independent => SourceSchema::Native,
+            Self::Session => SourceSchema::SessionExecutionV2,
+        }
+    }
 }
 
 /// Typed replay plans produced by the trace frontends.
@@ -37,15 +49,50 @@ pub(crate) struct ArrivalRateAdjustment {
 /// Dispatch to one source-specific frontend without erasing its request type.
 pub(crate) fn load_workload(
     path: &str,
-    format: TraceFormat,
+    declaration: &TraceDeclaration,
     max_items: Option<usize>,
 ) -> Result<ReplayWorkload> {
-    match format {
-        TraceFormat::Independent => {
-            independent::load(path, max_items).map(ReplayWorkload::IndependentRequests)
+    reject_what_this_runtime_cannot_replay(declaration)?;
+    match declaration.source_schema {
+        SourceSchema::Native => {
+            independent::load(path, declaration, max_items).map(ReplayWorkload::IndependentRequests)
         }
-        TraceFormat::Session => session::load(path, max_items).map(ReplayWorkload::Sessions),
+        SourceSchema::SessionExecutionV2 => {
+            session::load(path, declaration, max_items).map(ReplayWorkload::Sessions)
+        }
     }
+}
+
+/// Refuse declarations this client understands but cannot execute.
+///
+/// The taxonomy is shared with a simulator that has more of it implemented, so a
+/// declaration parsing successfully is not a promise that a *replay* can carry
+/// it out. Each rejection below names what is missing rather than reporting a
+/// parse error for a file that is perfectly well formed.
+fn reject_what_this_runtime_cannot_replay(declaration: &TraceDeclaration) -> Result<()> {
+    if declaration.kind != TraceKind::TextGeneration {
+        bail!(
+            "trace_kind {:?} is defined in the shared taxonomy but this client can only submit \
+             text generation: there is no prompt builder for a media modality yet, so replaying \
+             one would mean inventing content the trace never described",
+            declaration.kind.name(),
+        );
+    }
+    if declaration.carries(TraceTag::Speculative) {
+        bail!(
+            "the speculative trace tag declares an acceptance rate, which is an input to a \
+             simulation and not something a replay client can impose: against a real server the \
+             acceptance rate is whatever the server achieves, and it is measured, not declared"
+        );
+    }
+    if declaration.source_schema == SourceSchema::Native && declaration.carries(TraceTag::Session) {
+        bail!(
+            "the session trace tag on a native file describes multi-round conversations, which \
+             this client replays only from a canonical {} trace; generate one with tracegen",
+            crate::schema::session_execution_v2::SCHEMA_NAME,
+        );
+    }
+    Ok(())
 }
 
 impl ReplayWorkload {
@@ -163,6 +210,7 @@ mod tests {
             input_len: 1,
             output_len: 1,
             tool_wait_after_ms: 0.0,
+            scheduling: Default::default(),
         }
     }
 
@@ -246,7 +294,7 @@ mod tests {
         )
         .unwrap();
         let workload =
-            load_workload(path.to_str().unwrap(), TraceFormat::Independent, None).unwrap();
+            load_workload(path.to_str().unwrap(), &TraceDeclaration::text(), None).unwrap();
         fs::remove_file(path).unwrap();
 
         let ReplayWorkload::IndependentRequests(requests) = workload else {

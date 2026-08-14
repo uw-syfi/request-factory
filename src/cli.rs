@@ -46,6 +46,24 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "session")]
     pub trace_format: TraceFormat,
 
+    /// What a row of this trace *is*, from the shared taxonomy:
+    /// `text_generation`, `image_to_text`, `text_to_image`, ...
+    ///
+    /// Declared, never sniffed from the header. This client can submit only
+    /// `text_generation` today and says so for anything else, rather than
+    /// parsing a media trace and then inventing content for it.
+    #[arg(long, default_value = "text_generation")]
+    pub trace_kind: String,
+
+    /// Orthogonal declarations this file carries, comma-separated: `slo` adds
+    /// `deadline_ms` and `priority` columns to whatever kind it is used with.
+    ///
+    /// A tag is how a trace says it carries more than its format's own columns.
+    /// Undeclared extra columns are an error, not something to ignore: a column
+    /// nobody reads is data whose author expected it to matter.
+    #[arg(long, value_delimiter = ',')]
+    pub trace_tags: Vec<String>,
+
     /// Text corpus used to build synthetic prompt/input/output token pools.
     #[arg(long)]
     pub text_file: String,

@@ -469,6 +469,44 @@ semantics are generic and do not depend on any simulator or trace producer.
 There is no canonical variant of it: with no context to carry forward, there is
 nothing for a policy to materialize.
 
+### What a trace declares about itself
+
+A file is read against what it says it is, never against what its header looks
+like. Two things are declared, both shared with the simulator through
+`src/schema/`:
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--trace-kind` | `text_generation` | what a row *is* — the request family |
+| `--trace-tags` | none | orthogonal additions, comma-separated |
+
+The declaration fixes the exact column set, and both directions are errors: a
+missing column means the file cannot be read, and an **unexpected** one means the
+file describes something the run was not told about. That second case is the one
+worth having — an undeclared column is data whose author expected it to matter,
+and serde would have silently dropped it.
+
+`slo` is the tag that exists today. It adds two columns to whatever kind or
+format it is used with, including the canonical one:
+
+| column | meaning |
+| --- | --- |
+| `deadline_ms` | completion budget for **this row**, relative to its release. Blank on a row means that row declares none |
+| `priority` | server-side scheduling priority. Carried into the log, **never acted on** — this client has no queue of its own to reorder, and the server is the thing being measured |
+
+```bash
+--trace-format session --trace-tags slo    # canonical trace + per-round deadlines
+```
+
+Declaring a kind or tag this client cannot execute is refused by name rather
+than half-attempted: a media kind (no prompt builder exists yet, so replaying one
+would mean inventing content the trace never described), the `speculative` tag
+(an acceptance rate is a simulation input; against a real server it is measured,
+not imposed), and the `session` tag on a native file (multi-round replay reads a
+canonical trace). The taxonomy is shared with a simulator that has more of it
+implemented, so parsing a declaration is not a promise that a replay can carry
+it out.
+
 ## Arrival scheduling and load control
 
 Release is two independent decisions: *when* a unit may start, and *how many*
@@ -732,11 +770,17 @@ this zero-fill cannot mean "the server never reports cache detail at all".
 
 ## Output contracts
 
-### Per-request JSONL — schema v9
+### Per-request JSONL — schema v10
 
 `--log-path` receives one typed record per attempted request. Session and
 independent-request source data are tagged variants rather than one sparse
 object.
+
+v10 is additive: when a trace declares the `slo` tag, each record carries the
+`declared_deadline_ms` and `declared_priority` that row set for itself. Both are
+**absent**, not null, on a trace that declared no such column — so a reader can
+tell "this file carried no deadlines" from "this row left it blank", which is
+exactly the distinction the attainment fold depends on.
 
 v9 is the first non-additive revision: it **removes** three session fields that
 described a decision the runtime no longer makes. `session_context_policy`,
@@ -765,11 +809,11 @@ described under [Request backends](#request-backends). Consumers reading
 Abbreviated session example:
 
 <details>
-<summary><b>View a schema-v9 session record</b></summary>
+<summary><b>View a schema-v10 session record</b></summary>
 
 ```json
 {
-  "schema_version": 9,
+  "schema_version": 10,
   "source": {
     "type": "session_round",
     "data": {
@@ -785,7 +829,9 @@ Abbreviated session example:
       "planned_prefix_hit_rate": 0.8181818182,
       "output_len_target": 64,
       "tool_wait_after_ms": 100.0,
-      "arrival_time_ms": 0.0
+      "arrival_time_ms": 0.0,
+      "declared_deadline_ms": 2000.0,
+      "declared_priority": 0
     }
   },
   "outcome": {
@@ -925,12 +971,30 @@ An objective is a set of **upper bounds**, and the number it produces is an
 Not a percentile target. "p99 TTFT under 500 ms" hides how many requests were
 bad, and a run of two hundred thousand rounds has room to hide a great deal.
 
-Both scopes are supported, and the summary records which one applied:
+Three scopes are supported, and the summary records which applied:
 
 | scope | how | `slo.source` |
 | --- | --- | --- |
 | global | `--slo` on the command line | `global` |
 | per trace | a `<trace>.slo.json` sidecar beside the trace file | `trace` |
+| per request | the `slo` trace tag's `deadline_ms` column | absent — see below |
+
+The first two set the same bounds for every row, which is why they are a
+sidecar rather than a column repeated N times. The third is genuinely per-row
+and reported separately, under `slo.declared_deadline`:
+
+```text
+slo attainment | source=TraceRows steps=30 overall=0.7333 |
+  declared_deadline 0.5556 (18 of 30 rows, 8 violated, 0 unmeasured)
+```
+
+A row's deadline is judged on the same clock as `e2e_ms`, and only rows that
+declared one are counted — a blank cell asks for nothing, so counting blanks as
+attained would let an almost-empty column report near-perfect attainment. A step
+is attained overall when it met **every** bound in force for it: the run's and
+its own. A run needs no `--slo` at all for this: a trace declaring the tag is
+enough to make attainment worth reporting, because a column read and discarded
+is worse than a column never read.
 
 The sidecar is the same convention `.manifest.json` and `.plan.json` already
 use, so a trace and everything true about it travel together:
@@ -1078,6 +1142,8 @@ Every flag `session_runner` accepts. The axis columns map back to
 | Flag | Default | Values |
 |---|---|---|
 | `--trace-format` | `session` | `session`, `independent` — axis 1. `session` reads a canonical trace; generate one with `tracegen` |
+| `--trace-kind` | `text_generation` | What a row is, from the shared taxonomy. Only `text_generation` can be submitted today; see [What a trace declares](#what-a-trace-declares-about-itself) |
+| `--trace-tags` | none | Comma-separated. `slo` adds `deadline_ms` and `priority` columns |
 | `--backend` | `openai` | `openai`, `vllm-tokens`, `sglang-tokens` — axis 3 |
 | `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for `openai`, omit it for the native token endpoints |
 
@@ -1140,6 +1206,7 @@ A context-limit skip always ends its session, independently of this flag.
 │   │   ├── mod.rs            trace kinds, tags, column blocks, header check
 │   │   ├── media.rs          image/video/audio extents, decoding strategy
 │   │   ├── omni.rs           heterogeneous input/output segment JSON
+│   │   ├── scheduling.rs     the slo tag's columns: deadline_ms, priority
 │   │   ├── slo.rs            objective bounds + the attainment fold
 │   │   └── session_execution_v2.rs  the canonical schema, minting, validation
 │   ├── runner.rs             one run: validate, load, preflight, fan out, fold

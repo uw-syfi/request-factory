@@ -19,6 +19,7 @@
 
 pub mod media;
 pub mod omni;
+pub mod scheduling;
 pub mod session_execution_v2;
 pub mod slo;
 
@@ -26,6 +27,7 @@ use anyhow::{bail, Result};
 
 pub use media::{AudioExtent, DecodingStrategy, ImageExtent, VideoExtent};
 pub use omni::{OmniInputSegment, OmniOutputSpec};
+pub use scheduling::RequestScheduling;
 pub use slo::{SloMeasurement, SloSource, SloSpec, SloSummary};
 
 /// Columns every native row carries, whatever its kind: who it is and when it
@@ -287,9 +289,15 @@ impl TraceDeclaration {
 
     /// Parse a declaration that also names its wire format.
     ///
-    /// The canonical schema implies its own kind and tag, because the format
-    /// exists for exactly one shape of workload. Declaring anything else is a
-    /// configuration mistake worth naming rather than silently overriding.
+    /// The canonical schema implies its own kind and its session tag, because
+    /// the format exists for exactly one shape of workload and spells those
+    /// columns itself. Declaring a different kind is a configuration mistake
+    /// worth naming rather than silently overriding.
+    ///
+    /// Tags that are *orthogonal* to the format are not implied and not
+    /// forbidden: they are the mechanism by which a file says it carries more
+    /// than the format's own columns, and refusing them here would mean a
+    /// canonical trace could never carry a per-request deadline.
     pub fn parse_with_schema(kind: &str, tags: &[String], schema: &str) -> Result<Self> {
         let source_schema = SourceSchema::parse(schema)?;
         let mut declaration = Self::parse(kind, tags)?;
@@ -302,14 +310,11 @@ impl TraceDeclaration {
                     declaration.kind
                 );
             }
-            if !declaration.tags.is_empty() && declaration.tags != [TraceTag::Session] {
-                bail!(
-                    "{} already declares its session columns; drop trace_tags {:?}",
-                    session_execution_v2::SCHEMA_NAME,
-                    declaration.tags
-                );
+            // Implied rather than required: declaring it is harmless, omitting
+            // it does not make a canonical trace stop being a session trace.
+            if !declaration.carries(TraceTag::Session) {
+                declaration.tags.insert(0, TraceTag::Session);
             }
-            declaration.tags = vec![TraceTag::Session];
         }
         declaration.source_schema = source_schema;
         Ok(declaration)
@@ -332,12 +337,20 @@ impl TraceDeclaration {
     /// Exactly the columns a file with this declaration must have — no more, no
     /// fewer.
     pub fn expected_columns(&self) -> Vec<&'static str> {
-        if self.source_schema == SourceSchema::SessionExecutionV2 {
-            return session_execution_v2::COLUMNS.to_vec();
-        }
-        let mut columns = RELEASE_COLUMNS.to_vec();
-        columns.extend(self.kind.definition_columns());
+        let mut columns = if self.source_schema == SourceSchema::SessionExecutionV2 {
+            session_execution_v2::COLUMNS.to_vec()
+        } else {
+            let mut columns = RELEASE_COLUMNS.to_vec();
+            columns.extend(self.kind.definition_columns());
+            columns
+        };
         for tag in &self.tags {
+            // The canonical schema spells its own session columns, and spells
+            // some of them differently (it has no `prefix_kv`). Adding the tag's
+            // block on top would demand a column the format does not have.
+            if self.source_schema == SourceSchema::SessionExecutionV2 && *tag == TraceTag::Session {
+                continue;
+            }
             columns.extend_from_slice(tag.columns());
         }
         columns
@@ -504,6 +517,52 @@ mod tests {
         declaration
             .verify_header(session_execution_v2::COLUMNS.iter().copied())
             .expect("the canonical header must satisfy its own declaration");
+    }
+
+    #[test]
+    fn an_orthogonal_tag_extends_the_canonical_schema_without_restating_it() {
+        // The canonical format spells its own session columns -- and spells them
+        // differently, having no `prefix_kv`. Declaring the session tag must
+        // therefore add nothing, while a tag the format knows nothing about must
+        // add exactly its own columns.
+        let declaration = TraceDeclaration::parse_with_schema(
+            "text_generation",
+            &["slo".to_string()],
+            "session-execution-v2",
+        )
+        .unwrap();
+
+        assert_eq!(declaration.tags, vec![TraceTag::Session, TraceTag::Slo]);
+        let mut expected = session_execution_v2::COLUMNS.to_vec();
+        expected.extend_from_slice(TraceTag::Slo.columns());
+        assert_eq!(declaration.expected_columns(), expected);
+        declaration
+            .verify_header(expected.iter().copied())
+            .expect("canonical columns plus the tag's own must pass");
+
+        // And a file that carries them without declaring them is still refused:
+        // an undeclared column is data whose author expected something to read it.
+        let undeclared =
+            TraceDeclaration::parse_with_schema("text_generation", &[], "session-execution-v2")
+                .unwrap()
+                .verify_header(expected.iter().copied());
+        assert!(undeclared.unwrap_err().to_string().contains("deadline_ms"));
+    }
+
+    #[test]
+    fn declaring_the_implied_session_tag_is_harmless_rather_than_an_error() {
+        let implied =
+            TraceDeclaration::parse_with_schema("text_generation", &[], "session-execution-v2")
+                .unwrap();
+        let spelled = TraceDeclaration::parse_with_schema(
+            "text_generation",
+            &["session".to_string()],
+            "session-execution-v2",
+        )
+        .unwrap();
+
+        assert_eq!(implied.tags, spelled.tags);
+        assert_eq!(implied.expected_columns(), spelled.expected_columns());
     }
 
     #[test]

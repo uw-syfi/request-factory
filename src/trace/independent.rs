@@ -1,5 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+
+use crate::schema::{RequestScheduling, TraceDeclaration, TraceTag};
 
 /// One independent request from the generic request CSV frontend.
 ///
@@ -11,17 +13,136 @@ pub(crate) struct IndependentRequest {
     pub(crate) input_len: usize,
     pub(crate) output_len: usize,
     pub(crate) arrival_time: f64,
+    /// What the `slo` tag declared for this row, empty when it was not declared.
+    #[serde(skip)]
+    pub(crate) scheduling: RequestScheduling,
 }
 
-pub(super) fn load(path: &str, max_requests: Option<usize>) -> Result<Vec<IndependentRequest>> {
+/// Read a native trace, checking it against what it says it is.
+///
+/// The header is verified before any row is parsed. That is the whole point of a
+/// declaration: a column nobody expected is data whose author meant something by
+/// it, and silently dropping it is how a trace and the run that replayed it stop
+/// describing the same workload.
+pub(super) fn load(
+    path: &str,
+    declaration: &TraceDeclaration,
+    max_requests: Option<usize>,
+) -> Result<Vec<IndependentRequest>> {
     let mut reader = csv::Reader::from_path(path)
         .with_context(|| format!("failed to open independent-request trace: {path}"))?;
+    let headers = reader
+        .headers()
+        .with_context(|| format!("failed to read the header of {path}"))?
+        .clone();
+    declaration
+        .verify_header(headers.iter())
+        .map_err(|mismatch| anyhow!("{path}: {mismatch}"))?;
+
+    let reads_scheduling = declaration.carries(TraceTag::Slo);
     let mut requests = Vec::new();
-    for row in reader.deserialize() {
+    for (index, record) in reader.records().enumerate() {
         if max_requests.is_some_and(|max| requests.len() >= max) {
             break;
         }
-        requests.push(row.context("failed to parse independent-request trace row")?);
+        let line = index + 2; // the header occupies line 1
+        let record = record.with_context(|| format!("{path}: failed to read line {line}"))?;
+        let mut request: IndependentRequest = record
+            .deserialize(Some(&headers))
+            .with_context(|| format!("{path}: failed to parse line {line}"))?;
+        if reads_scheduling {
+            request.scheduling = record
+                .deserialize(Some(&headers))
+                .with_context(|| format!("{path}: failed to parse line {line}"))?;
+            request
+                .scheduling
+                .validate(&format!("{path} line {line}"))?;
+        }
+        requests.push(request);
     }
     Ok(requests)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn write(name: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "req_frontend_native_{}_{name}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_undeclared_column_is_refused_rather_than_dropped() {
+        // serde alone would have ignored `deadline_ms` and produced a run that
+        // silently held every request to no deadline at all.
+        let path = write(
+            "undeclared",
+            "id,arrival_time,input_len,output_len,deadline_ms\nreq-1,0,16,4,500\n",
+        );
+
+        let error = load(path.to_str().unwrap(), &TraceDeclaration::text(), None)
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&path).ok();
+
+        assert!(error.contains("deadline_ms"), "{error}");
+    }
+
+    #[test]
+    fn a_declared_tag_is_read_per_row_and_may_be_blank_on_any_of_them() {
+        let path = write(
+            "declared",
+            "id,arrival_time,input_len,output_len,deadline_ms,priority\n\
+             req-1,0,16,4,500,7\n\
+             req-2,10,16,4,,\n",
+        );
+        let declaration = TraceDeclaration::parse("text_generation", &["slo".to_string()]).unwrap();
+
+        let requests = load(path.to_str().unwrap(), &declaration, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(requests[0].scheduling.deadline_ms, Some(500.0));
+        assert_eq!(requests[0].scheduling.priority, Some(7));
+        assert!(requests[1].scheduling.is_empty());
+    }
+
+    #[test]
+    fn a_declared_column_that_is_missing_is_refused_before_any_row_is_read() {
+        let path = write(
+            "missing",
+            "id,arrival_time,input_len,output_len\nreq-1,0,16,4\n",
+        );
+        let declaration = TraceDeclaration::parse("text_generation", &["slo".to_string()]).unwrap();
+
+        let error = load(path.to_str().unwrap(), &declaration, None)
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&path).ok();
+
+        assert!(error.contains("deadline_ms"), "{error}");
+    }
+
+    #[test]
+    fn an_impossible_deadline_names_the_line_it_is_on() {
+        let path = write(
+            "bad-deadline",
+            "id,arrival_time,input_len,output_len,deadline_ms,priority\n\
+             req-1,0,16,4,500,0\n\
+             req-2,10,16,4,0,0\n",
+        );
+        let declaration = TraceDeclaration::parse("text_generation", &["slo".to_string()]).unwrap();
+
+        let error = load(path.to_str().unwrap(), &declaration, None)
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&path).ok();
+
+        assert!(error.contains("line 3"), "{error}");
+    }
 }

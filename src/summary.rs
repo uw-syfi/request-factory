@@ -360,7 +360,7 @@ pub(crate) async fn write_logs(
         summary.add(&record);
         measurements.add(&record.outcome);
         if let Some(slo) = slo.as_mut() {
-            slo.add(&record.outcome.slo_measurement());
+            slo.add(&record.slo_measurement());
         }
         log_server_prefix_hit_rate(&record);
         if let Ok(json) = serde_json::to_string(&record) {
@@ -622,6 +622,7 @@ mod tests {
             output_len_target: 4,
             tool_wait_after_ms: 0.0,
             arrival_time_ms: 0.0,
+            scheduling: Default::default(),
         };
         let mut measured_outcome = outcome("r1", 0.0, 1.0, 10.0, Some(1.0), 4, "SUCCESS");
         measured_outcome.server_usage = Some(crate::record::ServerUsageLog {

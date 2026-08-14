@@ -120,6 +120,11 @@ pub struct SloMeasurement {
     pub ttft_ms: Option<f64>,
     pub tpot_ms: Option<f64>,
     pub e2e_ms: Option<f64>,
+    /// The completion budget this row declared for itself, from the `slo` trace
+    /// tag. Judged against the same clock as `e2e_ms` and reported separately,
+    /// because "met the budget its own trace set" and "met the budget this run
+    /// was given" are two different claims about one step.
+    pub declared_deadline_ms: Option<f64>,
 }
 
 /// One metric's outcome for one step.
@@ -172,22 +177,53 @@ impl MetricAttainment {
     }
 }
 
+/// Attainment against per-request budgets the trace declared for itself.
+///
+/// No `threshold_ms`: every row brings its own, which is the entire difference
+/// between this and [`MetricAttainment`]. Only rows that declared one are
+/// counted — a blank cell is not a budget of zero and not a budget met.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct DeadlineAttainment {
+    pub declared_steps: usize,
+    pub attained_steps: usize,
+    pub violated_steps: usize,
+    pub unmeasured_steps: usize,
+    pub attainment: Option<f64>,
+}
+
+impl DeadlineAttainment {
+    fn add(&mut self, verdict: MetricVerdict) {
+        self.declared_steps += 1;
+        match verdict {
+            MetricVerdict::Attained => self.attained_steps += 1,
+            MetricVerdict::Violated => self.violated_steps += 1,
+            MetricVerdict::Unmeasured => self.unmeasured_steps += 1,
+        }
+        self.attainment = Some(self.attained_steps as f64 / self.declared_steps as f64);
+    }
+}
+
 /// Attainment for a whole run.
 #[derive(Clone, Debug, Serialize)]
 pub struct SloSummary {
-    /// The objective this run was held to, echoed so a report is readable
-    /// without the command line that produced it.
-    pub spec: SloSpec,
-    /// Where the objective came from, for the same reason.
-    pub source: SloSource,
+    /// The run-level objective, echoed so a report is readable without the
+    /// command line that produced it. Absent when the only bounds in force are
+    /// the trace's own per-request deadlines.
+    pub spec: Option<SloSpec>,
+    /// Where that objective came from, for the same reason.
+    pub source: Option<SloSource>,
     pub evaluated_steps: usize,
-    /// Steps that met **every** declared bound.
+    /// Steps that met **every** bound in force for them — the run-level ones and
+    /// their own declared deadline where they declared one.
     pub attained_steps: usize,
     /// `attained_steps / evaluated_steps`. The one number this exists to report.
     pub attainment: Option<f64>,
     pub ttft_ms: Option<MetricAttainment>,
     pub tpot_ms: Option<MetricAttainment>,
     pub e2e_ms: Option<MetricAttainment>,
+    /// Present when the trace declared the `slo` tag, whether or not any row
+    /// filled it in.
+    pub declared_deadline: Option<DeadlineAttainment>,
 }
 
 /// Which scope declared the objective in force.
@@ -201,17 +237,35 @@ pub enum SloSource {
 }
 
 impl SloSummary {
-    pub fn new(spec: SloSpec, source: SloSource) -> Self {
-        Self {
+    /// Build a summary when there is anything at all to hold the run to.
+    ///
+    /// `None` when neither a run-level objective nor a trace that declares its
+    /// own deadlines is present. A run with no objective must report *nothing*
+    /// rather than an attainment of one: the difference between "everything met
+    /// the bar" and "there was no bar" is the whole point.
+    pub fn new(
+        objective: Option<(SloSpec, SloSource)>,
+        per_request_deadlines: bool,
+    ) -> Option<Self> {
+        if objective.is_none() && !per_request_deadlines {
+            return None;
+        }
+        let spec = objective.map(|(spec, _)| spec);
+        Some(Self {
             spec,
-            source,
+            source: objective.map(|(_, source)| source),
             evaluated_steps: 0,
             attained_steps: 0,
             attainment: None,
-            ttft_ms: spec.ttft_ms.map(MetricAttainment::new),
-            tpot_ms: spec.tpot_ms.map(MetricAttainment::new),
-            e2e_ms: spec.e2e_ms.map(MetricAttainment::new),
-        }
+            ttft_ms: spec
+                .and_then(|spec| spec.ttft_ms)
+                .map(MetricAttainment::new),
+            tpot_ms: spec
+                .and_then(|spec| spec.tpot_ms)
+                .map(MetricAttainment::new),
+            e2e_ms: spec.and_then(|spec| spec.e2e_ms).map(MetricAttainment::new),
+            declared_deadline: per_request_deadlines.then(DeadlineAttainment::default),
+        })
     }
 
     /// Fold one step's measurements.
@@ -230,6 +284,17 @@ impl SloSummary {
             attained_every_bound &= verdict == MetricVerdict::Attained;
             metric.add(verdict);
         }
+        // A row's own budget is judged on the same clock as `e2e_ms`, and only
+        // when the row declared one: a blank cell asks for nothing, so counting
+        // it would let an empty column inflate the run's attainment.
+        if let (Some(deadline), Some(deadline_ms)) = (
+            self.declared_deadline.as_mut(),
+            measurement.declared_deadline_ms,
+        ) {
+            let verdict = judge(measurement.succeeded, measurement.e2e_ms, deadline_ms);
+            attained_every_bound &= verdict == MetricVerdict::Attained;
+            deadline.add(verdict);
+        }
         self.evaluated_steps += 1;
         if attained_every_bound {
             self.attained_steps += 1;
@@ -243,7 +308,7 @@ impl SloSummary {
             Some(rate) => format!("{:.4}", rate),
             None => "n/a".to_string(),
         };
-        let per_metric: Vec<String> = [
+        let mut blocks: Vec<String> = [
             ("ttft_ms", self.ttft_ms.as_ref()),
             ("tpot_ms", self.tpot_ms.as_ref()),
             ("e2e_ms", self.e2e_ms.as_ref()),
@@ -260,11 +325,29 @@ impl SloSummary {
             ))
         })
         .collect();
+        if let Some(deadline) = self.declared_deadline.as_ref() {
+            blocks.push(match deadline.attainment {
+                Some(attainment) => format!(
+                    "declared_deadline {attainment:.4} ({} of {} rows, {} violated, {} unmeasured)",
+                    deadline.declared_steps,
+                    self.evaluated_steps,
+                    deadline.violated_steps,
+                    deadline.unmeasured_steps,
+                ),
+                // Loud, because a declared column that no row filled in is
+                // almost always a generator that forgot to write it.
+                None => "declared_deadline n/a (the slo tag was declared but no row set one)"
+                    .to_string(),
+            });
+        }
+        let source = match self.source {
+            Some(source) => format!("{source:?}"),
+            None => "TraceRows".to_string(),
+        };
         format!(
-            "slo attainment | source={:?} steps={} overall={overall} | {}",
-            self.source,
+            "slo attainment | source={source} steps={} overall={overall} | {}",
             self.evaluated_steps,
-            per_metric.join(" | "),
+            blocks.join(" | "),
         )
     }
 }
@@ -290,6 +373,7 @@ mod tests {
             ttft_ms: Some(ttft),
             tpot_ms: Some(tpot),
             e2e_ms: Some(e2e),
+            declared_deadline_ms: None,
         }
     }
 
@@ -320,7 +404,7 @@ mod tests {
     #[test]
     fn a_step_is_attained_only_when_every_declared_bound_holds() {
         let spec = SloSpec::parse("ttft_ms=500,tpot_ms=50").unwrap();
-        let mut summary = SloSummary::new(spec, SloSource::Global);
+        let mut summary = SloSummary::new(Some((spec, SloSource::Global)), false).unwrap();
 
         summary.add(&met(400.0, 40.0, 9_999.0)); // both bounds met; e2e undeclared
         summary.add(&met(400.0, 60.0, 1.0)); // tpot over
@@ -337,8 +421,11 @@ mod tests {
 
     #[test]
     fn a_bound_is_a_ceiling_that_the_boundary_itself_satisfies() {
-        let mut summary =
-            SloSummary::new(SloSpec::parse("ttft_ms=500").unwrap(), SloSource::Global);
+        let mut summary = SloSummary::new(
+            Some((SloSpec::parse("ttft_ms=500").unwrap(), SloSource::Global)),
+            false,
+        )
+        .unwrap();
         summary.add(&met(500.0, 0.0, 0.0));
 
         assert_eq!(summary.attained_steps, 1);
@@ -348,8 +435,11 @@ mod tests {
     fn a_failed_step_is_unmeasured_rather_than_fast() {
         // It failed at 1 ms. That is not an attained SLO, and it is also not a
         // violated latency bound -- calling it either would misreport the run.
-        let mut summary =
-            SloSummary::new(SloSpec::parse("ttft_ms=500").unwrap(), SloSource::Global);
+        let mut summary = SloSummary::new(
+            Some((SloSpec::parse("ttft_ms=500").unwrap(), SloSource::Global)),
+            false,
+        )
+        .unwrap();
         summary.add(&SloMeasurement {
             succeeded: false,
             ttft_ms: Some(1.0),
@@ -368,18 +458,117 @@ mod tests {
         // A one-event response has no per-token pace to measure. It still fails
         // an objective that asked for one, but the count says it was unmeasured
         // rather than slow.
-        let mut summary = SloSummary::new(SloSpec::parse("tpot_ms=50").unwrap(), SloSource::Global);
+        let mut summary = SloSummary::new(
+            Some((SloSpec::parse("tpot_ms=50").unwrap(), SloSource::Global)),
+            false,
+        )
+        .unwrap();
         summary.add(&SloMeasurement {
             succeeded: true,
             ttft_ms: Some(10.0),
             tpot_ms: None,
             e2e_ms: Some(20.0),
+            declared_deadline_ms: None,
         });
 
         let tpot = summary.tpot_ms.unwrap();
         assert_eq!(tpot.unmeasured_steps, 1);
         assert_eq!(tpot.violated_steps, 0);
         assert_eq!(summary.attainment, Some(0.0));
+    }
+
+    #[test]
+    fn a_run_with_neither_an_objective_nor_declared_deadlines_reports_nothing() {
+        // Not an attainment of 1.0. "Everything met the bar" and "there was no
+        // bar" are different findings and must not print the same number.
+        assert!(SloSummary::new(None, false).is_none());
+    }
+
+    #[test]
+    fn a_trace_that_declares_its_own_deadlines_is_reported_without_any_run_level_spec() {
+        let mut summary = SloSummary::new(None, true).unwrap();
+        summary.add(&SloMeasurement {
+            succeeded: true,
+            e2e_ms: Some(400.0),
+            declared_deadline_ms: Some(500.0),
+            ..SloMeasurement::default()
+        });
+        summary.add(&SloMeasurement {
+            succeeded: true,
+            e2e_ms: Some(900.0),
+            declared_deadline_ms: Some(500.0),
+            ..SloMeasurement::default()
+        });
+
+        assert!(summary.spec.is_none());
+        assert!(summary.source.is_none());
+        let deadline = summary.declared_deadline.unwrap();
+        assert_eq!(deadline.declared_steps, 2);
+        assert_eq!(deadline.violated_steps, 1);
+        assert_eq!(summary.attainment, Some(0.5));
+    }
+
+    #[test]
+    fn a_row_that_declares_no_deadline_is_not_counted_as_one_that_met_it() {
+        // The trap: an `slo` column present but mostly blank. Counting blanks as
+        // attained would let an almost-empty column report near-perfect
+        // attainment, which is the opposite of what the file says.
+        let mut summary = SloSummary::new(None, true).unwrap();
+        summary.add(&SloMeasurement {
+            succeeded: true,
+            e2e_ms: Some(9_999.0),
+            declared_deadline_ms: None,
+            ..SloMeasurement::default()
+        });
+        summary.add(&SloMeasurement {
+            succeeded: true,
+            e2e_ms: Some(100.0),
+            declared_deadline_ms: Some(500.0),
+            ..SloMeasurement::default()
+        });
+
+        let deadline = summary.declared_deadline.unwrap();
+        assert_eq!(deadline.declared_steps, 1);
+        assert_eq!(deadline.attainment, Some(1.0));
+        // The undeclared row is still a step of the run, and it broke no bound.
+        assert_eq!(summary.evaluated_steps, 2);
+        assert_eq!(summary.attainment, Some(1.0));
+    }
+
+    #[test]
+    fn a_step_must_meet_both_the_runs_bound_and_its_own() {
+        let mut summary = SloSummary::new(
+            Some((SloSpec::parse("e2e_ms=1000").unwrap(), SloSource::Global)),
+            true,
+        )
+        .unwrap();
+        // Inside the run's bound, past its own.
+        summary.add(&SloMeasurement {
+            succeeded: true,
+            e2e_ms: Some(800.0),
+            declared_deadline_ms: Some(500.0),
+            ..SloMeasurement::default()
+        });
+
+        assert_eq!(summary.e2e_ms.unwrap().attained_steps, 1);
+        assert_eq!(summary.declared_deadline.unwrap().violated_steps, 1);
+        assert_eq!(summary.attained_steps, 0);
+    }
+
+    #[test]
+    fn a_declared_tag_that_no_row_filled_in_says_so_rather_than_reporting_a_rate() {
+        let mut summary = SloSummary::new(None, true).unwrap();
+        summary.add(&SloMeasurement {
+            succeeded: true,
+            e2e_ms: Some(10.0),
+            ..SloMeasurement::default()
+        });
+
+        assert!(
+            summary.describe().contains("no row set one"),
+            "{}",
+            summary.describe()
+        );
     }
 
     #[test]

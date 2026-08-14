@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 
 use crate::schema::session_execution_v2 as v2;
+use crate::schema::{RequestScheduling, TraceDeclaration};
 
 /// One round of one session, as the replay runtime executes it.
 ///
@@ -17,6 +18,10 @@ pub(crate) struct SessionStep {
     pub(crate) input_len: usize,
     pub(crate) output_len: usize,
     pub(crate) tool_wait_after_ms: f64,
+    /// What the `slo` tag declared for this round, empty when it was not
+    /// declared. Per round, not per session: within one conversation a tool-call
+    /// turn and a long answer owe different things.
+    pub(crate) scheduling: RequestScheduling,
 }
 
 /// Sessions in replay order, each with its rounds in round order.
@@ -32,11 +37,16 @@ pub(crate) type SessionPlans = Vec<(String, Vec<SessionStep>)>;
 /// its `request_id` is the identifier, and its `prefix_len` is already
 /// guaranteed to exist by the time the round runs — which is exactly why a
 /// simulator can read the same file and reach the same plan.
-pub(super) fn load(path: &str, max_sessions: Option<usize>) -> Result<SessionPlans> {
-    let rows = v2::load(path)?;
+pub(super) fn load(
+    path: &str,
+    declaration: &TraceDeclaration,
+    max_sessions: Option<usize>,
+) -> Result<SessionPlans> {
+    let rows = v2::load(path, declaration)?;
 
     let mut sessions: SessionPlans = Vec::new();
-    for row in rows {
+    for declared in rows {
+        let row = declared.row;
         let step = SessionStep {
             request_id: row.request_id,
             session_id: row.session_id,
@@ -46,6 +56,7 @@ pub(super) fn load(path: &str, max_sessions: Option<usize>) -> Result<SessionPla
             input_len: row.input_len,
             output_len: row.output_len,
             tool_wait_after_ms: row.tool_wait_after_ms,
+            scheduling: declared.scheduling,
         };
         match sessions.last_mut() {
             Some((session_id, steps)) if *session_id == step.session_id => steps.push(step),
@@ -75,6 +86,12 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// The declaration every canonical file carries, which is what the runner
+    /// builds for `--trace-format session`.
+    fn canonical() -> TraceDeclaration {
+        TraceDeclaration::parse_with_schema("text_generation", &[], "session-execution-v2").unwrap()
+    }
+
     fn write_temp(name: &str, contents: &str) -> String {
         let mut path = std::env::temp_dir();
         path.push(format!("req-frontend-session-test-{name}.csv"));
@@ -92,7 +109,7 @@ mod tests {
              session_10_round_000000,10,0,5.000000,0,10,4,0.000000\n",
         );
 
-        let sessions = load(&path, Some(1)).unwrap();
+        let sessions = load(&path, &canonical(), Some(1)).unwrap();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].0, "2");
@@ -103,7 +120,9 @@ mod tests {
     /// The legacy loader this replaced accepted such a file: every column it
     /// required was present in a canonical header too, and serde ignored the
     /// rest, so `arrival_time` silently defaulted to 0 and the whole timeline
-    /// collapsed with no error. The canonical row type has no such overlap.
+    /// collapsed with no error. The canonical row type has no such overlap, and
+    /// since the declaration was wired in, the rejection happens on the header
+    /// before a single row is read — and names every column that disagrees.
     #[test]
     fn raw_unmaterialized_csv_is_rejected_at_parse() {
         let path = write_temp(
@@ -112,9 +131,10 @@ mod tests {
              abc,0,0,0,10,4,0\n",
         );
 
-        let error = load(&path, None).unwrap_err().to_string();
+        let error = load(&path, &canonical(), None).unwrap_err().to_string();
 
-        assert!(error.contains("failed to parse"), "{error}");
+        assert!(error.contains("header does not match"), "{error}");
+        assert!(error.contains("arrival_time_ms"), "{error}");
     }
 
     #[test]
@@ -127,7 +147,7 @@ mod tests {
              session_a_round_000000,a,0,250.000000,0,400,48,0.000000\n",
         );
 
-        let sessions = load(&path, None).unwrap();
+        let sessions = load(&path, &canonical(), None).unwrap();
 
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].0, "b");
@@ -144,7 +164,7 @@ mod tests {
              session_a_round_000000,a,0,0.000000,128,512,64,0.000000\n",
         );
 
-        let error = load(&path, None).unwrap_err().to_string();
+        let error = load(&path, &canonical(), None).unwrap_err().to_string();
 
         assert!(error.contains("not a canonical"), "{error}");
     }

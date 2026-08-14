@@ -130,6 +130,9 @@ was generated at — read the manifest.
 
 # 4. Hold the run to an objective and report attainment.
 #    ... --slo 'ttft_ms=500,tpot_ms=50'
+
+# 5. Replay a trace carrying its own per-round deadlines.
+#    ... --trace-tags slo        (the file must then have deadline_ms + priority)
 ```
 
 `--tokenizer` must match the served model: it sizes the synthetic corpus in the
@@ -171,6 +174,14 @@ server's own token space.
   responses that came back slowly. A trace can declare its own objective in a
   `<trace>.slo.json` sidecar; `--slo` overrides it and prints that it did, so
   check `slo.source` before attributing a number to a trace.
+- A trace's columns are checked against what it was **declared** to be
+  (`--trace-kind`, `--trace-tags`), and an undeclared column is an error. If a
+  run refuses a header, the file is not malformed — the declaration is wrong.
+  Read the `expected exactly:` list in the message and add the tag the file
+  needs, rather than editing the file.
+- `slo.declared_deadline` counts only the rows that set `deadline_ms`. Read
+  `declared_steps` against the run's total before quoting its rate: an
+  almost-empty column produces a rate over a handful of rows.
 
 ## Troubleshooting
 
