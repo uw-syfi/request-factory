@@ -8,10 +8,13 @@ import json
 import os
 import random
 import shutil
+import subprocess
 import sys
 import tarfile
 import urllib.request
 from pathlib import Path
+
+from benchmarks import vbench
 
 FOOD101_URL = "https://data.vision.ee.ethz.ch/cvl/food-101.tar.gz"
 FOOD101_ARCHIVE_BYTES = 4_996_278_331
@@ -35,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
         "--prompt",
         default="What food is shown in this image? Answer with the dish name only.",
     )
+    vbench.add_parser(subparsers)
     return parser
 
 
@@ -231,7 +235,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.benchmark == "food101":
             return _materialize_food101(arguments)
-    except (EOFError, OSError, ValueError, tarfile.TarError) as error:
+        if arguments.benchmark == "vbench":
+            return vbench.materialize_from_arguments(arguments)
+    except (
+        EOFError,
+        OSError,
+        ValueError,
+        subprocess.CalledProcessError,
+        tarfile.TarError,
+    ) as error:
         print(f"benchmark error: {error}", file=sys.stderr)
         return 2
     raise AssertionError(arguments.benchmark)
