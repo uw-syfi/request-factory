@@ -3,14 +3,21 @@
 //!
 //! A grid sweep asks you to know the answer before you start: too coarse and the
 //! knee sits in a gap, too fine and most of the points are spent far away from
-//! it. The adaptive modes here ramp by doubling until the boundary flips, bisect
-//! back to locate it, then spend their remaining points *at* the knee, which is
-//! the only part of the curve anyone reads.
+//! it. Every adaptive mode here ramps by doubling and then spends its remaining
+//! points on the part of the curve anyone actually reads.
+//!
+//! **Two of the questions are not the same question.** "What is the highest rate
+//! this deployment keeps up with?" is a boundary, and bisection finds it.  "What
+//! is the most work it will ever do per second?" is a maximum, it lives *past*
+//! that boundary, and it is usually a plateau rather than a point. They get
+//! separate modes because they are separate numbers, and on a server whose batch
+//! grows with load they can be far apart.
 //!
 //! Runs happen in this process, which is what lets a sweep of twenty points pay
 //! for the tokenizer and the hundred-million-token synthetic corpus once.
 
 mod boundary;
+mod peak;
 mod point;
 mod search;
 
@@ -22,6 +29,7 @@ use req_frontend::{Args, ArrivalMode, CorpusCache};
 use serde::Serialize;
 
 use boundary::{AttainmentMetric, Boundary, Measured};
+use peak::{Peak, PeakConfig, PeakSearch};
 use search::{Knee, Phase, Search, SearchConfig};
 
 #[derive(Parser, Debug)]
@@ -32,7 +40,7 @@ use search::{Knee, Phase, Search, SearchConfig};
 )]
 struct SweepArgs {
     /// What this sweep is looking for.
-    #[arg(long, value_enum, default_value = "max-throughput")]
+    #[arg(long, value_enum, default_value = "max-sustainable-rate")]
     mode: Mode,
 
     /// Directory for `sweep.json` and one subdirectory per point.
@@ -60,10 +68,28 @@ struct SweepArgs {
     #[arg(long, default_value_t = 3)]
     densify_points: usize,
 
-    /// `max-throughput`: how far delivered throughput may fall behind the
+    /// `max-sustainable-rate`: how far delivered throughput may fall behind the
     /// offered rate and still count as keeping up.
     #[arg(long, default_value_t = 0.10)]
     max_shortfall: f64,
+
+    /// `peak-throughput`: relative improvement that still counts as rising.
+    #[arg(long, default_value_t = 0.03)]
+    min_gain: f64,
+
+    /// `peak-throughput`: consecutive non-improving points before the ramp
+    /// stops. More than one, so a single noisy run does not end the search.
+    #[arg(long, default_value_t = 2)]
+    patience: usize,
+
+    /// `peak-throughput`: throughput within this fraction of the peak counts as
+    /// being on the plateau.
+    #[arg(long, default_value_t = 0.02)]
+    plateau_tolerance: f64,
+
+    /// `peak-throughput`: which throughput to maximize.
+    #[arg(long, value_enum, default_value = "output-tokens")]
+    peak_metric: PeakMetric,
 
     /// `max-rate-under-slo`: the attainment the run must keep.
     #[arg(long, default_value_t = 0.99)]
@@ -89,8 +115,18 @@ struct SweepArgs {
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
-    /// Ramp until offering more stops buying more served throughput.
-    MaxThroughput,
+    /// The highest rate the server keeps up with: ramp, bisect, densify.
+    ///
+    /// Answers "how much load can this deployment take?". The boundary is
+    /// delivered throughput falling behind the offered rate.
+    MaxSustainableRate,
+    /// The most work the server will ever do per second, wherever that happens.
+    ///
+    /// Answers "how much can this deployment produce?". Deliberately keeps
+    /// ramping past the point where it stopped keeping up, because that is where
+    /// peak throughput lives — and because a server that gets *worse* under more
+    /// load is worth catching.
+    PeakThroughput,
     /// Ramp until SLO attainment falls below the target.
     MaxRateUnderSlo,
     /// Run the declared rates and nothing else.
@@ -101,6 +137,32 @@ enum Mode {
 enum AttainmentChoice {
     Overall,
     DeclaredDeadline,
+}
+
+/// Which throughput `peak-throughput` maximizes.
+///
+/// They peak in different places once output lengths vary: a workload of short
+/// answers maximizes requests per second well before it maximizes tokens.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PeakMetric {
+    OutputTokens,
+    Requests,
+}
+
+impl PeakMetric {
+    fn of(self, metrics: &req_frontend::RunMetrics) -> Option<f64> {
+        match self {
+            Self::OutputTokens => metrics.output_token_throughput_per_s,
+            Self::Requests => metrics.request_throughput_per_s,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::OutputTokens => "output_token_throughput_per_s",
+            Self::Requests => "request_throughput_per_s",
+        }
+    }
 }
 
 /// The whole sweep, as one readable document.
@@ -118,7 +180,13 @@ struct SweepReport {
     points: Vec<ReportPoint>,
     /// The same points sorted by rate: the curve.
     curve: Vec<CurveEntry>,
+    /// Where the server stopped keeping up. Set by the boundary-searching modes.
     knee: Option<Knee>,
+    /// The most work the server produced, and over which rates. Set by
+    /// `peak-throughput`. Distinct from `knee` on purpose: the peak lives past
+    /// the boundary, so the two are different rates and answer different
+    /// questions.
+    peak: Option<Peak>,
     /// Set when any point ran against a server whose carried-over state could
     /// not be cleared, so a reader is not left to infer it from the points.
     contamination_warning: Option<String>,
@@ -180,7 +248,8 @@ async fn main() -> Result<()> {
 
     let report = match args.mode {
         Mode::Grid => run_grid(&args).await?,
-        _ => run_adaptive(&args).await?,
+        Mode::PeakThroughput => run_peak(&args).await?,
+        Mode::MaxSustainableRate | Mode::MaxRateUnderSlo => run_adaptive(&args).await?,
     };
 
     let path = args.out.join("sweep.json");
@@ -194,6 +263,9 @@ async fn main() -> Result<()> {
     }
     if let Some(knee) = &report.knee {
         eprintln!("sweep | knee: {}", describe(knee));
+    }
+    if let Some(peak) = &report.peak {
+        eprintln!("sweep | peak: {}", describe_peak(peak));
     }
     Ok(())
 }
@@ -261,13 +333,13 @@ async fn run_grid(args: &SweepArgs) -> Result<SweepReport> {
             reused,
         });
     }
-    Ok(assemble(args, None, points, None))
+    Ok(assemble(args, None, points, None, None))
 }
 
 /// Ramp, bisect, densify.
 async fn run_adaptive(args: &SweepArgs) -> Result<SweepReport> {
     let boundary = match args.mode {
-        Mode::MaxThroughput => Boundary::MaxThroughput {
+        Mode::MaxSustainableRate => Boundary::MaxSustainableRate {
             max_shortfall: args.max_shortfall,
         },
         Mode::MaxRateUnderSlo => Boundary::MaxRateUnderSlo {
@@ -277,7 +349,9 @@ async fn run_adaptive(args: &SweepArgs) -> Result<SweepReport> {
                 AttainmentChoice::DeclaredDeadline => AttainmentMetric::DeclaredDeadline,
             },
         },
-        Mode::Grid => unreachable!("grid does not search"),
+        Mode::Grid | Mode::PeakThroughput => {
+            unreachable!("neither runs a boundary search")
+        }
     };
 
     let mut search = Search::new(SearchConfig {
@@ -310,7 +384,53 @@ async fn run_adaptive(args: &SweepArgs) -> Result<SweepReport> {
         search.record(rate, verdict.crossed);
     }
 
-    Ok(assemble(args, Some(boundary), points, Some(search.knee())))
+    Ok(assemble(
+        args,
+        Some(boundary),
+        points,
+        Some(search.knee()),
+        None,
+    ))
+}
+
+/// Ramp until throughput stops improving, then draw the top of the curve.
+async fn run_peak(args: &SweepArgs) -> Result<SweepReport> {
+    let mut search = PeakSearch::new(PeakConfig {
+        start_rate: args.start_rate,
+        max_rate: args.max_rate,
+        min_gain: args.min_gain,
+        patience: args.patience,
+        densify_points: args.densify_points,
+        plateau_tolerance: args.plateau_tolerance,
+    });
+    let mut corpus = CorpusCache::new();
+    let mut points: Vec<ReportPoint> = Vec::new();
+
+    while let Some((rate, phase)) = search.next_rate() {
+        let (record, reused) = measure(args, rate, &mut corpus).await?;
+        let Some(throughput) = args.peak_metric.of(&record.metrics) else {
+            bail!(
+                "the run at rate {rate:.6}/s produced no {}, so there is nothing to maximize; \
+                 check {}",
+                args.peak_metric.name(),
+                record.directory,
+            );
+        };
+        eprintln!(
+            "sweep | {phase:?} rate={rate:.6}/s {}={throughput:.4}",
+            args.peak_metric.name()
+        );
+        points.push(ReportPoint {
+            record,
+            phase: Some(phase),
+            crossed: None,
+            verdict: Some(format!("{}={throughput:.4}", args.peak_metric.name())),
+            reused,
+        });
+        search.record(rate, throughput);
+    }
+
+    Ok(assemble(args, None, points, None, Some(search.peak())))
 }
 
 /// Measure one rate, or read back the point a previous sweep completed.
@@ -335,6 +455,7 @@ fn assemble(
     boundary: Option<Boundary>,
     points: Vec<ReportPoint>,
     knee: Option<Knee>,
+    peak: Option<Peak>,
 ) -> SweepReport {
     let mut curve: Vec<CurveEntry> = points
         .iter()
@@ -355,9 +476,11 @@ fn assemble(
 
     SweepReport {
         knob: "rate",
-        objective: boundary
-            .map(|boundary| boundary.objective())
-            .unwrap_or("none"),
+        objective: match (boundary, args.mode) {
+            (Some(boundary), _) => boundary.objective(),
+            (None, Mode::PeakThroughput) => args.peak_metric.name(),
+            _ => "none",
+        },
         boundary,
         config: ReportConfig {
             mode: format!("{:?}", args.mode).to_lowercase(),
@@ -372,6 +495,7 @@ fn assemble(
         points,
         curve,
         knee,
+        peak,
     }
 }
 
@@ -391,6 +515,28 @@ fn contamination_warning(points: &[ReportPoint]) -> Option<String> {
          point's `cache_reset`.",
         points.len(),
     ))
+}
+
+fn describe_peak(peak: &Peak) -> String {
+    let Some(throughput) = peak.peak_throughput else {
+        return format!("{:?}: nothing was measured", peak.outcome);
+    };
+    let decline = match peak.decline_from_peak {
+        // Only worth saying when it is real: a server that got worse under more
+        // load is a finding, and noise around zero is not.
+        Some(decline) if decline > 0.05 => format!(
+            ", falling {:.1}% below it at the highest rate measured",
+            decline * 100.0
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "{:?} {throughput:.4} at {:.6}/s, flat from {:.6}/s to {:.6}/s{decline}",
+        peak.outcome,
+        peak.peak_rate.unwrap_or(f64::NAN),
+        peak.plateau_low_rate.unwrap_or(f64::NAN),
+        peak.plateau_high_rate.unwrap_or(f64::NAN),
+    )
 }
 
 fn describe(knee: &Knee) -> String {
@@ -443,9 +589,14 @@ mod tests {
     #[test]
     fn a_grid_with_no_rates_and_a_search_with_rates_are_both_refused() {
         assert!(validate(&parse(&["--mode", "grid"])).is_err());
-        let error = validate(&parse(&["--mode", "max-throughput", "--rates", "1,2"]))
-            .unwrap_err()
-            .to_string();
+        let error = validate(&parse(&[
+            "--mode",
+            "max-sustainable-rate",
+            "--rates",
+            "1,2",
+        ]))
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("grid"), "{error}");
     }
 

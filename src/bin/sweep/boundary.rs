@@ -1,12 +1,12 @@
 //! What counts as having crossed, and why each mode draws the line where it does.
 //!
 //! The search shape is shared; this is the only thing that differs between
-//! `max-throughput` and `max-rate-under-slo`.
+//! `max-sustainable-rate` and `max-rate-under-slo`.
 //!
 //! **A boundary judges one point, alone.** It is given the run and nothing else
 //! — no history, no neighbours. That restriction is the whole design of this
 //! file, because bisection is only meaningful if the answer for a rate does not
-//! depend on when that rate was measured. The first draft of `max-throughput`
+//! depend on when that rate was measured. The first draft of `max-sustainable-rate`
 //! asked "did throughput rise over the best seen so far", which reads like the
 //! textbook definition of saturation and is order-dependent: the same rate
 //! judged before and after a higher one gives opposite answers, and everything
@@ -42,7 +42,7 @@ pub enum Boundary {
     /// throughput falls short of offered even on a server that kept up
     /// perfectly. Use enough workload units that the span dominates the tail —
     /// the shortfall from this effect is roughly `latency * rate / units`.
-    MaxThroughput {
+    MaxSustainableRate {
         /// How far delivered throughput may fall behind the offered rate and
         /// still count as keeping up. 0.10 means "within 10%".
         max_shortfall: f64,
@@ -75,7 +75,7 @@ impl Boundary {
     /// Judge one point on its own.
     pub fn judge(&self, candidate: &Measured) -> Result<Verdict> {
         match *self {
-            Self::MaxThroughput { max_shortfall } => {
+            Self::MaxSustainableRate { max_shortfall } => {
                 let Some(delivered) = candidate.metrics.request_throughput_per_s else {
                     bail!(
                         "the run at rate {:.6}/s completed no requests, so there is no delivered \
@@ -129,7 +129,7 @@ impl Boundary {
     /// The quantity this sweep is maximizing, named for the report.
     pub fn objective(&self) -> &'static str {
         match self {
-            Self::MaxThroughput { .. } => "request_throughput_per_s",
+            Self::MaxSustainableRate { .. } => "request_throughput_per_s",
             Self::MaxRateUnderSlo { .. } => "slo_attainment",
         }
     }
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn saturation_is_delivered_falling_behind_offered() {
-        let boundary = Boundary::MaxThroughput {
+        let boundary = Boundary::MaxSustainableRate {
             max_shortfall: 0.10,
         };
 
@@ -180,7 +180,7 @@ mod tests {
         // the best throughput seen so far, so measuring 50/s before or after a
         // 200/s point gave opposite answers and the located knee was an artifact
         // of visit order.
-        let boundary = Boundary::MaxThroughput {
+        let boundary = Boundary::MaxSustainableRate {
             max_shortfall: 0.10,
         };
         let point = delivering(60.0, 50.0);
@@ -195,10 +195,10 @@ mod tests {
 
     #[test]
     fn the_shortfall_allowance_is_what_separates_the_two_sides() {
-        let strict = Boundary::MaxThroughput {
+        let strict = Boundary::MaxSustainableRate {
             max_shortfall: 0.01,
         };
-        let loose = Boundary::MaxThroughput {
+        let loose = Boundary::MaxSustainableRate {
             max_shortfall: 0.20,
         };
         let point = delivering(100.0, 90.0);
@@ -211,7 +211,7 @@ mod tests {
     fn a_point_that_completed_nothing_fails_rather_than_reading_as_saturated() {
         // "Crossed" would be the plausible reading, and it would let a broken
         // server or a misconfigured backend masquerade as a located knee.
-        let boundary = Boundary::MaxThroughput {
+        let boundary = Boundary::MaxSustainableRate {
             max_shortfall: 0.10,
         };
         let candidate = Measured {

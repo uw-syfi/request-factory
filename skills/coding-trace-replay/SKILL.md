@@ -135,9 +135,12 @@ was generated at — read the manifest.
 #    ... --trace-tags slo        (the file must then have deadline_ms + priority)
 
 # 6. Find the rate where the server stops keeping up. Ramps, bisects, densifies.
-./target/release/sweep --mode max-throughput --out out/sweep \
+./target/release/sweep --mode max-sustainable-rate --out out/sweep \
   --start-rate 5 --max-rate 800 \
   <every session_runner flag above, except --rate>
+
+# 7. Find the most work it will ever do. A different number, past that rate.
+#    ... --mode peak-throughput
 ```
 
 `--tokenizer` must match the served model: it sizes the synthetic corpus in the
@@ -187,6 +190,14 @@ server's own token space.
 - `slo.declared_deadline` counts only the rows that set `deadline_ms`. Read
   `declared_steps` against the run's total before quoting its rate: an
   almost-empty column produces a rate over a handful of rows.
+- `knee` and `peak` answer different questions and are usually different rates.
+  "How much load can it take" is the knee; "how much can it produce" is the peak,
+  which lives past the knee and is normally a plateau. Quote the one that was
+  asked for, and read `peak.plateau_low_rate` when someone wants the cheapest
+  rate that still reaches peak throughput.
+- `peak.decline_from_peak` above noise means the server got *worse* under more
+  load, not merely no better. That is preemption or thrashing, and it is worth
+  investigating rather than averaging away.
 - A sweep's `knee.outcome` of `never_crossed` or `always_crossed` is a **result**,
   not a failure: the knee is outside the searched range. Neither reports a rate
   at the range's edge as the knee. Widen `--max-rate` / `--min-rate` and re-run —

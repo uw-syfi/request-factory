@@ -1044,7 +1044,7 @@ it, then spends its remaining points **at** the knee.
 ```bash
 cargo build --release --bin sweep
 
-./target/release/sweep --mode max-throughput --out out/sweep \
+./target/release/sweep --mode max-sustainable-rate --out out/sweep \
   --start-rate 5 --max-rate 800 --tolerance 0.05 --densify-points 3 \
   --trace trace/execution.csv --trace-format session \
   --text-file corpus.txt --tokenizer <hf-model-or-path> --model <served-name> \
@@ -1057,31 +1057,78 @@ instead of twenty times.
 
 ### Modes
 
-| `--mode` | Crossed when |
-| --- | --- |
-| `max-throughput` | delivered request throughput fell more than `--max-shortfall` behind the offered rate |
-| `max-rate-under-slo` | SLO attainment fell below `--target-attainment` |
-| `grid` | never — `--rates 1,2,4,8` are run and reported, no search |
+| `--mode` | Question | Answer shape |
+| --- | --- | --- |
+| `max-sustainable-rate` | how much load can this deployment take? | one rate: `knee` |
+| `peak-throughput` | how much work can it produce? | a value and a rate span: `peak` |
+| `max-rate-under-slo` | how much load can it take *and still be acceptable*? | one rate: `knee` |
+| `grid` | run these rates | no search |
+
+**The first two are not the same question, and usually not the same rate.** The
+sustainable rate is where the server stops keeping up. Peak throughput lives
+*past* that point — on a server whose batch grows with load, throughput keeps
+climbing long after latency has stopped being acceptable — and it is normally a
+plateau rather than a point. Reporting one number for both would answer
+whichever question you did not ask.
+
+#### `max-sustainable-rate`
+
+Crossed when delivered request throughput falls more than `--max-shortfall`
+behind the offered rate. Ramp, bisect, densify.
 
 **A boundary judges one point, alone** — no history, no neighbours. That
-restriction is deliberate. "Throughput stopped rising over the best seen so far"
-reads like the textbook definition of saturation and is order-dependent: the same
-rate judged before and after a higher one gives opposite answers, and everything
-a bisection then concludes is an artifact of visit order. Stating it as
-*delivered against offered* is both order-independent and the more direct claim —
-a saturated server is one that cannot complete work as fast as it arrives.
+restriction is deliberate, and it came from getting it wrong first. "Throughput
+stopped rising over the best seen so far" reads like the textbook definition of
+saturation and is order-dependent: the same rate judged before and after a higher
+one gives opposite answers, so a bisection narrows on an artifact of visit order.
+Sorting the points by rate fixes the order-dependence but not the deeper problem
+— a *relative-gain* test is not a property of a rate at all, but of that rate
+plus whichever lower rates you happened to measure, and bisection's whole job is
+to keep changing that set. On the verified curve below, the relative-gain
+formulation puts the knee at ~80/s where the true value is ~48/s, purely because
+the doubling ramp landed on 80.
 
-One artifact to know about in `max-throughput`: the run window runs from the
-first submission to the last completion, so it always includes one request's
-latency after the last arrival. Delivered throughput therefore falls short of
-offered by roughly `latency × rate / units` even on a server that kept up
-perfectly. Use enough workload units that the arrival span dominates that tail.
+Stating it as *delivered against offered* is order-independent, grid-independent,
+and the more direct claim: a saturated server is one that cannot complete work as
+fast as it arrives. It is also exactly the sorted-curve test — the delivered
+curve's distance from `y = x` — expressed so one point can be judged without its
+neighbours.
 
-For `max-rate-under-slo`, `--attainment-metric declared-deadline` watches the
-trace's own per-request deadlines instead of the run-level objective. Either way
-the run must have an objective; a sweep whose every point reports `null`
-attainment fails rather than ramping to the ceiling and announcing a knee it
-never tested for.
+One artifact to know about: the run window runs from the first submission to the
+last completion, so it always includes one request's latency after the last
+arrival. Delivered throughput therefore falls short of offered by roughly
+`latency × rate / units` even on a server that kept up perfectly. Use enough
+workload units that the arrival span dominates that tail.
+
+#### `peak-throughput`
+
+Ramps while throughput keeps improving by `--min-gain`, stopping after
+`--patience` consecutive points that do not — more than one, so a single noisy
+run does not end the search. It deliberately keeps going past the sustainable
+rate, because that is where the peak is.
+
+Reported as a region: `peak_throughput` and the rate that produced it, plus
+`plateau_low_rate` / `plateau_high_rate`, the *contiguous* span within
+`--plateau-tolerance` of the peak. The lower edge is the actionable number — the
+cheapest rate that still gets peak throughput — so densification spends its
+points closing the octave-wide gap below it rather than drawing more of the flat
+top.
+
+`decline_from_peak` is how far throughput at the highest rate measured had fallen
+below the peak. Positive beyond noise means the server got *worse* under more
+load — preemption, cache thrashing — which is a finding a sweep that stopped at
+the knee could never make.
+
+`--peak-metric` chooses `output-tokens` (default) or `requests`. With variable
+output lengths these peak in different places.
+
+#### `max-rate-under-slo`
+
+Crossed when SLO attainment falls below `--target-attainment`.
+`--attainment-metric declared-deadline` watches the trace's own per-request
+deadlines instead of the run-level objective. Either way the run must have an
+objective; a sweep whose every point reports `null` attainment fails rather than
+ramping to the ceiling and announcing a knee it never tested for.
 
 ### What comes out
 
@@ -1093,20 +1140,34 @@ phase that asked for each rate, the verdict in words, and the located knee:
 {
   "knob": "rate",
   "objective": "request_throughput_per_s",
-  "boundary": { "mode": "max-throughput", "max_shortfall": 0.1 },
+  "boundary": { "mode": "max-sustainable-rate", "max_shortfall": 0.1 },
   "knee": {
     "outcome": "located",
     "last_good_rate": 47.5,
     "first_bad_rate": 50.0,
     "bracket_width": 0.05
-  }
+  },
+  "peak": null
 }
 ```
 
-Three outcomes, and the two that are not `located` are findings rather than
+`knee` is set by the boundary-searching modes and `peak` by `peak-throughput`;
+they are separate fields because they are separate answers.
+
+Three knee outcomes, and the two that are not `located` are findings rather than
 failures: `never_crossed` means the knee is above `--max-rate`, and
 `always_crossed` means it is below `--min-rate`. Neither is reported as a knee at
-the range's edge, because that would be a fabrication.
+the range's edge, because that would be a fabrication. `peak` likewise reports
+`still_rising_at_max_rate` rather than calling the ceiling's throughput the peak.
+
+Both modes run against `tools/stub_server.py --capacity 4 --chunk-delay-ms 2`
+(400 requests × 40 tokens, so capacity is arithmetic) give the two different
+answers they should:
+
+| mode | answer |
+| --- | --- |
+| `max-sustainable-rate` | knee bracketed to [47.5, 50.0]/s |
+| `peak-throughput` | 43.3 req/s, flat from 50/s to 320/s |
 
 Each point gets its own directory under `points/rate_*/` with the full
 `requests.jsonl`, `summary.json` and `timeline.parquet` of that run, plus a
@@ -1326,7 +1387,8 @@ A context-limit skip always ends its session, independently of this flag.
 │   │   └── policy.rs         context-policy arithmetic (generation-time only)
 │   ├── bin/sweep/
 │   │   ├── main.rs           CLI, orchestration, sweep.json
-│   │   ├── search.rs         ramp -> bisect -> densify, as a state machine
+│   │   ├── search.rs         ramp -> bisect -> densify: locate a boundary
+│   │   ├── peak.rs           ramp past it: locate a maximum and its plateau
 │   │   ├── boundary.rs       what "crossed" means, judged one point at a time
 │   │   └── point.rs          one point: reset the server, run, record, resume
 │   ├── executor/
