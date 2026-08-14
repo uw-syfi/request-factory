@@ -214,7 +214,7 @@ def _output_paths(
     output = _block(root, "output")
     _reject_unknown(
         output,
-        {"directory", "requests", "summary", "timeline", "terminal"},
+        {"directory", "requests", "summary", "timeline", "terminal", "artifacts"},
         "output",
     )
     directory = _resolve_path(
@@ -226,10 +226,11 @@ def _output_paths(
         "summary": _optional_string(output, "summary", "output", "summary.json"),
         "timeline": _optional_string(output, "timeline", "output", "timeline.parquet"),
         "terminal": _optional_string(output, "terminal", "output", "terminal.log"),
+        "artifacts": _optional_string(output, "artifacts", "output", "artifacts"),
     }
     for name, filename in filenames.items():
         if Path(filename).name != filename:
-            raise ConfigError(f"output.{name} must be a filename, not a path")
+            raise ConfigError(f"output.{name} must be a single path component")
     return directory, {
         name: directory / filename for name, filename in filenames.items()
     }
@@ -300,9 +301,9 @@ def _build_common_run_arguments(
             raise ConfigError(
                 "corpus is text-replay-only and must be omitted for multimodal-independent-v1"
             )
-        if backend != "openai-chat":
+        if backend not in {"openai-chat", "openai-images", "openai-speech"}:
             raise ConfigError(
-                "multimodal-independent-v1 requires server.backend: openai-chat"
+                "multimodal-independent-v1 requires server.backend: openai-chat, openai-images, or openai-speech"
             )
         if context:
             raise ConfigError(
@@ -360,6 +361,8 @@ def _build_common_run_arguments(
             "--tokenizer",
             tokenizer,
         ]
+    else:
+        arguments.extend(["--output-artifact-dir", str(paths["artifacts"])])
     if tags:
         arguments.extend(["--trace-tags", ",".join(tags)])
     _append_option(

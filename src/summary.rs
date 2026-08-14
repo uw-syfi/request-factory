@@ -52,6 +52,20 @@ pub(crate) struct CommonReplaySummary {
     run_duration_ms: Option<f64>,
     request_throughput_per_s: Option<f64>,
     output_token_throughput_per_s: Option<f64>,
+    output_bytes: usize,
+    output_byte_throughput_per_s: Option<f64>,
+    media_output_steps: usize,
+    first_output_ms_avg: Option<f64>,
+    first_output_ms_p50: Option<f64>,
+    first_output_ms_p90: Option<f64>,
+    first_output_ms_max: Option<f64>,
+    audio_duration_s: f64,
+    audio_throughput_s_per_s: Option<f64>,
+    real_time_factor_measured_steps: usize,
+    real_time_factor_avg: Option<f64>,
+    real_time_factor_p50: Option<f64>,
+    real_time_factor_p90: Option<f64>,
+    real_time_factor_max: Option<f64>,
     tpot_measured_steps: usize,
     tpot_ms_avg: Option<f64>,
     tpot_ms_p50: Option<f64>,
@@ -75,9 +89,13 @@ struct ReplayMeasurements {
     ttfts_ms: Vec<f64>,
     tpots_ms: Vec<f64>,
     completion_amortized_tpots_ms: Vec<f64>,
+    first_outputs_ms: Vec<f64>,
+    real_time_factors: Vec<f64>,
     first_submit_timestamp: Option<f64>,
     last_complete_timestamp: Option<f64>,
     successful_output_tokens: usize,
+    successful_output_bytes: usize,
+    successful_audio_duration_ms: f64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -158,12 +176,18 @@ impl CommonReplaySummary {
         if outcome.is_context_overflow() {
             self.context_overflow_steps += 1;
         }
-        self.target_output_tokens += output_len_target;
-        self.actual_output_tokens += outcome.output_len_actual;
-        if outcome.is_success() && outcome.output_len_actual != output_len_target {
-            self.output_mismatch_steps += 1;
-            self.output_token_delta += outcome.output_len_actual as i64 - output_len_target as i64;
+        if outcome.output_modality == crate::schema::Modality::Text {
+            self.target_output_tokens += output_len_target;
+            self.actual_output_tokens += outcome.output_len_actual;
+            if outcome.is_success() && outcome.output_len_actual != output_len_target {
+                self.output_mismatch_steps += 1;
+                self.output_token_delta +=
+                    outcome.output_len_actual as i64 - output_len_target as i64;
+            }
+        } else {
+            self.media_output_steps += 1;
         }
+        self.output_bytes += outcome.output_bytes;
         self.total_duration_ms_sum += outcome.total_duration_ms;
         if outcome.first_token_id_ms.is_some() {
             self.ttft_token_id_steps += 1;
@@ -195,6 +219,33 @@ impl CommonReplaySummary {
             self.ttft_ms_p50 = Some(percentile_sorted(&measurements.ttfts_ms, 0.50));
             self.ttft_ms_p90 = Some(percentile_sorted(&measurements.ttfts_ms, 0.90));
             self.ttft_ms_max = measurements.ttfts_ms.last().copied();
+        }
+
+        if !measurements.first_outputs_ms.is_empty() {
+            measurements
+                .first_outputs_ms
+                .sort_by(|left, right| left.total_cmp(right));
+            let sum: f64 = measurements.first_outputs_ms.iter().sum();
+            self.first_output_ms_avg = Some(sum / measurements.first_outputs_ms.len() as f64);
+            self.first_output_ms_p50 =
+                Some(percentile_sorted(&measurements.first_outputs_ms, 0.50));
+            self.first_output_ms_p90 =
+                Some(percentile_sorted(&measurements.first_outputs_ms, 0.90));
+            self.first_output_ms_max = measurements.first_outputs_ms.last().copied();
+        }
+
+        if !measurements.real_time_factors.is_empty() {
+            measurements
+                .real_time_factors
+                .sort_by(|left, right| left.total_cmp(right));
+            self.real_time_factor_measured_steps = measurements.real_time_factors.len();
+            let sum: f64 = measurements.real_time_factors.iter().sum();
+            self.real_time_factor_avg = Some(sum / self.real_time_factor_measured_steps as f64);
+            self.real_time_factor_p50 =
+                Some(percentile_sorted(&measurements.real_time_factors, 0.50));
+            self.real_time_factor_p90 =
+                Some(percentile_sorted(&measurements.real_time_factors, 0.90));
+            self.real_time_factor_max = measurements.real_time_factors.last().copied();
         }
 
         if !measurements.tpots_ms.is_empty() {
@@ -239,6 +290,10 @@ impl CommonReplaySummary {
                 self.request_throughput_per_s = Some(self.success_steps as f64 / duration_s);
                 self.output_token_throughput_per_s =
                     Some(measurements.successful_output_tokens as f64 / duration_s);
+                self.output_byte_throughput_per_s =
+                    Some(measurements.successful_output_bytes as f64 / duration_s);
+                self.audio_duration_s = measurements.successful_audio_duration_ms / 1_000.0;
+                self.audio_throughput_s_per_s = Some(self.audio_duration_s / duration_s);
             }
         }
     }
@@ -251,6 +306,9 @@ impl ReplayMeasurements {
             self.ttfts_ms.push(ttft_ms);
         } else if let Some(ttft_ms) = outcome.first_token_ms {
             self.ttfts_ms.push(ttft_ms);
+        }
+        if let Some(first_output_ms) = outcome.first_output_ms {
+            self.first_outputs_ms.push(first_output_ms);
         }
         self.first_submit_timestamp = Some(
             self.first_submit_timestamp
@@ -269,6 +327,11 @@ impl ReplayMeasurements {
             return;
         }
         self.successful_output_tokens += outcome.output_len_actual;
+        self.successful_output_bytes += outcome.output_bytes;
+        self.successful_audio_duration_ms += outcome.output_duration_ms.unwrap_or(0.0);
+        if let Some(real_time_factor) = outcome.real_time_factor {
+            self.real_time_factors.push(real_time_factor);
+        }
         if let Some(tpot_ms) = outcome.token_delivery_tpot_ms {
             self.tpots_ms.push(tpot_ms);
         }
@@ -349,6 +412,12 @@ pub struct RunMetrics {
     pub run_duration_ms: Option<f64>,
     pub request_throughput_per_s: Option<f64>,
     pub output_token_throughput_per_s: Option<f64>,
+    pub output_byte_throughput_per_s: Option<f64>,
+    pub audio_throughput_s_per_s: Option<f64>,
+    pub real_time_factor_p50: Option<f64>,
+    pub real_time_factor_p90: Option<f64>,
+    pub first_output_ms_p50: Option<f64>,
+    pub first_output_ms_p90: Option<f64>,
     pub ttft_ms_p50: Option<f64>,
     pub ttft_ms_p90: Option<f64>,
     pub tpot_ms_p50: Option<f64>,
@@ -388,6 +457,12 @@ impl RunSummary {
             run_duration_ms: common.run_duration_ms,
             request_throughput_per_s: common.request_throughput_per_s,
             output_token_throughput_per_s: common.output_token_throughput_per_s,
+            output_byte_throughput_per_s: common.output_byte_throughput_per_s,
+            audio_throughput_s_per_s: common.audio_throughput_s_per_s,
+            real_time_factor_p50: common.real_time_factor_p50,
+            real_time_factor_p90: common.real_time_factor_p90,
+            first_output_ms_p50: common.first_output_ms_p50,
+            first_output_ms_p90: common.first_output_ms_p90,
             ttft_ms_p50: common.ttft_ms_p50,
             ttft_ms_p90: common.ttft_ms_p90,
             tpot_ms_p50: common.tpot_ms_p50,
@@ -568,6 +643,7 @@ mod tests {
         };
         GenerationOutcome {
             request_id: request_id.to_string(),
+            output_modality: crate::schema::Modality::Text,
             output_len_actual,
             output_len_text_tokens: output_len_actual,
             echoed_prompt_tokens: 0,
@@ -576,6 +652,13 @@ mod tests {
             submit_timestamp,
             post_timestamp: Some(submit_timestamp),
             complete_timestamp,
+            first_output_ms: first_token_ms,
+            last_output_ms: None,
+            output_bytes: output_len_actual,
+            output_chunk_count: output_len_actual,
+            output_duration_ms: None,
+            real_time_factor: None,
+            artifact_path: None,
             first_token_ms,
             first_token_id_ms: first_token_ms,
             last_token_id_ms: None,
@@ -687,6 +770,33 @@ mod tests {
         summary.finalize(&mut measurements);
 
         assert_close(summary.completion_amortized_tpot_ms_avg, 100.0 / 3.0);
+    }
+
+    #[test]
+    fn media_outputs_report_bytes_first_output_audio_throughput_and_rtf() {
+        let mut media = outcome("audio", 10.0, 12.0, 500.0, None, 0, "SUCCESS");
+        media.output_modality = crate::schema::Modality::Audio;
+        media.first_output_ms = Some(100.0);
+        media.last_output_ms = Some(450.0);
+        media.output_bytes = 48_000;
+        media.output_chunk_count = 4;
+        media.output_duration_ms = Some(1_000.0);
+        media.real_time_factor = Some(0.5);
+
+        let mut summary = CommonReplaySummary::default();
+        let mut measurements = ReplayMeasurements::default();
+        summary.add(0, &media);
+        measurements.add(&media);
+        summary.finalize(&mut measurements);
+
+        assert_eq!(summary.media_output_steps, 1);
+        assert_eq!(summary.output_bytes, 48_000);
+        assert_eq!(summary.first_output_ms_p50, Some(100.0));
+        assert_eq!(summary.real_time_factor_p50, Some(0.5));
+        assert_eq!(summary.audio_duration_s, 1.0);
+        assert_eq!(summary.audio_throughput_s_per_s, Some(0.5));
+        assert_eq!(summary.output_byte_throughput_per_s, Some(24_000.0));
+        assert_eq!(summary.target_output_tokens, 0);
     }
 
     #[test]

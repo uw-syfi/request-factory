@@ -51,7 +51,7 @@ RunSummary（可选写入 summary JSON，同时返回给 caller）
 | format loader | 文件内容是否符合声明？ | typed rows / grouped sessions |
 | workload | 本次 run 如何使用这些已验证内容？ | `ReplayWorkload` |
 | executor | 每个 workload unit 何时以及按何种依赖执行？ | concrete generation attempt |
-| backend | 怎样发送请求并统一解释 stream？ | `GenerationResult` |
+| backend | 怎样发送请求并统一解释 text/media stream？ | `GenerationResult` |
 | output | 实际发生了什么？ | `StepLog`、timeline、`RunSummary` |
 
 ## 2. 用户接口是 task + structured YAML
@@ -352,7 +352,9 @@ GenRequest {
 3. 将 wire objects 标准化为 `StreamEvent`；
 4. 折叠 text、token ids、usage、finish reason 与错误；
 5. 检查 prompt echo 和 token accounting；
-6. 返回 backend-neutral `GenerationResult`。
+6. 返回 backend-neutral `GenerationResult`。生成媒体由 `media_client.rs` 统一
+   JSON image、chat audio delta 与 raw PCM，记录 first-output、bytes、duration、
+   RTF、artifact 和 timeline。
 
 ```rust
 GenerationResult {
@@ -443,7 +445,8 @@ timings，并不是 schema loader 或 executor 的 owner。
 | `executor/` | arrival release、session dependency、admission、request lifecycle |
 | `tokens.rs` | concrete token ids 与 session context carry-forward |
 | `backend/wire/` | protocol-specific JSON shaping/parsing |
-| `backend/client.rs` | shared HTTP streaming engine 与 integrity measurements |
+| `backend/client.rs` | shared token/text HTTP streaming engine 与 integrity measurements |
+| `backend/media_client.rs` | generated image/audio transport 与 modality-neutral measurements |
 | `record.rs` | per-step source + outcome JSONL contract |
 | `timeline.rs` | optional per-event recording |
 | `summary.rs` | replay、runtime、timeline 与 run-level aggregation |

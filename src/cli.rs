@@ -14,6 +14,10 @@ pub enum BackendKind {
     SglangTokens,
     /// OpenAI-compatible `/chat/completions` with interleaved text/media input.
     OpenaiChat,
+    /// OpenAI-compatible `/images/generations` for text-to-image generation.
+    OpenaiImages,
+    /// OpenAI-compatible `/audio/speech` with raw PCM streaming output.
+    OpenaiSpeech,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -90,6 +94,11 @@ pub struct Args {
 
     #[arg(long, default_value = "session_runner_output.jsonl")]
     pub log_path: String,
+
+    /// Optional directory for generated image/audio artifacts. Measurements are
+    /// taken before artifact writes so local storage cannot inflate latency.
+    #[arg(long)]
+    pub output_artifact_dir: Option<String>,
 
     /// Cap on synthetic token-pool size. Defaults to cover the workload's longest prompt with
     /// headroom, so synthetic content never repeats within a single request.

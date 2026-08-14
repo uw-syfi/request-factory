@@ -8,7 +8,10 @@ of modalities.
 
 `schema::RequestSpec` contains an ordered list of `InputPart` values and one or
 more `OutputSpec` values. Both enums currently cover text, image, audio, video,
-and tensor data. Repeated and mixed inputs are legal.
+and tensor data. Repeated and mixed inputs are legal. A role-aware `system`
+input is text for capability checking, must precede every user input, and is
+encoded as a system message by chat transports. Plain prompt transports ignore
+it, which lets one text-to-audio artifact target both chat and speech APIs.
 
 On disk, `multimodal-independent-v1` is JSON Lines with one `RequestSpec` per
 non-empty line. The loader validates every record, unique IDs, and nondecreasing
@@ -20,6 +23,7 @@ inside a CSV cell.
   "id": "example-1",
   "arrival_time_ms": 0,
   "inputs": [
+    {"type": "system", "text": "Answer precisely."},
     {
       "type": "image",
       "asset": {
@@ -45,7 +49,7 @@ test.
 The execution path has three independently extensible pieces:
 
 ```text
-InputPart encoders -> protocol/backend adapter -> output observers
+InputPart encoders -> protocol/backend adapter -> modality-neutral output events
 ```
 
 A protocol adapter publishes a `CapabilityProfile`: accepted input modalities,
@@ -66,7 +70,8 @@ Most benchmark additions should contain only a Python materializer and fixture:
 1. deterministically select source examples;
 2. emit canonical requests and immutable asset references;
 3. emit provenance, including source URL/revision and hashes;
-4. choose an existing backend adapter;
+4. choose an existing backend adapter (`openai-chat`, `openai-images`, or
+   `openai-speech`) and validate its input/output capability set;
 5. test conversion against a tiny checked-in fixture and a downloaded source
    sample.
 
@@ -78,7 +83,9 @@ that case:
 2. teach the relevant protocol adapter to encode or observe it;
 3. add it to that adapter's `CapabilityProfile`;
 4. add wire-shape and mock-server tests;
-5. update this document and the backend support table.
+5. expose first-output, byte, duration, and artifact metadata through the shared
+outcome rather than introducing benchmark-only timing fields;
+6. update this document and the backend support table.
 
 `assets::AssetStore` resolves asset paths relative to the request artifact,
 verifies SHA-256 and MIME declarations, caches immutable bytes, and can produce

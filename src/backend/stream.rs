@@ -165,6 +165,8 @@ impl StreamAccumulator {
                 // quiet lie where a clamped one is an obvious one.
                 tokens: u16::try_from(delivered_tokens).unwrap_or(u16::MAX),
                 cumulative_tokens: u32::try_from(self.output_token_ids.len()).unwrap_or(u32::MAX),
+                bytes: 0,
+                cumulative_bytes: 0,
             });
         }
         ControlFlow::Continue(())
@@ -321,18 +323,24 @@ mod tests {
                     kind: EventKind::Tokens,
                     tokens: 3,
                     cumulative_tokens: 3,
+                    bytes: 0,
+                    cumulative_bytes: 0,
                 },
                 TimelineEvent {
                     elapsed_ms: 120.0,
                     kind: EventKind::Usage,
                     tokens: 0,
                     cumulative_tokens: 3,
+                    bytes: 0,
+                    cumulative_bytes: 0,
                 },
                 TimelineEvent {
                     elapsed_ms: 140.0,
                     kind: EventKind::Tokens,
                     tokens: 1,
                     cumulative_tokens: 4,
+                    bytes: 0,
+                    cumulative_bytes: 0,
                 },
             ]
         );

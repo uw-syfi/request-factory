@@ -62,16 +62,31 @@ impl AssetRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputPart {
-    Text { text: String },
-    Image { asset: AssetRef },
-    Audio { asset: AssetRef },
-    Video { asset: AssetRef },
-    Tensor { asset: AssetRef },
+    /// A chat-level instruction. It must precede every user input part.
+    System {
+        text: String,
+    },
+    Text {
+        text: String,
+    },
+    Image {
+        asset: AssetRef,
+    },
+    Audio {
+        asset: AssetRef,
+    },
+    Video {
+        asset: AssetRef,
+    },
+    Tensor {
+        asset: AssetRef,
+    },
 }
 
 impl InputPart {
     pub fn modality(&self) -> Modality {
         match self {
+            Self::System { .. } => Modality::Text,
             Self::Text { .. } => Modality::Text,
             Self::Image { .. } => Modality::Image,
             Self::Audio { .. } => Modality::Audio,
@@ -82,7 +97,7 @@ impl InputPart {
 
     pub fn asset(&self) -> Option<&AssetRef> {
         match self {
-            Self::Text { .. } => None,
+            Self::System { .. } | Self::Text { .. } => None,
             Self::Image { asset }
             | Self::Audio { asset }
             | Self::Video { asset }
@@ -92,15 +107,17 @@ impl InputPart {
 
     fn validate(&self, at: &str) -> Result<()> {
         match self {
-            Self::Text { text } if text.is_empty() => bail!("{at}: text must not be empty"),
-            Self::Text { .. } => Ok(()),
+            Self::System { text } | Self::Text { text } if text.trim().is_empty() => {
+                bail!("{at}: text must not be empty")
+            }
+            Self::System { .. } | Self::Text { .. } => Ok(()),
             _ => self.asset().expect("media input has an asset").validate(at),
         }
     }
 }
 
 /// Requested output with controls expressed in that modality's natural units.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputSpec {
     Text {
@@ -112,11 +129,26 @@ pub enum OutputSpec {
         steps: usize,
         #[serde(default = "one")]
         count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cfg_scale: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cfg_img_scale: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cfg_renorm_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cfg_interval: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<u64>,
     },
     Audio {
         sample_rate_hz: u32,
+        /// Backend-native cap on generated audio tokens, when supported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_samples: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice: Option<String>,
     },
     Video {
         width: u32,
@@ -153,11 +185,38 @@ impl OutputSpec {
                 height,
                 steps,
                 count,
-            } => *width > 0 && *height > 0 && *steps > 0 && *count > 0,
+                cfg_scale,
+                cfg_img_scale,
+                cfg_renorm_type,
+                cfg_interval,
+                ..
+            } => {
+                *width > 0
+                    && *height > 0
+                    && *steps > 0
+                    && *count > 0
+                    && cfg_scale.is_none_or(|value| value.is_finite() && value > 0.0)
+                    && cfg_img_scale.is_none_or(|value| value.is_finite() && value > 0.0)
+                    && cfg_renorm_type
+                        .as_deref()
+                        .is_none_or(|value| !value.trim().is_empty())
+                    && cfg_interval.is_none_or(|[start, end]| {
+                        start.is_finite() && end.is_finite() && start >= 0.0 && start <= end
+                    })
+            }
             Self::Audio {
                 sample_rate_hz,
+                max_tokens,
                 max_samples,
-            } => *sample_rate_hz > 0 && max_samples.is_none_or(|samples| samples > 0),
+                voice,
+            } => {
+                *sample_rate_hz > 0
+                    && max_tokens.is_none_or(|tokens| tokens > 0)
+                    && max_samples.is_none_or(|samples| samples > 0)
+                    && voice
+                        .as_deref()
+                        .is_none_or(|value| !value.trim().is_empty())
+            }
             Self::Video {
                 width,
                 height,
@@ -243,6 +302,14 @@ impl RequestSpec {
         for (index, input) in self.inputs.iter().enumerate() {
             input.validate(&format!("{at}.inputs[{index}]"))?;
         }
+        if self
+            .inputs
+            .iter()
+            .skip_while(|input| matches!(input, InputPart::System { .. }))
+            .any(|input| matches!(input, InputPart::System { .. }))
+        {
+            bail!("{at}: system inputs must precede all user inputs");
+        }
         for (index, output) in self.outputs.iter().enumerate() {
             output.validate(&format!("{at}.outputs[{index}]"))?;
         }
@@ -297,7 +364,9 @@ mod tests {
                 OutputSpec::Text { max_tokens: 64 },
                 OutputSpec::Audio {
                     sample_rate_hz: 24_000,
+                    max_tokens: None,
                     max_samples: None,
+                    voice: None,
                 },
             ],
         };
@@ -333,6 +402,43 @@ mod tests {
         }
         .validate("output")
         .is_err());
+        assert!(OutputSpec::Audio {
+            sample_rate_hz: 24_000,
+            max_tokens: Some(0),
+            max_samples: None,
+            voice: None,
+        }
+        .validate("output")
+        .is_err());
+    }
+
+    #[test]
+    fn system_inputs_are_text_but_must_precede_user_content() {
+        let mut request = RequestSpec {
+            id: "speech-1".into(),
+            arrival_time_ms: 0.0,
+            inputs: vec![
+                InputPart::System {
+                    text: "Speak clearly.".into(),
+                },
+                InputPart::Text {
+                    text: "Hello".into(),
+                },
+            ],
+            outputs: vec![OutputSpec::Audio {
+                sample_rate_hz: 24_000,
+                max_tokens: Some(256),
+                max_samples: None,
+                voice: None,
+            }],
+        };
+        request.validate("request").unwrap();
+        assert_eq!(
+            request.input_modalities(),
+            [Modality::Text].into_iter().collect()
+        );
+        request.inputs.swap(0, 1);
+        assert!(request.validate("request").is_err());
     }
 
     #[test]
@@ -365,6 +471,11 @@ mod tests {
             height: 512,
             steps: 20,
             count: 1,
+            cfg_scale: None,
+            cfg_img_scale: None,
+            cfg_renorm_type: None,
+            cfg_interval: None,
+            seed: None,
         }];
         assert!(profile.validate(&request).is_err());
     }

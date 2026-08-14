@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::backend::GenerationClient;
+use crate::backend::{GenerationClient, MediaClient};
 use crate::cli::Args;
 use crate::executor::{
     prepare_multimodal_requests, run_independent_request, run_multimodal_request, run_session,
@@ -332,7 +332,7 @@ async fn run_multimodal(
     // All reads, hashes, MIME inference, and base64 encoding happen before the
     // run clock starts, so request timing contains transport/server work rather
     // than benchmark setup.
-    let prepared = prepare_multimodal_requests(&args.trace, requests)?;
+    let prepared = prepare_multimodal_requests(&args.trace, args.backend, requests)?;
     let total_steps = prepared.len();
     let common = CommonState {
         policy: RunPolicy::from_args(args),
@@ -347,7 +347,17 @@ async fn run_multimodal(
     };
     let state = Arc::new(MultimodalState {
         common,
-        client: Arc::new(GenerationClient::new_chat(args)?),
+        text_client: (args.backend == crate::cli::BackendKind::OpenaiChat)
+            .then(|| GenerationClient::new_chat(args).map(Arc::new))
+            .transpose()?,
+        media_client: matches!(
+            args.backend,
+            crate::cli::BackendKind::OpenaiChat
+                | crate::cli::BackendKind::OpenaiImages
+                | crate::cli::BackendKind::OpenaiSpeech
+        )
+        .then(|| MediaClient::new(args).map(Arc::new))
+        .transpose()?,
     });
 
     const TIMELINE_QUEUE_REQUESTS: usize = 4_096;
@@ -438,9 +448,14 @@ fn validate(args: &Args) -> Result<()> {
     }
     let format = InputFileFormat::parse(&args.input_file_format)?;
     if format == InputFileFormat::MultimodalIndependentV1 {
-        if args.backend != crate::cli::BackendKind::OpenaiChat {
+        if !matches!(
+            args.backend,
+            crate::cli::BackendKind::OpenaiChat
+                | crate::cli::BackendKind::OpenaiImages
+                | crate::cli::BackendKind::OpenaiSpeech
+        ) {
             return Err(anyhow!(
-                "multimodal-independent-v1 requires --backend openai-chat"
+                "multimodal-independent-v1 requires --backend openai-chat, openai-images, or openai-speech"
             ));
         }
         if args.max_model_len.is_some() || args.skip_when_reaching_limit {
@@ -448,9 +463,14 @@ fn validate(args: &Args) -> Result<()> {
                 "context-token guards are text-replay-only and cannot be used with multimodal-independent-v1"
             ));
         }
-    } else if args.backend == crate::cli::BackendKind::OpenaiChat {
+    } else if matches!(
+        args.backend,
+        crate::cli::BackendKind::OpenaiChat
+            | crate::cli::BackendKind::OpenaiImages
+            | crate::cli::BackendKind::OpenaiSpeech
+    ) {
         return Err(anyhow!(
-            "--backend openai-chat requires multimodal-independent-v1"
+            "generated-media and chat backends require multimodal-independent-v1"
         ));
     }
     Ok(())
