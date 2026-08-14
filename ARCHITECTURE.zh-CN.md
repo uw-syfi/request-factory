@@ -1,386 +1,444 @@
-# req-frontend：从输入文件到测量报告
+# req-frontend：从输入文件到 replay 报告
 
-本文自底向上解释 `req-frontend` 的术语、目录边界和实际 wiring。它描述当前代码，
-不是未来设计草案。
+本文解释 `req-frontend` 自己的端到端数据流：一次 run 如何声明输入文件、解析并验证
+rows、构造 replay workload、按时间 release 请求、与 serving backend 交互，最后写出日志与
+汇总。SLO、priority、session 和 speculative 都是这条主线上的局部语义，不是架构主轴。
 
-## 一条 request 经过哪些层
+## 1. 一次 run 的完整路径
+
+`runner::run_once_reusing` 是 wiring root。正常运行依次经过：
 
 ```text
-CSV cells
-  ↓
+YAML config
+  │ launcher：validate → resolve paths → build argv
+  ▼
+Rust Args
+  │
+  ├─ parse --input-file-format + --trace-tag
+  ▼
 InputFileSchema
-  = InputFileFormat + TraceTag[]
-  ↓
-schema/format/*：读取、反序列化、验证
-  ↓
-IndependentRequest 或 SessionPlans<SessionRound>
-  ↓
-workload.rs：选择 loader、截断、缩放 arrival、统计 workload
-  ↓
-executor/：按 independent 或 session 语义 release
-  ↓
-tokens.rs：构造实际 token ids
-  ↓
-backend/：发送 HTTP、折叠 stream events
-  ↓
-record.rs + timeline.rs：记录 per-request / per-event 事实
-  ↓
-slo.rs + summary.rs：比较声明值与测量值并聚合
+  │  声明整份文件的 format、request family、合法 columns
+  ▼
+format::<family>::load(path, schema)
+  │  header validation → CSV decoding → row validation → structural validation
+  ▼
+typed file contents
+  ├─ Vec<IndependentRequest>
+  └─ SessionPlans = Vec<(session_id, Vec<SessionRound>)>
+  ▼
+ReplayWorkload
+  │  --max-items、--rate、arrival mode、workload summary
+  ▼
+executor
+  │  arrival wait → admission → prompt construction → context-limit decision
+  ▼
+GenerationClient
+  │  backend-specific JSON → HTTP stream → normalized events
+  ▼
+GenerationResult
+  │
+  ├─ StepLog channel ──────→ JSONL + replay/SLO aggregation
+  └─ TimelineSink channel ─→ per-event Parquet（可选）
+  ▼
+RunSummary（可选写入 summary JSON，同时返回给 caller）
 ```
 
-最重要的分界是：
+每层只回答一个问题：
 
-- `schema/` 解释输入文件已经声明的事实；
-- `workload.rs` 应用本次运行的 replay 操作；
-- `executor/` 和 `backend/` 执行并测量；
-- `record.rs`、`slo.rs`、`summary.rs` 输出结果。
-
-## 1. CSV header 不是完整 schema
-
-考虑一份 native 文件：
-
-```csv
-id,arrival_time,input_len,output_len,ttft_slo_ms,tpot_slo_ms,e2e_slo_ms,priority
-req-0,0.0,512,64,300,25,1200,3
-```
-
-只看 cells 和 header，consumer 仍然不知道：
-
-- 这份文件描述 text generation 还是其他 request family；
-- SLO 和 priority columns 是否是有意声明的；
-- row 是否属于某种带 predecessor 语义的 session format；
-- `input_len` 是完整 prompt，还是 canonical session row 的 fresh suffix。
-
-因此 startup 必须显式构造一个 `InputFileSchema`。代码不会根据 header 猜测
-request family，也不允许同一文件的不同 row 各自携带一个 `request_type` union。
-
-## 2. 完整 format 决定 request family
-
-```text
-InputFileFormat + TraceTag[] = InputFileSchema
-```
-
-| 类型 | 回答的问题 | 当前例子 |
+| 层 | 回答的问题 | 主要输出 |
 |---|---|---|
-| `InputFileFormat` | family 是什么、row 怎样编码、由谁 load？ | `TextGenerationIndependent` |
-| `RequestFamily` | 该完整 format 固有的 request 语义是什么？ | `TextGeneration`, `ImageToText` |
-| `TraceTag` | 文件额外声明了哪些 column bundle？ | `Slo`, `Priority`, `Session` |
-| `InputFileSchema` | 最终精确允许哪些 columns？ | format 加合法 tags 后的结果 |
+| schema declaration | 文件声称自己是什么？ | `InputFileSchema` |
+| format loader | 文件内容是否符合声明？ | typed rows / grouped sessions |
+| workload | 本次 run 如何使用这些已验证内容？ | `ReplayWorkload` |
+| executor | 每个 workload unit 何时以及按何种依赖执行？ | concrete generation attempt |
+| backend | 怎样发送请求并统一解释 stream？ | `GenerationResult` |
+| output | 实际发生了什么？ | `StepLog`、timeline、`RunSummary` |
 
-### `InputFileFormat` 是完整选择
+## 2. 用户接口是 task + structured YAML
 
-format 名同时编码 family 与布局，例如：
+普通用户不直接拼接 Rust binary 的几十个 flags。支持的入口是：
 
-```text
-text-generation-independent
-text-generation-session-execution-v2
-image-to-text-independent
-text-to-image-independent
+```bash
+uv run python -m launcher run configs/run.yaml
+uv run python -m launcher sweep configs/sweep.yaml
+uv run python -m launcher tracegen configs/tracegen.yaml
+uv run python -m launcher selfcheck configs/selfcheck.yaml
 ```
 
-因此不存在一个 generic `Native` 再与另一个 family selector 拼接的中间状态，也不存在
-`SessionExecutionV2 + ImageToText` 这样的非法组合。
-
-`TextGenerationIndependent` 的基础 columns 是：
+`run` 和 `sweep` 共享同一组嵌套 blocks：
 
 ```text
-id, arrival_time, input_len, output_len
+input       输入文件、完整 format、tags
+corpus      text corpus、tokenizer、token-pool limit
+server      endpoint、backend、model、sampling
+replay      arrival、capacity、context-limit 与 failure policy
+measurement timeline 与可选 run-level SLO
+output      一个 output directory；具体 artifact 文件名有稳定默认值
 ```
 
-`TextGenerationSessionExecutionV2` 的 canonical columns 是：
+`sweep` 另外增加 `search` block，表达 mode、rate range 与停止条件。launcher 严格拒绝
+unknown keys 和错误 value types，解析相对路径，build 对应 Rust binary，然后把 resolved
+values 转成底层 argv。YAML 是 supported operator contract；Rust flags 是 launcher 与 engine
+之间的内部接口。
+
+`tracegen` 使用 `generator.type` 选择 `synthetic` 或 `coding-session`，其余字段放在对应
+generator block；`selfcheck` 以独立 config 表达 tokenizer、output directory、pair count 与
+owned loopback port。这样所有 Rust execution modes 都经过同一个 launcher lifecycle。
+
+launcher 不读取 CSV、不构造 prompt，也不计算 metric。它只拥有 run 外围 lifecycle 和
+terminal presentation。完整 engine stdout/stderr 写入 `terminal.log`；默认终端只展示 build、
+replay progress、最终 workload/success/throughput/latency/cache summary 与 artifact paths。
+
+## 3. Startup 先声明整份输入文件
+
+CSV header 本身不足以决定语义。相同的 `input_len` 可能表示 independent request 的完整
+prompt，也可能表示 session round 新追加的 suffix。因此 CLI 必须选择一个完整 format：
 
 ```text
-request_id, session_id, round_idx, arrival_time_ms,
-prefix_len, input_len, output_len, tool_wait_after_ms
+--input-file-format text-generation-independent
+--input-file-format text-generation-session-execution-v2
+--input-file-format image-to-text-independent
 ```
 
-canonical format 中的 `prefix_len`、round order 和 tool wait 都已在 generation time
-materialize。replay 时不能重新猜 context policy。
+startup 将 format 与额外 tags 合成为：
 
-### `RequestFamily` 是 format 的属性
+```rust
+InputFileSchema {
+    input_file_format: InputFileFormat,
+    tags: Vec<TraceTag>,
+}
+```
 
-`InputFileFormat::request_family()` 返回 format 固有的 family。这个 family 不是从 CSV
-header 或 row 推断，也不是第二个 CLI 参数。不同 row 可以有不同长度、arrival、SLO、
-priority 和 session round，但不能在同一 CSV 中切换 family。
+三者的关系是：
 
-### `TraceTag` 是额外的 column contract
+- `InputFileFormat` 决定 physical columns、loader、结构规则以及 `RequestFamily`；
+- `RequestFamily` 是 format 的派生属性，不是另一个 CLI selector，也不能逐 row 改变；
+- `TraceTag` 增加与 family 正交的 column bundle，例如 `slo` 或 `priority`；
+- `InputFileSchema` 是 base format 与合法 tags 合并后的精确 header contract。
+
+例如 `text-generation-session-execution-v2` 已经同时表达 text generation family 和
+session execution layout。系统中不存在 `SessionExecutionV2 + ImageToText` 这样的半组合
+状态，也不会根据 header 猜 family。
+
+## 4. Schema parsing 之后究竟发生什么
+
+`InputFileSchema` 只声明 contract；真正打开文件的是 `workload::load_workload`。它先根据
+完整 format 选择唯一 loader：
 
 ```text
-Slo
-└── ttft_slo_ms, tpot_slo_ms, e2e_slo_ms
+TextGenerationIndependent
+  └─ format/text_generation/independent.rs::load
+       └─ Vec<IndependentRequest>
 
-Priority
-└── priority
-
-Session
-└── session_id, prefix_kv, tool_wait_after_ms   # native format 的 tag columns
-
-Speculative
-└── accept_rate
+TextGenerationSessionExecutionV2
+  └─ format/text_generation/session.rs::load
+       └─ SessionPlans
 ```
 
-`Slo` 与 `Priority` 有意分开：SLO 是可测量 latency metric 的上限；priority 是 scheduler
-可能使用的排序 hint。声明其中一个不会自动声明另一个。
-
-## 3. `schema/` 的内部层级
+每个 family format 文件都拥有：
 
 ```text
-schema/
-├── input_file_schema.rs
-│   └── InputFileFormat + TraceTag[] → exact header contract
-│
-├── format/
-│   ├── text_generation/
-│   │   ├── independent.rs
-│   │   └── session.rs
-│   ├── image_to_text.rs
-│   ├── video_to_text.rs
-│   ├── audio_to_text.rs
-│   ├── text_to_image.rs
-│   ├── text_to_video.rs
-│   ├── text_to_speech.rs
-│   ├── image_to_video.rs
-│   ├── omni_generation.rs
-│   └── load_utils.rs
-│       └── 每个 family format 都拥有 COLUMNS、typed Row、validation、load；
-│           load_utils 只共享重复的 CSV/tag mechanics
-│
-├── family/
-│   ├── media.rs
-│   └── omni.rs
-│       └── family-specific declared values；不负责 replay
-│
-└── tag/
-    ├── slo.rs
-    ├── priority.rs
-    └── speculative.rs
-        └── 每种 tag 的 per-row declared value
+COLUMNS
+typed Row / runtime-ready row type
+per-row validation
+load(path, InputFileSchema)
 ```
 
-这些文件不在同一抽象层。`input_file_schema.rs` 只组合完整 format 与 tags；`format/`
-拥有 physical row decoding；`family/` 和 `tag/` 提供可组合的字段类型。
+`format/load_utils.rs` 只共享机械步骤：打开 CSV、核对 header、遍历 records、解析 tag
+columns。它不决定 family，也不制造 generic request union。
 
-### 为什么 session grouping 在 format loader 中
+### Independent 文件的输出
 
-对 `SessionExecutionV2` 而言，以下条件属于文件格式本身：
+每行独立验证后成为一个 `IndependentRequest`：
 
-- 同一 session 的 rows 必须连续；
-- `round_idx` 必须从 0 连续递增；
-- round 0 不能声明 prefix；
-- 同一 session 的 arrival 必须一致；
-- session blocks 必须按 arrival 排列；
-- request id 必须唯一。
+```text
+CSV record
+  ↓ decode base fields + declared tag fields
+IndependentRequest
+  ├─ id / arrival_time
+  ├─ input_len / output_len
+  ├─ per-request SLO（若声明）
+  └─ priority（若声明）
+```
 
-因此 loader 在返回前验证完整文件，并按文件顺序构造：
+loader 最终返回 `Vec<IndependentRequest>`，文件顺序被保留。
+
+### Session 文件的输出
+
+session loader 先把一行解码为 `ExecutionRow`，再合并 tags，随后验证文件级结构：
+
+- 同一 session 的 rows 连续；
+- `round_idx` 从 0 连续递增；
+- round 0 没有 prefix；
+- 同一 session 的 arrival 一致；
+- session blocks 按 arrival 排列；
+- request id 唯一。
+
+验证完成后，rows 被组织为：
 
 ```rust
 type SessionPlans = Vec<(String, Vec<SessionRound>)>;
 ```
 
-这个 grouping 不是可选 runtime policy；它是 canonical bytes 的结构含义，所以属于
-`schema/format/text_generation/session.rs`。把它放进另一个
-`trace/session.rs` 只会制造第二个
-解释同一 format 的地方。
+这个 grouping 属于 format parsing，因为 round order、prefix 和 tool wait 是输入 bytes 的
+固有含义，不是本次 run 临时选择的 replay policy。
 
-`SessionRound` 也不是原始 CSV row。`ExecutionRow` 是 canonical 基础 columns；loader
-另外读取已声明的 `RequestSlo` 和 `RequestPriority`，验证后合成为可交给 runtime 的
-`SessionRound`：
+### 解析成功不等于当前 client 能执行
 
-```text
-ExecutionRow + RequestSlo + RequestPriority
-  ↓ format loader validates and groups
-SessionRound
-```
+shared schema 定义了多个 request families，因此 media format 可以被合法解析和验证；但
+当前 HTTP replay runtime 只实现了 text-generation prompt builder。`load_workload` 会在
+runtime boundary 明确拒绝“schema 合法、client 尚不支持”的 family，而不是让 schema 层
+谎称这些 format 不存在。
 
-## 4. 为什么仍然需要 `workload.rs`
+## 5. 为什么 loader 之后还有 `ReplayWorkload`
 
-`workload.rs` 不再解析 CSV，也不再定义 independent/session 的第二套 loader。它只负责
-本次运行才出现的操作：
-
-```rust
-load_workload(path, input_file_schema, max_items)
-    -> ReplayWorkload
-```
-
-其内部流程是：
+两个 loader 返回不同的 Rust 类型：
 
 ```text
-1. 检查 HTTP replay runtime 是否支持该合法 schema
-2. 按 InputFileFormat 调用该 family 自己的 format loader
-3. 得到完全验证的 IndependentRequest 或 SessionPlans
-4. 再应用 --max-items
-5. 如指定 --rate，缩放 top-level arrival times
-6. 计算 workload summary 与 offered-rate units
+independent::load(...) → Vec<IndependentRequest>
+session::load(...)     → SessionPlans
 ```
 
-这一层不能合并回 `schema/`，因为 `--max-items`、`--rate` 和“这个 HTTP client 暂时只会
-发送 text generation”都不是输入文件的含义。模拟器可以共享同一个 schema loader，
-但使用不同的 replay policy。
-
-特别地，loader 会先验证完整文件，再截断。否则 `--max-items 1` 会把第二行之后的损坏
-静默藏起来。
-
-`ReplayWorkload` 保留两种 runtime shape：
+而 `--input-file-format` 到 runtime 才能确定，所以 `load_workload` 不能在编译时选择其中一个
+返回类型。`ReplayWorkload` 只是承载这两个可能结果的 sum type：
 
 ```rust
 enum ReplayWorkload {
-    Sessions(SessionPlans),
     IndependentRequests(Vec<IndependentRequest>),
+    Sessions(SessionPlans),
 }
 ```
 
-这不是 per-row request-family union。它是 startup 根据整份文件选择一次的执行路径。
+它没有重新解析 rows，也没有增加一种 schema。variant 直接拥有对应 loader 的原始输出；
+整份文件只选择一个 variant，runner 最终只进入对应 executor。
 
-## 5. `runner.rs` 是 wiring root
+这个 branch 本身无法消失，因为两种执行结构确实不同：independent requests 可以分别
+release，而 session rounds 必须按 predecessor 顺序 closed-loop 执行。若删除这个 enum，
+只能把同一个 `match` 搬进 `runner.rs` 并让两条路径分别承担后续 setup，或者引入更复杂的
+trait abstraction。把 session 强行 flatten 成 independent rows 则会丢失 dependency 和
+tool-wait 语义。
 
-`run_once_reusing` 按以下顺序连接各层：
+因此这里保留的是最小的 runtime branch，不是第二套 input model。如果以后两个 format
+共享完全相同的执行 shape，这个 enum 才应该合并或删除。
 
-```text
-Args
-  ↓ InputFileFormat::parse(...)
-InputFileSchema::new(format, tags)
-  ↓
-slo_source::resolve(...)
-  ↓
-workload::load_workload(...)
-  ↓
-optional arrival-rate scaling
-  ↓
-WorkloadSummary + context-limit preflight
-  ↓
-token corpus / backend preflight
-  ↓
-executor::execute(...)
-  ↓
-RunSummary
-```
+`workload.rs` 随后应用只属于本次运行的操作：
 
-CLI 只接受完整 format，不再有第二个 family selector：
+1. 先验证完整文件，再应用 `--max-items`；
+2. 计算 trace 中 top-level workload units 的 arrival rate；
+3. 如设置 `--rate`，统一缩放 top-level arrival offsets；
+4. 生成 `WorkloadSummary`，包括 unit 数、step 数、最大 prompt/output 和 context-limit 信息。
 
-```text
---input-file-format text-generation-independent
---input-file-format text-generation-session-execution-v2
-```
+先验证再截断是有意的：`--max-items 1` 不能隐藏文件后半段的坏 row。
 
-## 6. `executor/` 负责 release 语义
+session 的 workload unit 是 session，step 是 round；independent workload 中二者都是
+request。offered rate 与 delivered step throughput 比较时必须通过
+`steps_per_workload_unit` 转换，不能把两种单位直接相比。
+
+## 6. 执行前准备
+
+`runner.rs` 在启动 tasks 前完成一次性准备：
 
 ```text
-executor/independent.rs
-└── 每个 request 按自己的 trace arrival release
-
-executor/session.rs
-└── round 0 按 session arrival release
-    later round 等 predecessor 完成，再等待 tool_wait_after_ms
-
-executor/admission.rs
-└── max-concurrency 与 deterministic admission order
+WorkloadSummary / dry-run early return
+  ↓
+load tokenizer + build/reuse synthetic token pool
+  ↓
+construct GenerationClient and protocol adapter
+  ↓
+prefix-cache capability preflight
+  ↓
+create AppState, concurrency gate, log channel, optional timeline channel
 ```
 
-format loader 只证明 session topology 合法；executor 才执行时间相关的 dependency。这样
-“文件说 predecessor 是谁”和“runtime 何时实际 release”不会混在一个层里。
+`--dry-run` 在 token corpus 和网络访问前返回，因此它验证的是输入与 workload shaping，
+不是 serving endpoint。
 
-## 7. `tokens.rs` 构造实际 prompt
+tokenizer 与 synthetic corpus 可由 `CorpusCache` 跨 sweep points 复用。backend preflight
+在正式 replay 前确认 server 能报告所需的 prefix-cache usage，避免把“没有 telemetry”
+误读成“cache hit 为零”。
 
-independent request 从 synthetic token pool 取得 `input_len` 个 tokens。
+## 7. `executor/` 负责 release、dependency 与 admission
 
-session round 则构造：
+runner 对每个 top-level workload unit 启动一个 task，然后按 `ReplayWorkload` variant
+进入两条执行路径。
+
+### Independent request
 
 ```text
-previous realized context[..prefix_len] + fresh tokens[input_len]
+wait for request arrival
+  → acquire concurrency slot
+  → draw input_len synthetic tokens
+  → context-limit check
+  → GenerationClient::run_step
+  → StepLog
 ```
 
-`prefix_len` 表示 cache-eligible prefix，不保证 server 实际 cache hit。真实 server 报告的
-cached prompt tokens 与 declared/planned prefix 会分别记录，不能互相替代。
+每个 independent request 独立 release，也独立持有 concurrency slot。
 
-## 8. `backend/` 发送并测量 stream
+### Session
 
-`backend/wire/` 只处理协议差异：OpenAI、vLLM native token endpoint、SGLang native token
-endpoint。`backend/client.rs` 和 `backend/stream.rs` 将不同 wire events 折叠成同一组可审计
-measurement。
+```text
+wait for session arrival
+  → acquire one concurrency slot for the whole session
+  → for each round in order:
+       build prompt from carried context
+       context-limit check
+       GenerationClient::run_step
+       carry real output token ids into next round
+       wait tool_wait_after_ms
+  → release slot when the session ends
+```
 
-关键 timing 定义是：
+后续 round 不按原始 wall-clock arrival 独立 release；它是 closed-loop chain，必须等待
+predecessor 完成及 tool wait。session 在所有 rounds 和 tool waits 期间持有同一个 capacity
+slot，这是当前 concurrency contract。
 
-- TTFT：HTTP send 到第一个 non-empty generated event；优先使用 token-id clock；
-- TPOT：第一个 timed token event 之后的 token delivery 平均间隔；
-- E2E：submission 到 completion；
-- arrival release lag：计划 arrival 到 client task 实际恢复之间的延迟。
+`arrival_mode=trace` 尊重记录的 arrival offset；`arrival_mode=saturated` 忽略该 timeline，
+让 units 尽快进入 admission。`--max-concurrency` 只限制 active units，并用 deterministic
+admission order 处理竞争。
 
-这四个量不能互相代替。尤其不能把 client scheduling lag 偷偷算进 server TTFT。
+## 8. `tokens.rs` 把长度声明变成实际 prompt
 
-## 9. declared SLO 与 measured timing 分开保存
+输入文件保存长度和 prefix 关系，不保存本次 replay 的 concrete token ids。
 
-`schema/tag/slo.rs` 只定义输入文件声明的 per-request bounds：
+independent request 从共享 synthetic token pool 取得 `input_len` 个 tokens。session round
+由 `PromptBuilder` 构造：
+
+```text
+previous realized context[..prefix_len]
++ fresh synthetic tokens[input_len]
+= prompt ids sent to server
+```
+
+round 完成后，builder 优先携带 server 返回的真实 output token ids，而不是重新生成假
+output。`prefix_len` 表示计划中可复用的 prefix，不保证 server 实际命中；真实 cached
+prompt tokens 由 backend usage 单独记录。
+
+## 9. `backend/` 统一不同 serving 协议
+
+executor 只提交 backend-neutral 的：
 
 ```rust
-RequestSlo {
-    ttft_slo_ms: Option<f64>,
-    tpot_slo_ms: Option<f64>,
-    e2e_slo_ms: Option<f64>,
+GenRequest {
+    request_id,
+    prompt: Prompt::Tokens(...),
+    max_tokens,
+    ...
 }
 ```
 
-`schema/tag/priority.rs` 独立定义：
+`backend/wire/` 负责 OpenAI、vLLM native token endpoint 和 SGLang native token endpoint
+之间的 JSON 差异。`GenerationClient` 负责共享 async lifecycle：
+
+1. 构造并发送 payload；
+2. 持续读取 stream；
+3. 将 wire objects 标准化为 `StreamEvent`；
+4. 折叠 text、token ids、usage、finish reason 与错误；
+5. 检查 prompt echo 和 token accounting；
+6. 返回 backend-neutral `GenerationResult`。
 
 ```rust
-RequestPriority {
-    priority: Option<i64>,
+GenerationResult {
+    outcome: GenerationOutcome,
+    output_ids: Vec<u32>,
+    timeline: Vec<TimelineEvent>,
 }
 ```
 
-根目录的 `slo.rs` 位于更高层，负责 runtime measurement、attainment 和 aggregation。
-它不属于 schema tag 层，因为这些计算只有执行完成后才存在。
+这里测量 submit、send、first text/token-id、last token-id 和 response completion 等 clock。
+TTFT、TPOT、E2E 与 arrival release lag 都从这些明确 clock 推导；它们是 outcome 的一部分，
+不是控制整个架构的中心对象。
 
-每个实际声明的 metric 单独判断：
+## 10. 结果怎样流向文件和 summary
 
-```text
-attained(metric) = measured(metric) <= declared_bound(metric)
-```
-
-一个 request 声明多个 bounds 时，全部满足才算 combined attained。空 cell 表示该 request
-没有为该 metric 提出 bound，不表示 0，也不表示自动达标。
-
-## 10. 输出层
-
-`record.rs` 写 per-request JSONL，将 source declaration 与 generation outcome 放在同一条
-record 中。SLO fields 与 priority field 分开 flatten：
+executor 将 source declaration 与 `GenerationOutcome` 合成 `StepLog`：
 
 ```text
-declared_ttft_slo_ms
-declared_tpot_slo_ms
-declared_e2e_slo_ms
-declared_priority
+IndependentRequest / SessionRound
+            +
+GenerationOutcome
+            ↓
+         StepLog
 ```
 
-`timeline.rs` 异步写 per-event Parquet；channel 满时丢 timeline sample，而不阻塞被测的
-submission path。`summary.rs` 生成 run-level metrics 和 SLO aggregation。
+之后有两条互不阻塞主执行的输出路径：
+
+- log channel：`summary::write_logs` 写 per-step JSONL，同时折叠 replay metrics、prefix-cache
+  metrics 和可选 SLO attainment；
+- timeline channel：可选地在独立 blocking writer 中编码 per-event Parquet。channel 满时丢
+  timeline sample，而不让磁盘或 Arrow encoding 对被测 submission 施加 backpressure。
+
+所有 workload tasks 完成后，runner 等待 writers 收尾并构造：
+
+```rust
+RunSummary {
+    workload,
+    replay,
+    client_runtime,
+    timeline,
+    slo,
+}
+```
+
+它既作为 library return value 返回，也可写入 `--summary-path`。因此一次 run 的最终产物
+不是只有 SLO：它同时报告输入规模、replay outcome、client runtime、timeline 完整度、
+throughput、latency、prefix-cache fidelity，以及在有声明时的 SLO attainment。
+
+## 11. Tags 是穿过主线的附加声明
+
+tags 在 schema parsing 时进入 typed row，并随 source record 一直保留到 output：
+
+```text
+slo         → ttft_slo_ms, tpot_slo_ms, e2e_slo_ms
+priority    → priority
+session     → native independent layout 的 session-related columns
+speculative → accept_rate
+```
+
+它们互不替代。特别地，priority 是 scheduling hint，不属于 SLO；SLO 的三个 metric 也逐
+request、逐 metric 独立声明。根目录 `slo.rs` 只在执行后比较 declared bounds 与 measured
+timings，并不是 schema loader 或 executor 的 owner。
+
+## 12. Binary 与 library 边界
+
+| 入口 | 作用 |
+|---|---|
+| `run` / `session_runner` | 执行一次真实 replay |
+| `sweep` | 多次调用同一个 `run_once_reusing`，搜索 rate/SLO boundary，并复用 corpus |
+| `tracegen` | 从 generator source materialize canonical session input files |
+| `selfcheck` | 用受控 stub 验证 release、stream measurement、cache accounting 等 fidelity |
+
+主 binary 与 sweep 都调用同一个 runner，而不是维护两套 replay path。其他 consumer 可以
+共享 `schema` 的 format contract 与 loaders，但不会自动继承这个 HTTP client 的
+`ReplayWorkload`、token construction 或 execution policy。
 
 ## 目录 owner map
 
 | 路径 | 唯一职责 |
 |---|---|
-| `schema/input_file_schema.rs` | 在完整 format 上组合 tags 并验证 header |
-| `schema/format/` | 读取、验证、组织 format 声明的结构 |
+| `launcher/` | YAML validation、argv/build/run lifecycle、terminal UI |
+| `schema/input_file_schema.rs` | 组合完整 format 与 tags，产生精确文件 contract |
+| `schema/format/` | decode、validate 并组织 family-specific typed contents |
 | `schema/family/` | family-specific declared value types |
 | `schema/tag/` | orthogonal per-row declaration types |
-| `workload.rs` | runtime selection、truncate、rate scaling、workload summary |
-| `runner.rs` | 一次 run 的 wiring root |
-| `executor/` | release、dependency、admission |
-| `tokens.rs` | concrete token construction |
-| `backend/` | protocol、stream fold、integrity、preflight |
-| `record.rs` | per-request JSONL contract |
-| `timeline.rs` | per-event timeline |
-| `slo.rs` | measured SLO verdict 与 aggregation |
-| `summary.rs` | run-level report |
-| `bin/tracegen/` | raw source → canonical trace；generation-time policy |
-| `bin/sweep/` | 多个 run point 的搜索与边界判断 |
-| `bin/selfcheck/` | 用可控 stub 验证 release、TTFT、TPOT 等测量 fidelity |
+| `workload.rs` | runtime dispatch、truncate、rate scaling、workload summary |
+| `runner.rs` | 一次 run 的 wiring 与 lifecycle |
+| `executor/` | arrival release、session dependency、admission、request lifecycle |
+| `tokens.rs` | concrete token ids 与 session context carry-forward |
+| `backend/wire/` | protocol-specific JSON shaping/parsing |
+| `backend/client.rs` | shared HTTP streaming engine 与 integrity measurements |
+| `record.rs` | per-step source + outcome JSONL contract |
+| `timeline.rs` | optional per-event recording |
+| `summary.rs` | replay、runtime、timeline 与 run-level aggregation |
+| `slo.rs` | 可选的 declared-vs-measured SLO evaluation |
 
 最短的心智模型是：
 
 ```text
-InputFileSchema 定义文件是什么。
-format loader 证明文件确实如此。
-workload 决定本次怎样 replay 已验证内容。
-executor/backend 执行并测量。
-record/summary 把声明与事实放在一起。
+Schema 说明文件是什么。
+Format loader 把 bytes 变成已验证的 typed contents。
+Workload 决定本次怎样 replay。
+Executor 把计划按时间和依赖变成实际请求。
+Backend 把请求变成 stream outcome。
+Record 与 Summary 保存实际发生的事情。
 ```

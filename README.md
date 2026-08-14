@@ -7,6 +7,7 @@
 Session chains · Independent requests · Exact token-ID prompts · Prefix-cache auditing · TTFT/TPOT
 
 [Quickstart](#quickstart) ·
+[Launcher](#launcher-yaml-interface) ·
 [Architecture](ARCHITECTURE.md) ·
 [中文架构](ARCHITECTURE.zh-CN.md) ·
 [Engine setup](#engine-side-setup-guide) ·
@@ -14,7 +15,7 @@ Session chains · Independent requests · Exact token-ID prompts · Prefix-cache
 [CSV formats](#input-csv-formats) ·
 [Backends](#request-backends) ·
 [Metrics](#metrics) ·
-[CLI reference](#cli-reference) ·
+[YAML reference](#launcher-yaml-interface) ·
 [Troubleshooting](#troubleshooting)
 
 </div>
@@ -37,6 +38,46 @@ session rounds; `tracegen` here turns those into the canonical execution trace
 
 [tracelab]: https://github.com/uw-syfi/TraceLab
 
+## Launcher YAML interface
+
+The supported operator interface is one task plus one structured YAML file:
+
+```bash
+uv run python -m launcher run configs/run.example.yaml
+uv run python -m launcher sweep configs/sweep.example.yaml
+uv run python -m launcher tracegen configs/tracegen.example.yaml
+uv run python -m launcher selfcheck configs/selfcheck.example.yaml
+```
+
+The launcher rejects duplicate and unknown keys, checks value types, resolves
+paths relative to the YAML file, builds the right Rust binary, saves the
+resolved command, and renders a concise result panel from the machine-readable
+artifact. The complete Rust output remains available in `terminal.log`.
+
+The Rust binaries and their flags are the internal launcher-to-engine
+interface. They remain useful for development and debugging, but a reproducible
+operator run should be represented by YAML rather than a shell history entry.
+
+Common `run`/`sweep` blocks are:
+
+| Block | Owns |
+|---|---|
+| `input` | trace path, complete input-file format, declared tags |
+| `corpus` | synthetic text corpus, matching tokenizer, token-pool bound |
+| `server` | backend, endpoint, served model, temperature |
+| `replay` | arrival mode/rate, item and concurrency caps, context/error policy |
+| `measurement` | timeline recording and optional TTFT/TPOT/E2E objective |
+| `output` | one artifact directory and optional stable filenames |
+| `search` | sweep-only mode, range, metric, and stopping criteria |
+
+`tracegen` instead uses `generator.type: synthetic` or `coding-session` plus
+generator-specific fields. `selfcheck` uses `tokenizer`, `checks`, and `output`.
+See the four files under `configs/` for complete, commented shapes.
+
+Use launcher `--dry-run` to validate and print the resolved internal command
+without building or executing. Set `replay.dry_run: true` in a `run` YAML to
+perform the Rust engine's static trace inspection without contacting a server.
+
 ## Configuration axes
 
 A run is described by three independent choices. Each axis answers a different
@@ -45,9 +86,9 @@ per axis.
 
 | # | Axis | Selected by | Supported values |
 |---|---|---|---|
-| 1 | **Input-file format** — request family, row schema, and topology | `--input-file-format` | Complete names such as `text-generation-session-execution-v2` |
-| 2 | **Arrival and load control** — when top-level units are released, how many run at once | `--arrival-mode`, CSV `arrival_time`, `--rate`, `--max-concurrency`, `--max-items` | `trace-timed` (default) or `saturated`, each with an optional cap |
-| 3 | **Wire backend** — endpoint and output representation | `--backend` | `openai` (default), `vllm-tokens`, `sglang-tokens` |
+| 1 | **Input-file format** — request family, row schema, and topology | `input.format` | Complete names such as `text-generation-session-execution-v2` |
+| 2 | **Arrival and load control** — when top-level units are released, how many run at once | `replay.*`, CSV `arrival_time` | `trace-timed` (default) or `saturated`, each with an optional cap |
+| 3 | **Wire backend** — endpoint and output representation | `server.backend` | `openai` (default), `vllm-tokens`, `sglang-tokens` |
 
 The prefix/append split a session round replays is **not** an axis of a run. It
 is resolved once, when the canonical trace is generated, and recorded in that
@@ -64,9 +105,8 @@ never flattened into a standalone one.
 |---|---|---|
 | `text-generation-session-execution-v2` | One **already-materialized** text-generation round | Rounds are closed-loop: submit round `i`, await its response, wait `tool_wait_after_ms`, then submit round `i + 1` |
 | `text-generation-independent` | One standalone text-generation request | Each row releases independently |
-| `independent` | One standalone request | One-shot; rows never share context |
 
-`session` reads a canonical `session-execution-v2` file: its `prefix_len` is
+`text-generation-session-execution-v2` reads a canonical file whose `prefix_len` is
 guaranteed to exist by the time the round runs, so the runtime has nothing left
 to decide and a simulator reading the same bytes reaches the same plan. Generate
 one from a raw CSV with [`tracegen`](#generating-a-canonical-trace); a raw,
@@ -82,11 +122,11 @@ This axis has two sub-axes that compose freely — *when* a unit may start, and
 
 | Control | Effect |
 |---|---|
-| `--arrival-mode trace-timed` | Default. Release offsets are replayed from CSV `arrival_time`. For `session`, only the first sorted round's value releases the session |
-| `--arrival-mode saturated` | Recorded arrivals are ignored: every unit is eligible from the start. Without a cap this submits the whole workload at once; with one it is a closed-loop generator. Rejected together with `--rate`, which rescales a timeline this mode discards |
-| `--rate N` | Rescale all arrivals to `N` units/s, preserving relative gaps and simultaneous-arrival bursts. Needs at least two distinct arrival times, measured after `--max-items` has been applied |
-| `--max-concurrency N` | Bound concurrently active units, under either arrival mode. One session holds its slot across all of its rounds **and its tool waits** — while waiting on a tool it has no request in flight but is still occupying a slot |
-| `--max-items N` | Keep the first `N` units in trace order, applied before `--rate` is measured. Rows are kept in file order; `independent` keeps the first `N` CSV rows |
+| `replay.arrival_mode: trace-timed` | Default. Release offsets are replayed from CSV `arrival_time`. For a session, only the first round's value releases the session |
+| `replay.arrival_mode: saturated` | Recorded arrivals are ignored: every unit is eligible from the start. Without a cap this submits the whole workload at once; with one it is a closed-loop generator. Rejected together with `replay.rate`, which rescales a timeline this mode discards |
+| `replay.rate: N` | Rescale all arrivals to `N` units/s, preserving relative gaps and simultaneous-arrival bursts. Needs at least two distinct arrival times |
+| `replay.max_concurrency: N` | Bound concurrently active units under either arrival mode. One session holds its slot across all rounds **and tool waits** |
+| `replay.max_items: N` | Keep the first `N` units in trace order after the complete file has been validated |
 
 `--max-concurrency` bounds *workload units*, not HTTP requests in flight. There
 is deliberately no separate in-flight cap: a session is the unit a coding agent
@@ -105,7 +145,7 @@ for a unit that arrives after you.
 Transport only: endpoint, payload, and response parsing. It does not change
 workload shape.
 
-| Value | Endpoint | Output representation |
+| `server.backend` | Endpoint | Output representation |
 |---|---|---|
 | `openai` | `POST {base_url}/completions` | Text plus vLLM's optional `return_token_ids` extension |
 | `vllm-tokens` | `POST {base_url}/inference/v1/generate` | Native token-ID deltas; server must run with `--tokens-only` |
@@ -125,7 +165,7 @@ both live inside axis 2.
 
 Independent of every axis above, a live run:
 
-- sends prompts as explicit token-ID arrays built from `--text-file`, with a
+- sends prompts as explicit token-ID arrays built from `corpus.text_file`, with a
   distinct pool offset per workload unit so cross-unit prefix sharing is never
   fabricated;
 - sends `output_len` as `max_tokens` with `ignore_eos: true`, so output length
@@ -139,84 +179,44 @@ For what is deliberately *not* implemented, see [Current scope](#current-scope).
 
 ## Quickstart
 
-Run these commands from the repository root.
-
-### 1. Build
-
-```bash
-cargo build --release --bin session_runner
-```
-
-### 2. Parse and inspect a trace without a server
+Run from the repository root. Start with the supplied shape and edit the model,
+tokenizer, corpus, endpoint, and output directory:
 
 ```bash
-mkdir -p "$TMPDIR/req-frontend"
+cp configs/run.example.yaml "$TMPDIR/req-frontend-run.yaml"
+${EDITOR:-vi} "$TMPDIR/req-frontend-run.yaml"
 
-./target/release/session_runner \
-  --trace examples/session_execution_v2_example.csv \
-  --input-file-format text-generation-session-execution-v2 \
-  --text-file unused-in-dry-run \
-  --tokenizer unused-in-dry-run \
-  --model dry-run \
-  --dry-run \
-  --max-model-len 131072 \
-  --summary-path "$TMPDIR/req-frontend/dry-run-summary.json"
+uv run python -m launcher run "$TMPDIR/req-frontend-run.yaml" --dry-run
+uv run python -m launcher run "$TMPDIR/req-frontend-run.yaml"
 ```
 
-`--text-file`, `--tokenizer`, and `--model` remain required CLI arguments, but
-dry-run returns before loading a tokenizer or corpus and never contacts a
-server.
+The launcher builds `session_runner`, runs it, saves the YAML and resolved
+command beside the results, and ends with a compact report such as:
 
-Dry-run performs static inspection only. It:
-
-- parses required columns and field types;
-- groups and sorts session rows;
-- applies `--max-items` and optional arrival-rate scaling;
-- reports workload counts, length maxima, output totals, arrivals, and waits;
-- reports the first trace-target prompt plus target output that reaches
-  `--max-model-len`.
-
-It does **not** check duplicate round indices, cumulative session consistency,
-the synthetic corpus, tokenizer/server identity, backend capabilities,
-prefix-cache telemetry, exact output IDs, or live server behavior. Live replay
-loads the corpus and checks cache telemetry, output IDs, and actual prompt
-overflow. Duplicate indices, cumulative consistency, and tokenizer/server
-identity are not automatically proven today.
-
-### 3. Replay through the OpenAI-compatible backend
-
-```bash
-./target/release/session_runner \
-  --trace examples/session_execution_v2_example.csv \
-  --input-file-format text-generation-session-execution-v2 \
-  --text-file /path/to/large-text-corpus \
-  --tokenizer /path/to/model-or-tokenizer.json \
-  --model meta-llama/Meta-Llama-3-8B \
-  --backend openai \
-  --base-url http://127.0.0.1:8000/v1 \
-  --max-model-len 131072 \
-  --skip-when-reaching-limit \
-  --log-path "$TMPDIR/req-frontend/requests.jsonl" \
-  --summary-path "$TMPDIR/req-frontend/summary.json"
+```text
+RESULT
+------------------------------------------------------------------------
+  status        complete
+  workload      2 sessions / 4 rounds
+  success       4 / 4 steps
+  throughput    26.46 requests/s  |  211.72 output tokens/s
+  TTFT          avg 11.28 ms  |  p90 12.46 ms  |  max 12.97 ms
+  TPOT          avg 1.64 ms   |  p90 1.67 ms   |  max 1.67 ms
+  prefix cache  planned 0.3600  |  measured 0.3200
+  timeline      36 events  |  0 requests dropped
+  SLO           not declared
 ```
 
-Before any measured requests, every live run performs a two-request
-prefix-cache preflight. The server must enable prefix caching and report cached
-prompt-token details. For vLLM that means prefix caching left enabled (do not
-pass `--no-enable-prefix-caching`) plus `--enable-prompt-tokens-details`, or
-the equivalent `ENABLE_PROMPT_TOKENS_DETAILS=1`.
+Before measured requests, every live run performs a two-request prefix-cache
+preflight. vLLM must keep prefix caching enabled and expose prompt-token details
+with `--enable-prompt-tokens-details`. For native token-in/token-out, launch
+vLLM with `--tokens-only` and set:
 
-### 4. Use native vLLM token-in/token-out
-
-Launch vLLM with `--tokens-only`, then change the client arguments to:
-
-```bash
---backend vllm-tokens \
---base-url http://127.0.0.1:8000
+```yaml
+server:
+  backend: vllm-tokens
+  base_url: http://127.0.0.1:8000
 ```
-
-This backend disables server-side detokenization and is the preferred path when
-TTFT/TPOT must exclude detokenization work.
 
 ## Engine-side setup guide
 
@@ -379,12 +379,18 @@ not a new binary.
 | `coding-session` | a raw `session-rounds-v2` CSV, materialized under a context policy | You are replaying something that was recorded |
 | `synthetic` | distributions, no corpus at all | You want to vary one dimension and hold the rest fixed |
 
+```yaml
+generator:
+  type: coding-session
+  source: examples/multi_session_example.csv
+  policy: trace-reported
+  max_sessions: 200
+output:
+  trace: trace/execution.csv
+```
+
 ```bash
-cargo run --release --bin tracegen -- coding-session \
-  --source examples/multi_session_example.csv \
-  --policy trace-reported \
-  --max-sessions 200 \
-  --out trace/execution.csv
+uv run python -m launcher tracegen tracegen-coding.yaml
 ```
 
 It writes `execution.csv` plus `execution.manifest.json` and
@@ -405,15 +411,21 @@ inputs, the flags it records regenerate the trace byte for byte.
 
 #### Drawing a trace instead of recording one
 
+```yaml
+generator:
+  type: synthetic
+  sessions: 500
+  rounds: uniform:1..8
+  input_len: lognormal:1024,0.8
+  output_len: lognormal:256,0.7
+  compaction_probability: 0.1
+  arrival_rate: 4
+output:
+  trace: trace/synthetic.csv
+```
+
 ```bash
-cargo run --release --bin tracegen -- synthetic \
-  --sessions 500 \
-  --rounds 'uniform:1..8' \
-  --input-len 'lognormal:1024,0.8' \
-  --output-len 'lognormal:256,0.7' \
-  --compaction-probability 0.1 \
-  --arrival-rate 4 \
-  --out trace/synthetic.csv
+uv run python -m launcher tracegen tracegen-synthetic.yaml
 ```
 
 Every length knob takes a distribution: `512` or `fixed:512` for a constant,
@@ -990,10 +1002,11 @@ This claim is maintained by `selfcheck`, not by a pasted benchmark table. It
 alternates timeline-on and timeline-off runs against `tools/stub_server.py`,
 then checks the p50/p99 difference and requires zero dropped request timelines:
 
+Configure the tokenizer, check count, stub port, and output directory in a
+`selfcheck` YAML (start from `configs/selfcheck.example.yaml`), then run:
+
 ```bash
-cargo run --release --bin selfcheck -- \
-  --tokenizer /path/to/tokenizer.json \
-  --out "$TMPDIR/req-frontend-selfcheck"
+uv run python -m launcher selfcheck selfcheck.yaml
 ```
 
 The same harness separately checks scheduled release lag, rate scaling, TTFT,
@@ -1081,9 +1094,9 @@ slo attainment | source=Global steps=48 overall=0.6667 |
   e2e_ms<=60 0.6667 (16 violated, 0 unmeasured)
 ```
 
-`SloSpec` and the attainment fold live in `src/schema/slo.rs`, alongside the
-trace schemas rather than in the runtime, because a measured replay and a
-simulated run must report the same number for the same trace.
+The declared tag shape lives in `src/schema/tag/slo.rs`; runtime measurement and
+attainment live in `src/slo.rs`. Keeping those owners separate prevents input
+declarations from being confused with observations that exist only after a run.
 
 ## Rate sweeps — `sweep`
 
@@ -1092,14 +1105,20 @@ knee falls in a gap, too fine and most of the points are spent far from it. The
 `sweep` binary ramps by doubling until the boundary flips, bisects back to locate
 it, then spends its remaining points **at** the knee.
 
-```bash
-cargo build --release --bin sweep
+```yaml
+search:
+  mode: max-sustainable-rate
+  start_rate: 5
+  max_rate: 800
+  tolerance: 0.05
+  densify_points: 3
 
-./target/release/sweep --mode max-sustainable-rate --out out/sweep \
-  --start-rate 5 --max-rate 800 --tolerance 0.05 --densify-points 3 \
-  --trace trace/execution.csv --input-file-format text-generation-session-execution-v2 \
-  --text-file corpus.txt --tokenizer <hf-model-or-path> --model <served-name> \
-  --base-url http://127.0.0.1:8000 --backend vllm-tokens
+# input, corpus, server, replay, measurement, and output follow
+# configs/sweep.example.yaml.
+```
+
+```bash
+uv run python -m launcher sweep sweep.yaml
 ```
 
 Every point is a full run in **this process**, which is what lets a twenty-point
@@ -1387,13 +1406,18 @@ token-level plan.
 | `SKIPPED_CONTEXT_OVERFLOW` | Compatibility status name: actual prompt plus target output reached `--max-model-len` while `--skip-when-reaching-limit` was enabled. The request was not sent. |
 | TTFT/TPOT missing | The response carried insufficient token or text events for that metric's denominator. Inspect per-request event counters and usage. |
 
-Use `--dry-run` first for every new trace. It catches CSV/type errors and reports
-the selected workload shape without consuming model capacity.
+Use launcher `--dry-run` first to validate every new YAML. Then set
+`replay.dry_run: true` for the first engine pass over a new trace; it reports the
+selected workload shape without consuming model capacity.
 
-## CLI reference
+## Internal Rust CLI reference
 
-Every flag `session_runner` accepts. The axis columns map back to
-[Configuration axes](#configuration-axes).
+<details>
+<summary><b>Contributor-facing launcher-to-engine flags</b></summary>
+
+Operators should use the YAML launcher. These flags document the internal
+lowering boundary and are useful when changing `launcher/config.py` or the Rust
+binary. The axis columns map back to [Configuration axes](#configuration-axes).
 
 ### Required
 
@@ -1456,6 +1480,8 @@ A context-limit skip always ends its session, independently of this flag.
 | `--timeline-path` | `session_runner_timeline.parquet` | Where that timeline is written |
 | `--slo` | trace sidecar, else none | `ttft_ms=500,tpot_ms=50`. Overrides a `<trace>.slo.json` sidecar. See [Service-level objectives](#service-level-objectives) |
 
+</details>
+
 ## Repository structure
 
 <details>
@@ -1463,8 +1489,11 @@ A context-limit skip always ends its session, independently of this flag.
 
 ```text
 .
+├── configs/                  tested YAML examples for every launcher task
+├── launcher/                 strict config lowering, lifecycle, and result UI
 ├── examples/                 canonical trace + raw tracegen inputs
 ├── skills/                   agent-facing operating guide for a replay
+├── tests/                    launcher config/UI tests
 ├── tools/                    stub server for measuring the client alone
 ├── viz/                      optional Python plotting; nothing here depends on it
 ├── src/
@@ -1479,8 +1508,8 @@ A context-limit skip always ends its session, independently of this flag.
 │   ├── slo.rs                runtime measurement, attainment, and aggregation
 │   ├── runner.rs             one run: validate, load, preflight, fan out, fold
 │   ├── slo_source.rs         --slo, the trace's sidecar, and which one won
-│   ├── main.rs               argument parsing; one call into the library
-│   ├── cli.rs                public CLI contract
+│   ├── main.rs               internal binary entry; one call into the library
+│   ├── cli.rs                launcher-to-engine argv contract
 │   ├── backend/
 │   │   ├── mod.rs            normalized request/response vocabulary + Backend
 │   │   ├── wire/             one file per protocol: openai, vllm, sglang
@@ -1509,19 +1538,15 @@ A context-limit skip always ends its session, independently of this flag.
 │   │   ├── admission.rs      declaration-order admission under a cap
 │   │   ├── session.rs        ordered closed-loop session executor
 │   │   └── independent.rs    one-shot independent-request executor
-│   ├── trace/
-│   │   ├── mod.rs            frontend dispatch + arrival-rate scaling
-│   │   ├── session.rs        canonical session trace loader
-│   │   └── independent.rs    independent-request CSV parser
 │   ├── tokens.rs             synthetic ID pool + session prompt assembly
 │   ├── record.rs             versioned typed JSONL records
 │   ├── timeline/
 │   │   ├── mod.rs            per-event vocabulary + the non-blocking handoff
 │   │   └── writer.rs         Arrow/Parquet, entirely off the request path
 │   ├── summary.rs            run-level metric aggregation
-│   ├── workload.rs           dry-run workload summaries
 │   └── util.rs               shared timing/ratio helpers
-└── Cargo.toml
+├── pyproject.toml            launcher Python dependencies and test config
+└── Cargo.toml                Rust library and execution binaries
 ```
 
 Frontends own source semantics and produce distinct workload variants. Backends

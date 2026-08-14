@@ -1,0 +1,13 @@
+[project]
+name = "req-frontend-launcher"
+version = "0.1.0"
+description = "Structured YAML launcher for req-frontend"
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.12"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

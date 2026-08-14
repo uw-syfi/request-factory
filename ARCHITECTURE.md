@@ -1,405 +1,473 @@
-# Request frontend, from CSV to SLO report
+# req-frontend: from input file to replay report
 
-This document explains the system bottom-up: what exists in an input file, how
-the file's declaration gives those bytes meaning, how rows become typed
-requests, and how declarations are eventually compared with measurements.
+This document explains `req-frontend`'s own end-to-end data flow: how one run
+declares an input file, parses and validates its rows, builds a replay workload,
+releases requests, talks to a serving backend, and records the result. SLO,
+priority, session, and speculative metadata are local concerns along that path;
+none of them is the architecture's organizing axis.
 
-## The whole path
+## 1. The complete path through one run
+
+`runner::run_once_reusing` is the wiring root:
 
 ```text
-CSV cells
-   ↓
-InputFileFormat + TraceTag
-   ↓
+YAML config
+  │ launcher: validate → resolve paths → build argv
+  ▼
+Rust Args
+  │
+  ├─ parse --input-file-format + --trace-tag
+  ▼
 InputFileSchema
-   ↓
-validated, parsed row
-   ↓
-Workload: independent requests or session steps
-   ↓
-ScheduledRequest
-   ↓
-Request
-   ↓
-ActiveRequest
-   ↓
-worker execution and telemetry
-   ↓
-JSONL / request_slo.parquet / SloSummary
+  │  declares the file-wide format, request family, and legal columns
+  ▼
+format::<family>::load(path, schema)
+  │  header validation → CSV decoding → row validation → structural validation
+  ▼
+typed file contents
+  ├─ Vec<IndependentRequest>
+  └─ SessionPlans = Vec<(session_id, Vec<SessionRound>)>
+  ▼
+ReplayWorkload
+  │  --max-items, --rate, arrival mode, workload summary
+  ▼
+executor
+  │  arrival wait → admission → prompt construction → context-limit decision
+  ▼
+GenerationClient
+  │  backend-specific JSON → HTTP stream → normalized events
+  ▼
+GenerationResult
+  │
+  ├─ StepLog channel ──────→ JSONL + replay/SLO aggregation
+  └─ TimelineSink channel ─→ per-event Parquet (optional)
+  ▼
+RunSummary (optionally written as summary JSON and also returned to the caller)
 ```
 
-The first four layers live in this repository. `ScheduledRequest`, `Request`,
-`ActiveRequest`, and `request_slo.parquet` are the corresponding downstream
-VibeSim concepts. The important property across the boundary is that both
-consumers use the same input declaration and therefore assign the same meaning
-to the same CSV.
+Each layer answers one question:
 
-## 1. CSV cells have no meaning by themselves
-
-Consider this row:
-
-```csv
-id,input_len,output_len,arrival_time,ttft_slo_ms,tpot_slo_ms,e2e_slo_ms,priority
-0,512,64,0.0,300,25,1200,3
-```
-
-The header still does not answer all the questions a consumer must answer:
-
-- Is the row an independent request or one round of a session?
-- Is this text generation, image generation, or another request family?
-- Were the SLO and priority columns intentionally declared?
-- Does `input_len` mean the whole prompt or only its fresh suffix?
-
-The consumer therefore reads the file against an explicit declaration. It does
-not infer the declaration from the header.
-
-## 2. A complete format determines its request family
-
-| Type | Role | Question answered |
+| Layer | Question | Main output |
 |---|---|---|
-| `InputFileFormat` | complete format | Which family, columns, loader, and structural rules apply? |
-| `RequestFamily` | format property | What kind of request does every row describe? |
-| `TraceTag` | optional schema extension | Which orthogonal column bundles does the file carry? |
+| schema declaration | What does the file claim to be? | `InputFileSchema` |
+| format loader | Does the whole file satisfy that claim? | typed rows or grouped sessions |
+| workload | How will this run use the validated contents? | `ReplayWorkload` |
+| executor | When and under which dependencies does each unit run? | a concrete generation attempt |
+| backend | How is a request sent and its stream normalized? | `GenerationResult` |
+| output | What actually happened? | `StepLog`, timeline, `RunSummary` |
 
-`InputFileSchema` combines the axes and resolves the exact expected header:
+## 2. The user interface is task plus structured YAML
 
-```text
-complete family-specific format
-+ declared tag columns
-= exact input-file schema
+Operators do not assemble dozens of Rust flags. The supported entry points are:
+
+```bash
+uv run python -m launcher run configs/run.yaml
+uv run python -m launcher sweep configs/sweep.yaml
+uv run python -m launcher tracegen configs/tracegen.yaml
+uv run python -m launcher selfcheck configs/selfcheck.yaml
 ```
 
-There is no generic `Native` format that must be paired with a second family
-selector. Names such as `text-generation-independent` and
-`text-generation-session-execution-v2` are complete choices.
-
-### `InputFileFormat`: family and representation together
-
-A format selects a request family, physical row contract, and parser. The canonical
-`session-execution-v2` format, for example, carries already-materialized session
-execution facts:
+Both tasks share the same nested blocks:
 
 ```text
-request_id
-session_id
-round_idx
-arrival_time_ms
-prefix_len
-input_len
-output_len
-tool_wait_after_ms
+input       file, complete format, and tags
+corpus      text corpus, tokenizer, and token-pool limit
+server      endpoint, backend, model, and sampling
+replay      arrival, capacity, context-limit, and failure policy
+measurement timeline and optional run-level SLO
+output      one output directory with stable artifact filenames
 ```
 
-Its family is text generation by construction. An impossible pairing such as
-`SessionExecutionV2 + ImageToText` cannot be represented.
+`sweep` adds a `search` block for its mode, rate range, and stopping rules. The
+launcher strictly rejects unknown keys and bad value types, resolves paths,
+builds the corresponding Rust binary, and lowers resolved values to internal
+argv. YAML is the supported operator contract; Rust flags are the internal
+launcher-to-engine interface.
 
-### `RequestFamily`: what every request in the file is
+`tracegen` selects `synthetic` or `coding-session` with `generator.type` and
+puts generator-specific fields in that block. `selfcheck` has an independent
+config for its tokenizer, output directory, pair count, and owned loopback
+port. Every Rust execution mode therefore shares one launcher lifecycle.
 
-One format applies to one whole CSV. `RequestFamily` cannot differ by row and is
-returned by `InputFileFormat::request_family()` rather than parsed separately.
-For example:
+The launcher does not read CSV, build prompts, or compute metrics. It owns only
+the lifecycle around a run and terminal presentation. Complete engine output is
+preserved in `terminal.log`; the default terminal view shows build, replay
+progress, final workload/success/throughput/latency/cache metrics, and artifact
+paths.
+
+## 3. Startup declares the whole input file
+
+A CSV header cannot determine its own meaning. The same `input_len` can mean an
+independent request's complete prompt or the fresh suffix of a session round.
+The CLI therefore selects one complete format:
 
 ```text
-RequestFamily::TextGeneration
-        ↓ startup selects one typed parser
-TextGenerationDefinition
+--input-file-format text-generation-independent
+--input-file-format text-generation-session-execution-v2
+--input-file-format image-to-text-independent
 ```
 
-Rows may differ in lengths, arrival times, SLOs, priority, and session facts,
-but they may not switch from text generation to image generation halfway
-through the file. A mixed-family workload uses separate typed files and a
-higher-level orchestrator.
-
-Keeping the family at file scope lets downstream Rust code preserve it in the
-type system:
-
-```text
-TraceFrontend<TextGenerationDefinition>
-        ↓
-RequestStore<TextGenerationDefinition>
-        ↓
-text-generation worker
-```
-
-The worker does not repeatedly match a per-row request-family enum.
-
-### `TraceTag`: optional, orthogonal column bundles
-
-Tags add columns without changing the request family or base row format:
-
-```text
-session
-└── session_id, prefix_kv, tool_wait_after_ms
-
-slo
-└── ttft_slo_ms, tpot_slo_ms, e2e_slo_ms
-
-priority
-└── priority
-
-speculative
-└── accept_rate
-```
-
-`slo` and `priority` are deliberately separate. An SLO states how quickly a
-request should be served; priority is a scheduling-policy hint. Neither implies
-the other.
-
-## 3. Header validation closes the declaration
-
-Before parsing any row, `InputFileSchema` computes the exact expected columns
-and compares them with the file header.
-
-Both directions are errors:
-
-- A missing column means the file cannot supply what it declared.
-- An unexpected column means the file contains semantics the run was not told
-  to consume.
-
-For example, a `priority` column without the `priority` tag is rejected rather
-than silently ignored. A declaration carrying `slo` requires all three SLO
-columns, although each individual cell may be blank.
-
-This is the boundary where the complete format and its tags become one exact
-input-file schema.
-
-## 4. Parsing turns cells into typed declarations
-
-After header validation, each tag is parsed into its own type.
-
-Per-request metric bounds become:
+Startup combines that format with optional tags:
 
 ```rust
-RequestSlo {
-    ttft_slo_ms: Option<f64>,
-    tpot_slo_ms: Option<f64>,
-    e2e_slo_ms: Option<f64>,
+InputFileSchema {
+    input_file_format: InputFileFormat,
+    tags: Vec<TraceTag>,
 }
 ```
 
-Scheduling policy becomes:
+The concepts relate as follows:
+
+- `InputFileFormat` selects physical columns, a loader, structural rules, and a
+  `RequestFamily`;
+- `RequestFamily` is derived from the format, not selected by another CLI
+  argument and not allowed to vary by row;
+- `TraceTag` adds a family-orthogonal column bundle such as `slo` or `priority`;
+- `InputFileSchema` is the exact header contract after combining the base
+  format with its legal tags.
+
+For example, `text-generation-session-execution-v2` already expresses both the
+text-generation family and the session-execution layout. There is no partial
+`SessionExecutionV2 + ImageToText` state and no family inference from headers.
+
+## 4. What happens after schema parsing
+
+`InputFileSchema` declares the contract; `workload::load_workload` opens the
+file. It dispatches once on the complete format:
+
+```text
+TextGenerationIndependent
+  └─ format/text_generation/independent.rs::load
+       └─ Vec<IndependentRequest>
+
+TextGenerationSessionExecutionV2
+  └─ format/text_generation/session.rs::load
+       └─ SessionPlans
+```
+
+Every family-format module owns:
+
+```text
+COLUMNS
+typed Row / runtime-ready row type
+per-row validation
+load(path, InputFileSchema)
+```
+
+`format/load_utils.rs` shares only mechanical work: opening CSV, checking the
+header, walking records, and parsing tag columns. It does not select a family
+or produce a generic request union.
+
+### Independent files
+
+Each row is decoded and validated into an `IndependentRequest`:
+
+```text
+CSV record
+  ↓ decode base fields + declared tag fields
+IndependentRequest
+  ├─ id / arrival_time
+  ├─ input_len / output_len
+  ├─ per-request SLO (when declared)
+  └─ priority (when declared)
+```
+
+The loader returns `Vec<IndependentRequest>` in file order.
+
+### Session files
+
+The session loader decodes an `ExecutionRow`, combines it with declared tags,
+and then validates whole-file structure:
+
+- rows for one session are contiguous;
+- `round_idx` starts at zero and is consecutive;
+- round zero declares no prefix;
+- every round in a session has the same arrival;
+- session blocks are ordered by arrival;
+- request ids are unique.
+
+It then returns:
 
 ```rust
-RequestPriority {
-    priority: Option<i64>,
+type SessionPlans = Vec<(String, Vec<SessionRound>)>;
+```
+
+Grouping belongs to format parsing because round order, prefix, and tool wait
+are meanings encoded in the bytes. They are not optional replay policy.
+
+### Valid schema does not imply executable by this client
+
+The shared schema defines several request families, so a media format may be
+valid and parseable even though this HTTP replay runtime currently implements
+only text-generation prompt builders. `load_workload` rejects a valid but
+unsupported family at the runtime boundary; the schema layer does not pretend
+the format does not exist.
+
+## 5. Why `ReplayWorkload` still exists after loading
+
+The two loaders return different Rust types:
+
+```text
+independent::load(...) → Vec<IndependentRequest>
+session::load(...)     → SessionPlans
+```
+
+Because `--input-file-format` is known only at runtime, `load_workload` cannot
+choose one of those return types at compile time. `ReplayWorkload` is only the
+sum type that carries either result:
+
+```rust
+enum ReplayWorkload {
+    IndependentRequests(Vec<IndependentRequest>),
+    Sessions(SessionPlans),
 }
 ```
 
-Every SLO field is independently optional. A blank cell means that the request
-declares no bound for that metric. It does not mean zero, and it is not an
-automatic success. A present bound must be finite and greater than zero.
+It does not parse rows again or introduce another schema. Each variant directly
+owns one loader's output. One whole file selects one variant, and the runner
+enters only the corresponding executor.
 
-## 5. Format loaders own structure; `workload.rs` owns replay operations
+The branch itself is real: independent requests release separately, while
+session rounds execute as a predecessor-ordered closed loop. Removing the enum
+would either move the same `match` into `runner.rs` and duplicate later setup,
+or replace it with a more elaborate trait abstraction. Flattening sessions into
+independent rows would instead lose dependency and tool-wait semantics.
 
-The schema hierarchy separates declarations, physical formats, families, and
-orthogonal tags:
+This is therefore the smallest runtime branch, not a second input model. If two
+formats eventually share exactly the same execution shape, their variants
+should be merged or removed.
+
+`workload.rs` then applies operations that belong to this run rather than to
+the input format:
+
+1. validate the whole file, then apply `--max-items`;
+2. calculate the arrival rate of top-level workload units;
+3. rescale top-level arrival offsets when `--rate` is set;
+4. build `WorkloadSummary`, including unit count, step count, maximum lengths,
+   and context-limit information.
+
+Validation deliberately precedes truncation, so `--max-items 1` cannot hide a
+malformed row later in the file.
+
+A session workload counts sessions as workload units and rounds as steps. In an
+independent workload both are requests. Offered unit rate must be converted by
+`steps_per_workload_unit` before it is compared with delivered step throughput.
+
+## 6. Preparing execution
+
+Before tasks start, `runner.rs` performs one-time setup:
 
 ```text
-schema/
-├── input_file_schema.rs  adds tags and verifies the exact header
-├── format/
-│   ├── text_generation/  independent and session-execution-v2
-│   ├── image_to_text.rs, video_to_text.rs, ...
-│   │                     each owns columns, typed row, validation, and load
-│   └── load_utils.rs     shared CSV/tag mechanics only
-├── family/               family-specific declared values
-└── tag/                  SLO, priority, and speculative declarations
+WorkloadSummary / dry-run early return
+  ↓
+load tokenizer + build or reuse the synthetic token pool
+  ↓
+construct GenerationClient and its protocol adapter
+  ↓
+prefix-cache capability preflight
+  ↓
+create AppState, concurrency gate, log channel, optional timeline channel
 ```
 
-Session grouping belongs to the canonical format loader because contiguity,
-round indices, predecessor order, and shared session arrival are properties of
-the file's bytes. They are not optional replay policy. `SessionRound` is the
-validated value produced by combining the base execution row with its declared
-tags:
+`--dry-run` returns before corpus construction and network access. It validates
+the input and workload shaping, not the serving endpoint.
+
+`CorpusCache` can reuse the tokenizer and synthetic corpus across sweep points.
+The backend preflight confirms that the server exposes required prefix-cache
+usage before replay, so missing telemetry cannot silently appear as zero hits.
+
+## 7. `executor/` owns release, dependencies, and admission
+
+The runner spawns one task per top-level workload unit and follows one of two
+paths selected by `ReplayWorkload`.
+
+### Independent request
 
 ```text
-CSV row
-  ↓ session parser
-ExecutionRow + RequestSlo + RequestPriority
-  ↓ format validation and grouping
-SessionRound
+wait for request arrival
+  → acquire concurrency slot
+  → draw input_len synthetic tokens
+  → context-limit check
+  → GenerationClient::run_step
+  → StepLog
 ```
 
-`workload.rs` starts after that boundary. It selects the one format loader,
-then applies runtime-only operations such as `--max-items`, `--rate`, and
-workload summaries. The whole input is validated before truncation, so a small
-`--max-items` cannot hide malformed later rows.
+Each independent request releases and holds capacity independently.
 
-## 6. A parsed row becomes a scheduled request
+### Session
 
-In VibeSim, the corresponding normalized value is:
+```text
+wait for session arrival
+  → acquire one concurrency slot for the entire session
+  → for each round in order:
+       build prompt from carried context
+       context-limit check
+       GenerationClient::run_step
+       carry real output token ids into the next round
+       wait tool_wait_after_ms
+  → release the slot when the session ends
+```
+
+Later rounds are not independently released by a recorded wall-clock arrival.
+They form a closed-loop chain and wait for their predecessor and tool delay.
+The session holds its capacity slot across every round and tool wait; that is
+the current concurrency contract.
+
+`arrival_mode=trace` honors recorded arrival offsets. `arrival_mode=saturated`
+ignores that timeline and moves units into admission as soon as possible.
+`--max-concurrency` limits active units and uses deterministic admission order
+when tasks contend.
+
+## 8. `tokens.rs` materializes actual prompts
+
+Input rows carry lengths and prefix relationships, not concrete token ids for
+this replay.
+
+An independent request draws `input_len` tokens from the shared synthetic
+pool. A session round uses `PromptBuilder`:
+
+```text
+previous realized context[..prefix_len]
++ fresh synthetic tokens[input_len]
+= prompt ids sent to the server
+```
+
+After a round, the builder prefers the server's real output token ids for the
+next context instead of inventing output. `prefix_len` is the planned reusable
+prefix; it does not assert that the server hit its cache. Server-reported cached
+prompt tokens are recorded separately.
+
+## 9. `backend/` normalizes serving protocols
+
+The executor submits a backend-neutral request:
 
 ```rust
-ScheduledRequest<Definition> {
-    release,
+GenRequest {
+    request_id,
+    prompt: Prompt::Tokens(...),
+    max_tokens,
+    ...
+}
+```
+
+`backend/wire/` owns JSON differences among OpenAI, vLLM native-token, and
+SGLang native-token endpoints. `GenerationClient` owns the shared async
+lifecycle:
+
+1. build and send a payload;
+2. consume the response stream;
+3. normalize wire objects into `StreamEvent`;
+4. fold text, token ids, usage, finish reason, and failures;
+5. check prompt echo and token accounting;
+6. return a backend-neutral result.
+
+```rust
+GenerationResult {
+    outcome: GenerationOutcome,
+    output_ids: Vec<u32>,
+    timeline: Vec<TimelineEvent>,
+}
+```
+
+This layer observes submission, send, first text/token id, last token id, and
+response-completion clocks. TTFT, TPOT, E2E, and arrival-release lag are derived
+from explicit clocks in the outcome; they do not organize the whole pipeline.
+
+## 10. Results flow into logs and summary
+
+The executor combines the source declaration with the result:
+
+```text
+IndependentRequest / SessionRound
+            +
+GenerationOutcome
+            ↓
+         StepLog
+```
+
+Two output paths avoid blocking request execution:
+
+- the log channel lets `summary::write_logs` write per-step JSONL while folding
+  replay metrics, prefix-cache metrics, and optional SLO attainment;
+- the optional timeline channel encodes per-event Parquet in a separate
+  blocking writer. A full channel drops timeline samples instead of applying
+  disk or Arrow backpressure to the measured submission path.
+
+After every workload task and writer finishes, the runner constructs:
+
+```rust
+RunSummary {
+    workload,
+    replay,
+    client_runtime,
+    timeline,
     slo,
-    scheduling,
-    definition,
 }
 ```
 
-Each field has one owner:
+It is returned as a library value and may also be written to `--summary-path`.
+The final product is therefore broader than an SLO report: it covers input
+shape, replay outcome, client runtime, timeline completeness, throughput,
+latency, prefix-cache fidelity, and SLO attainment when one was declared.
 
-| Field | Meaning |
+## 11. Tags are auxiliary declarations carried through the path
+
+Tags enter typed rows during schema parsing and remain attached to the source
+record through output:
+
+```text
+slo         → ttft_slo_ms, tpot_slo_ms, e2e_slo_ms
+priority    → priority
+session     → session-related columns for the native independent layout
+speculative → accept_rate
+```
+
+They do not imply one another. Priority is a scheduling hint, not an SLO, and
+the three SLO metrics are declared independently per request. Root-level
+`slo.rs` compares declared bounds with measured timings after execution; it
+does not own schema loading or execution.
+
+## 12. Binary and library boundaries
+
+| Entry point | Role |
 |---|---|
-| `definition` | What family-specific work should be performed? |
-| `release` | When may the request enter, and what predecessor/tool wait gates it? |
-| `slo` | What TTFT, TPOT, and E2E duration bounds did this request declare? |
-| `scheduling` | What scheduling priority did it declare? |
+| `run` / `session_runner` | executes one live replay |
+| `sweep` | calls the same `run_once_reusing` repeatedly, searches a rate/SLO boundary, and reuses the corpus |
+| `tracegen` | materializes canonical session input files from generator sources |
+| `selfcheck` | validates release, stream measurement, and cache accounting against a controlled stub |
 
-The distinction is important:
-
-```text
-definition  = what to do
-release     = when it may enter
-slo         = how quickly it should finish each measured obligation
-scheduling  = how a policy may rank it in a queue
-```
-
-## 7. Release constructs the immutable request
-
-When replay releases a scheduled row, it stamps the actual arrival time and
-constructs:
-
-```rust
-Request<Definition> {
-    core: RequestCore {
-        id,
-        arrival_time,
-        slo: SloContract,
-        scheduling: SchedulingContract,
-    },
-    definition,
-}
-```
-
-`SloContract` contains three optional durations. `SchedulingContract` contains
-priority only. SLOs are not converted into absolute scheduling deadlines.
-
-Family-specific work remains in `Definition`, so a
-`Request<TextGenerationDefinition>` cannot accidentally enter an image worker.
-
-## 8. Execution adds mutable state and observations
-
-An executing request is wrapped in:
-
-```rust
-ActiveRequest<Definition> {
-    request,
-    progress,
-    lifecycle,
-    telemetry,
-}
-```
-
-The layers remain separate:
-
-| Field | Owner |
-|---|---|
-| `request` | Immutable input declaration |
-| `progress` | Work completed so far |
-| `lifecycle` | Admission, stage, and completion state |
-| `telemetry` | First/last/per-output timing observations |
-
-For example, the declared TTFT bound lives in `request.core.slo`, while the
-actual first-output time lives in telemetry. Only after execution can the two
-be compared.
-
-Current workers preserve SLO and priority, but they do not yet change execution
-policy based on them. Carrying a field faithfully is not the same as having an
-execution consumer for it.
-
-## 9. Logs place declarations beside measurements
-
-The replay client writes its public JSONL record, and VibeSim writes one
-terminal or sim-end partial row per request to `request_slo.parquet`.
-
-The downstream SLO record preserves the declarations:
-
-```text
-declared_ttft_slo_ms
-declared_tpot_slo_ms
-declared_e2e_slo_ms
-```
-
-beside measurements such as:
-
-```text
-ttft_ms
-tpot_mean_ms
-arrival_time_ms
-finish_decode_time_ms
-```
-
-E2E is submission to completion and can be derived as:
-
-```text
-finish_decode_time_ms - arrival_time_ms
-```
-
-The metric relationships are exact:
-
-```text
-declared_ttft_slo_ms  ↔ measured TTFT
-declared_tpot_slo_ms  ↔ measured TPOT
-declared_e2e_slo_ms   ↔ measured E2E
-```
-
-One metric's bound cannot stand in for another.
-
-## 10. Summary folds per-request verdicts
-
-For each bound a request actually declared:
-
-```text
-attained = measurement <= bound
-```
-
-If a request declares multiple bounds, it attains its combined per-request SLO
-only when every declared bound is met. For example:
-
-```text
-declared: TTFT <= 300 ms, TPOT <= 25 ms, no E2E bound
-measured: TTFT = 240 ms, TPOT = 31 ms
-
-TTFT verdict    = attained
-TPOT verdict    = violated
-combined verdict = violated
-```
-
-A request with no bound for a metric is excluded from that metric's
-denominator. If it has no per-request bound at all and no run-level objective,
-it is also excluded from overall SLO attainment; “asked for nothing” must not
-be reported as “attained everything.”
+The main binary and sweep share one runner instead of maintaining two replay
+paths. Another consumer may share the schema's format contracts and loaders
+without inheriting this HTTP client's `ReplayWorkload`, token construction, or
+execution policy.
 
 ## Owner map
 
-| Concept | Question | Owner |
-|---|---|---|
-| `InputFileFormat` | Which family-specific format is this file? | `schema/format/` |
-| `RequestFamily` | What request family does this whole file contain? | `schema/` and startup dispatch |
-| `TraceTag` | Which optional column bundles are present? | `schema/` |
-| `InputFileSchema` | What exact input contract was declared? | `schema/` |
-| `schema/format/` | How are bytes validated and organized? | format loader |
-| `workload.rs` | How is validated input replayed for this run? | runtime workload operations |
-| `Definition` | What work should this family perform? | typed request |
-| `ReleaseMetadata` | When may it enter? | replay scheduler |
-| `SloContract` | What per-metric duration bounds apply? | request core |
-| `SchedulingContract` | What queue-ranking policy hint applies? | request core/admission |
-| `Progress` | How much work has completed? | active request |
-| `Telemetry` | What timing was observed? | active request |
-| JSONL / `request_slo.parquet` | What was declared and measured? | logging |
-| `SloSummary` | What fraction met the applicable bounds? | reporting |
+| Path | Sole responsibility |
+|---|---|
+| `launcher/` | YAML validation, argv/build/run lifecycle, and terminal UI |
+| `schema/input_file_schema.rs` | combine a complete format and tags into an exact file contract |
+| `schema/format/` | decode, validate, and organize family-specific typed contents |
+| `schema/family/` | family-specific declared value types |
+| `schema/tag/` | orthogonal per-row declaration types |
+| `workload.rs` | runtime dispatch, truncation, rate scaling, and workload summary |
+| `runner.rs` | wiring and lifecycle for one run |
+| `executor/` | arrival release, session dependency, admission, request lifecycle |
+| `tokens.rs` | concrete token ids and session-context carry-forward |
+| `backend/wire/` | protocol-specific JSON shaping and parsing |
+| `backend/client.rs` | shared HTTP streaming engine and integrity measurements |
+| `record.rs` | per-step source-plus-outcome JSONL contract |
+| `timeline.rs` | optional per-event recording |
+| `summary.rs` | replay, runtime, timeline, and run-level aggregation |
+| `slo.rs` | optional declared-versus-measured SLO evaluation |
 
 The shortest useful mental model is:
 
 ```text
-InputFileSchema defines the file.
-Format loaders prove that the bytes match it.
-Workload applies this run's replay operations.
-ScheduledRequest waits for release.
-Request preserves the declaration.
-ActiveRequest holds execution state.
-Telemetry records what happened.
-Summary compares measurements with SLOs.
+Schema says what the file is.
+The format loader turns bytes into validated typed contents.
+Workload decides how this run replays them.
+Executor turns the plan into actual requests under time and dependency rules.
+Backend turns requests into stream outcomes.
+Record and Summary preserve what actually happened.
 ```

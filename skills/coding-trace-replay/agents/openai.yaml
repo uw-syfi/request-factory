@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coding Trace Replay"
+  short_description: "Run and diagnose typed serving workload replays"
+  default_prompt: "Use $coding-trace-replay to configure and interpret this req-frontend task through its YAML launcher."

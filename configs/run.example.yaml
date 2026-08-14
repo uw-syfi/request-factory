@@ -1,0 +1,35 @@
+input:
+  trace: ../examples/session_execution_v2_example.csv
+  format: text-generation-session-execution-v2
+  tags: []
+
+corpus:
+  text_file: ../README.md
+  tokenizer: /path/to/served-model/tokenizer.json
+  token_pool_limit: 100000000
+
+server:
+  backend: openai
+  base_url: http://127.0.0.1:8000/v1
+  model: served-model-name
+  temperature: 0
+
+replay:
+  dry_run: false
+  arrival_mode: trace-timed
+  max_concurrency: 8
+  stop_session_on_error: true
+  stream_idle_timeout_seconds: 600
+  context:
+    max_model_len: 131072
+    on_limit: skip
+
+measurement:
+  timeline: true
+  # Omit this block when the run declares no global objective.
+  slo:
+    ttft_ms: 500
+    tpot_ms: 50
+
+output:
+  directory: ../out/run-example

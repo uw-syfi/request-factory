@@ -1,0 +1,9 @@
+tokenizer:
+  path: /path/to/any/tokenizer.json
+
+checks:
+  pairs: 2
+  port: 8271
+
+output:
+  directory: ../out/selfcheck

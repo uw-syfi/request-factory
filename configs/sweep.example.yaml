@@ -1,0 +1,41 @@
+search:
+  mode: max-sustainable-rate
+  start_rate: 5
+  max_rate: 800
+  min_rate: 0.1
+  tolerance: 0.05
+  densify_points: 3
+  max_shortfall: 0.10
+  resume: true
+
+input:
+  trace: ../examples/session_execution_v2_example.csv
+  format: text-generation-session-execution-v2
+  tags: []
+
+corpus:
+  text_file: ../README.md
+  tokenizer: /path/to/served-model/tokenizer.json
+  token_pool_limit: 100000000
+
+server:
+  backend: openai
+  base_url: http://127.0.0.1:8000/v1
+  model: served-model-name
+  temperature: 0
+
+replay:
+  max_concurrency: 64
+  stop_session_on_error: true
+  context:
+    max_model_len: 131072
+    on_limit: skip
+
+measurement:
+  timeline: true
+
+output:
+  directory: ../out/sweep-example
+
+visualization:
+  enabled: true
