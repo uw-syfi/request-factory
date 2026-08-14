@@ -345,8 +345,9 @@ pub struct RunMetrics {
     /// Fraction of steps meeting every bound in force. `None` when the run was
     /// held to no objective at all.
     pub slo_attainment: Option<f64>,
-    /// Fraction of the rows that declared their own deadline and met it.
-    pub declared_deadline_attainment: Option<f64>,
+    /// Fraction of rows with per-request metric bounds that met every bound they
+    /// declared.
+    pub declared_slo_attainment: Option<f64>,
     /// Nonzero means the per-event timeline is a sample of this point rather
     /// than a record of it.
     pub timeline_dropped_requests: usize,
@@ -380,11 +381,11 @@ impl RunSummary {
             tpot_ms_p50: common.tpot_ms_p50,
             tpot_ms_p90: common.tpot_ms_p90,
             slo_attainment: self.slo.as_ref().and_then(|slo| slo.attainment),
-            declared_deadline_attainment: self
+            declared_slo_attainment: self
                 .slo
                 .as_ref()
-                .and_then(|slo| slo.declared_deadline)
-                .and_then(|deadline| deadline.attainment),
+                .and_then(|slo| slo.declared_slo)
+                .and_then(|declared| declared.attainment),
             timeline_dropped_requests: self.timeline.dropped_requests,
             workload_units: self.workload.workload_units(),
             steps_per_workload_unit: self.workload.steps_per_workload_unit(),
@@ -692,6 +693,7 @@ mod tests {
             output_len_target: 4,
             tool_wait_after_ms: 0.0,
             arrival_time_ms: 0.0,
+            slo: Default::default(),
             scheduling: Default::default(),
         };
         let mut measured_outcome = outcome("r1", 0.0, 1.0, 10.0, Some(1.0), 4, "SUCCESS");

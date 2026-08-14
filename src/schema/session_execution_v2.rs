@@ -19,7 +19,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::scheduling::RequestScheduling;
-use super::{TraceDeclaration, TraceTag};
+use super::{RequestSlo, TraceDeclaration, TraceTag};
 
 /// Schema name recorded in the manifest and named on the command line. Consumers
 /// select it explicitly; no consumer sniffs headers to discover it.
@@ -114,8 +114,10 @@ pub fn load(path: &str, declaration: &TraceDeclaration) -> Result<Vec<DeclaredRo
         .verify_header(headers.iter())
         .map_err(|mismatch| anyhow!("{path}: {mismatch}"))?;
 
-    let reads_scheduling = declaration.carries(TraceTag::Slo);
+    let reads_slo = declaration.carries(TraceTag::Slo);
+    let reads_priority = declaration.carries(TraceTag::Priority);
     let mut rows: Vec<ExecutionRow> = Vec::new();
+    let mut slos: Vec<RequestSlo> = Vec::new();
     let mut scheduling: Vec<RequestScheduling> = Vec::new();
     for (index, record) in reader.records().enumerate() {
         let line = index + 2; // the header occupies line 1
@@ -125,7 +127,17 @@ pub fn load(path: &str, declaration: &TraceDeclaration) -> Result<Vec<DeclaredRo
                 .deserialize(Some(&headers))
                 .context("failed to parse a session-execution-v2 row")?,
         );
-        let declared = if reads_scheduling {
+        let slo = if reads_slo {
+            let declared: RequestSlo = record
+                .deserialize(Some(&headers))
+                .context("failed to parse a session-execution-v2 row")?;
+            declared.validate(&format!("{path} line {line}"))?;
+            declared
+        } else {
+            RequestSlo::default()
+        };
+        slos.push(slo);
+        let declared = if reads_priority {
             let declared: RequestScheduling = record
                 .deserialize(Some(&headers))
                 .context("failed to parse a session-execution-v2 row")?;
@@ -139,8 +151,13 @@ pub fn load(path: &str, declaration: &TraceDeclaration) -> Result<Vec<DeclaredRo
     validate(&rows).with_context(|| format!("{path} is not a canonical {SCHEMA_NAME} trace"))?;
     Ok(rows
         .into_iter()
+        .zip(slos)
         .zip(scheduling)
-        .map(|(row, scheduling)| DeclaredRow { row, scheduling })
+        .map(|((row, slo), scheduling)| DeclaredRow {
+            row,
+            slo,
+            scheduling,
+        })
         .collect())
 }
 
@@ -153,6 +170,7 @@ pub fn load(path: &str, declaration: &TraceDeclaration) -> Result<Vec<DeclaredRo
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeclaredRow {
     pub row: ExecutionRow,
+    pub slo: RequestSlo,
     pub scheduling: RequestScheduling,
 }
 

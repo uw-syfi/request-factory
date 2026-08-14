@@ -136,7 +136,7 @@ enum Mode {
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum AttainmentChoice {
     Overall,
-    DeclaredDeadline,
+    DeclaredSlo,
 }
 
 /// Which throughput `peak-throughput` maximizes.
@@ -232,7 +232,7 @@ struct CurveEntry {
     tpot_ms_p50: Option<f64>,
     tpot_ms_p90: Option<f64>,
     slo_attainment: Option<f64>,
-    declared_deadline_attainment: Option<f64>,
+    declared_slo_attainment: Option<f64>,
     failed_steps: usize,
 }
 
@@ -353,7 +353,7 @@ async fn run_adaptive(args: &SweepArgs) -> Result<SweepReport> {
             target_attainment: args.target_attainment,
             metric: match args.attainment_metric {
                 AttainmentChoice::Overall => AttainmentMetric::Overall,
-                AttainmentChoice::DeclaredDeadline => AttainmentMetric::DeclaredDeadline,
+                AttainmentChoice::DeclaredSlo => AttainmentMetric::DeclaredSlo,
             },
         },
         Mode::Grid | Mode::PeakThroughput => {
@@ -476,7 +476,7 @@ fn assemble(
             tpot_ms_p50: point.record.metrics.tpot_ms_p50,
             tpot_ms_p90: point.record.metrics.tpot_ms_p90,
             slo_attainment: point.record.metrics.slo_attainment,
-            declared_deadline_attainment: point.record.metrics.declared_deadline_attainment,
+            declared_slo_attainment: point.record.metrics.declared_slo_attainment,
             failed_steps: point.record.metrics.failed_steps,
         })
         .collect();

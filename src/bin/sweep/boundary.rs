@@ -69,8 +69,8 @@ pub enum Boundary {
 pub enum AttainmentMetric {
     /// Every bound in force, from `--slo` or the trace's sidecar.
     Overall,
-    /// Only the per-request deadlines the trace declared for itself.
-    DeclaredDeadline,
+    /// Only the metric-specific bounds individual requests declared.
+    DeclaredSlo,
 }
 
 /// Why a point was judged as it was, in words a reader can check.
@@ -120,9 +120,7 @@ impl Boundary {
             } => {
                 let measured = match metric {
                     AttainmentMetric::Overall => candidate.metrics.slo_attainment,
-                    AttainmentMetric::DeclaredDeadline => {
-                        candidate.metrics.declared_deadline_attainment
-                    }
+                    AttainmentMetric::DeclaredSlo => candidate.metrics.declared_slo_attainment,
                 };
                 let Some(attainment) = measured else {
                     bail!(
@@ -132,7 +130,7 @@ impl Boundary {
                         candidate.rate,
                         match metric {
                             AttainmentMetric::Overall => "SLO",
-                            AttainmentMetric::DeclaredDeadline => "declared-deadline",
+                            AttainmentMetric::DeclaredSlo => "declared-slo",
                         },
                     );
                 };
@@ -320,17 +318,17 @@ mod tests {
     }
 
     #[test]
-    fn the_declared_deadline_metric_is_watched_separately_from_the_overall_one() {
+    fn the_declared_slo_metric_is_watched_separately_from_the_overall_one() {
         let boundary = Boundary::MaxRateUnderSlo {
             target_attainment: 0.9,
-            metric: AttainmentMetric::DeclaredDeadline,
+            metric: AttainmentMetric::DeclaredSlo,
         };
         let candidate = Measured {
             rate: 1.0,
-            // Overall is fine; the trace's own deadlines are not.
+            // Overall is fine; the trace's own metric SLOs are not.
             metrics: RunMetrics {
                 slo_attainment: Some(1.0),
-                declared_deadline_attainment: Some(0.5),
+                declared_slo_attainment: Some(0.5),
                 ..RunMetrics::default()
             },
         };

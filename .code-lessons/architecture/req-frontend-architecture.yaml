@@ -97,7 +97,7 @@ lesson:
             `TraceKind` 指明 workload 属于哪种 request family，以及它是否是 autoregressive。
             [TraceDeclaration](code-ref:trace-declaration) 再把 kind、彼此独立的 tags 和 source
             schema 组合成完整声明，并严格核对 CSV header。这样，即使某个文件碰巧能够被
-            serde 解析，只要列定义与声明不一致，也不能进入执行。scheduling、SLO、media、
+            serde 解析，只要列定义与声明不一致，也不能进入执行。priority、SLO、media、
             omni 等能力都通过声明决定的固定列表示，而不是塞进一组含义模糊的 optional fields。
 
           key_points:
@@ -113,7 +113,7 @@ lesson:
                   start_line: 227
                   end_line: 388
             - id: scheduling-columns
-              title: priority 与 deadline 的类型化校验
+              title: priority tag 的独立调度声明
               location:
                 file: src/schema/scheduling.rs
                 range:
@@ -156,7 +156,7 @@ lesson:
                   end_line: 72
 
         - id: slo-contract
-          title: SLO 分别记录目标、单项判定和总体达标率
+          title: SLO 支持 run-level 目标和每个 request 独立的指标上限
 
           primary:
             file: src/schema/slo.rs
@@ -165,10 +165,12 @@ lesson:
               end_line: 220
 
           explanation: |
-            `SloSpec` 表示整次运行采用的目标。实测值、单项 metric 判定、deadline 达标情况
-            和最终 summary 分别使用明确的数据类型。每收到一条 `StepLog`，
-            `SloSummary::add` 都用同一组规则累计结果；[SLO 来源解析](code-ref:slo-source-resolution)
-            明确规定 CLI 参数和 sidecar 文件的优先级，防止不同入口采用不同目标。
+            `SloSpec` 表示整次运行统一采用的目标；`RequestSlo` 则让每个 request/round
+            分别声明 `ttft_slo_ms`、`tpot_slo_ms` 和 `e2e_slo_ms`。三个字段都可独立留空，
+            因此同一 session 内的 tool-call round 和长回答可以承担不同义务。priority 使用
+            独立 tag，不属于 SLO。[SLO 来源解析](code-ref:slo-source-resolution) 明确规定 CLI
+            和 sidecar 的优先级；[统一 fold](code-ref:slo-fold) 在同一遍数据上分别统计
+            run-level 与 per-request attainment。
 
           related:
             - id: slo-source-resolution
@@ -438,7 +440,7 @@ lesson:
 
       steps:
         - id: step-log
-          title: StepLog 同时保存请求来源、调度声明和实测结果
+          title: StepLog 同时保存请求来源、SLO、priority 和实测结果
 
           primary:
             file: src/record.rs
@@ -447,11 +449,12 @@ lesson:
               end_line: 160
 
           explanation: |
-            `SourceRecord` 记录这一步来自哪个 session round 或 independent request，以及请求
-            计划和实际释放的时间。`GenerationOutcome` 记录客户端计时、完整性检查结果、
-            server usage 和完成状态。[StepLog 构造器](code-ref:step-log-constructors) 把两部分
-            组合起来，但不要求 backend 层理解 trace family。因此写出的 JSONL 可以作为带
-            schema version 的公开测量格式。
+            `SourceRecord` 记录这一步来自哪个 session round 或 independent request，以及该
+            row 声明的三项 SLO bounds、priority 和 release facts。`GenerationOutcome` 记录
+            客户端实际测得的 TTFT/TPOT/E2E、完整性检查结果、server usage 和完成状态。
+            [StepLog 构造器](code-ref:step-log-constructors) 把声明与观测组合起来，但不要求
+            backend 层理解 trace family。JSONL schema v11 因而能逐 request 审计“要求什么”
+            与“实际得到什么”。
 
           related:
             - id: step-log-constructors

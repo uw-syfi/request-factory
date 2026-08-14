@@ -210,6 +210,7 @@ mod tests {
             input_len: 1,
             output_len: 1,
             tool_wait_after_ms: 0.0,
+            slo: Default::default(),
             scheduling: Default::default(),
         }
     }

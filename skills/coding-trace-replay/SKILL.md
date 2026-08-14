@@ -149,8 +149,9 @@ was generated at — read the manifest.
 # 4. Hold the run to an objective and report attainment.
 #    ... --slo 'ttft_ms=500,tpot_ms=50'
 
-# 5. Replay a trace carrying its own per-round deadlines.
-#    ... --trace-tags slo        (the file must then have deadline_ms + priority)
+# 5. Replay a trace carrying per-round metric-specific bounds.
+#    ... --trace-tags slo        (ttft_slo_ms + tpot_slo_ms + e2e_slo_ms)
+#    Add --trace-tags slo,priority only when it also carries priority.
 
 # 6. Find the rate where the server stops keeping up. Ramps, bisects, densifies.
 ./target/release/sweep --mode max-sustainable-rate --out out/sweep \
@@ -206,7 +207,7 @@ server's own token space.
   run refuses a header, the file is not malformed — the declaration is wrong.
   Read the `expected exactly:` list in the message and add the tag the file
   needs, rather than editing the file.
-- `slo.declared_deadline` counts only the rows that set `deadline_ms`. Read
+- `slo.declared_slo` counts only rows that set at least one metric bound. Read
   `declared_steps` against the run's total before quoting its rate: an
   almost-empty column produces a rate over a handful of rows.
 - `knee` and `peak` answer different questions and are usually different rates.

@@ -144,14 +144,14 @@ def attainment_curve(sweep: Sweep, out: Path) -> Path:
     """SLO attainment against offered rate.
 
     Two independent series, never merged. `slo_attainment` is the fraction of
-    steps meeting the *run's* bounds; `declared_deadline_attainment` is the
-    fraction of the rows that carried their own `deadline_ms` and met it — a
-    different denominator over a different subset. Averaging them would produce
+    steps meeting the *run's* bounds; `declared_slo_attainment` is the fraction
+    of rows with their own metric-specific bounds that met every bound they
+    declared — a different denominator over a different subset. Averaging them would produce
     a number that answers no question.
     """
     figure, axes = pyplot.subplots(figsize=(8, 5))
     overall = sweep.series("slo_attainment")
-    declared = sweep.series("declared_deadline_attainment")
+    declared = sweep.series("declared_slo_attainment")
 
     if not len(overall) and not len(declared):
         _nothing_to_draw(
@@ -168,7 +168,7 @@ def attainment_curve(sweep: Sweep, out: Path) -> Path:
                 declared.y,
                 "s--",
                 color="#ff7f0e",
-                label="rows' own deadlines",
+                label="rows' own metric SLOs",
             )
         target = sweep.config.get("target_attainment")
         if target is not None:

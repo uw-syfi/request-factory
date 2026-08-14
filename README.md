@@ -531,16 +531,18 @@ file describes something the run was not told about. That second case is the one
 worth having — an undeclared column is data whose author expected it to matter,
 and serde would have silently dropped it.
 
-`slo` is the tag that exists today. It adds two columns to whatever kind or
-format it is used with, including the canonical one:
+`slo` and `priority` are independent tags. They add these columns to whatever
+kind or format declares them, including the canonical one:
 
 | column | meaning |
 | --- | --- |
-| `deadline_ms` | completion budget for **this row**, relative to its release. Blank on a row means that row declares none |
-| `priority` | server-side scheduling priority. Carried into the log, **never acted on** — this client has no queue of its own to reorder, and the server is the thing being measured |
+| `ttft_slo_ms` | this row's TTFT upper bound; blank means this row declares none |
+| `tpot_slo_ms` | this row's TPOT upper bound; blank means this row declares none |
+| `e2e_slo_ms` | this row's submission-to-completion upper bound; blank means this row declares none |
+| `priority` | added only by the `priority` tag; carried into the log and never acted on by this client |
 
 ```bash
---trace-format session --trace-tags slo    # canonical trace + per-round deadlines
+--trace-format session --trace-tags slo,priority
 ```
 
 Declaring a kind or tag this client cannot execute is refused by name rather
@@ -815,17 +817,17 @@ this zero-fill cannot mean "the server never reports cache detail at all".
 
 ## Output contracts
 
-### Per-request JSONL — schema v10
+### Per-request JSONL — schema v11
 
 `--log-path` receives one typed record per attempted request. Session and
 independent-request source data are tagged variants rather than one sparse
 object.
 
-v10 is additive: when a trace declares the `slo` tag, each record carries the
-`declared_deadline_ms` and `declared_priority` that row set for itself. Both are
-**absent**, not null, on a trace that declared no such column — so a reader can
-tell "this file carried no deadlines" from "this row left it blank", which is
-exactly the distinction the attainment fold depends on.
+v11 replaces the single per-row completion deadline with metric-specific
+`declared_ttft_slo_ms`, `declared_tpot_slo_ms`, and `declared_e2e_slo_ms`.
+`declared_priority` now comes from a separate `priority` tag. Every undeclared or
+blank value is absent rather than null, so a reader can distinguish a bound the
+row never declared from a bound it violated.
 
 v9 is the first non-additive revision: it **removes** three session fields that
 described a decision the runtime no longer makes. `session_context_policy`,
@@ -854,11 +856,11 @@ described under [Request backends](#request-backends). Consumers reading
 Abbreviated session example:
 
 <details>
-<summary><b>View a schema-v10 session record</b></summary>
+<summary><b>View a schema-v11 session record</b></summary>
 
 ```json
 {
-  "schema_version": 10,
+  "schema_version": 11,
   "source": {
     "type": "session_round",
     "data": {
@@ -875,7 +877,9 @@ Abbreviated session example:
       "output_len_target": 64,
       "tool_wait_after_ms": 100.0,
       "arrival_time_ms": 0.0,
-      "declared_deadline_ms": 2000.0,
+      "declared_ttft_slo_ms": 500.0,
+      "declared_tpot_slo_ms": 50.0,
+      "declared_e2e_slo_ms": 2000.0,
       "declared_priority": 0
     }
   },
@@ -1021,24 +1025,23 @@ Three scopes are supported, and the summary records which applied:
 | --- | --- | --- |
 | global | `--slo` on the command line | `global` |
 | per trace | a `<trace>.slo.json` sidecar beside the trace file | `trace` |
-| per request | the `slo` trace tag's `deadline_ms` column | absent — see below |
+| per request | the `slo` tag's three metric-specific columns | absent — see below |
 
 The first two set the same bounds for every row, which is why they are a
 sidecar rather than a column repeated N times. The third is genuinely per-row
-and reported separately, under `slo.declared_deadline`:
+and reported separately, under `slo.declared_slo`:
 
 ```text
 slo attainment | source=TraceRows steps=30 overall=0.7333 |
-  declared_deadline 0.5556 (18 of 30 rows, 8 violated, 0 unmeasured)
+  declared_slo 0.5556 (18 of 30 rows, 8 violated, 0 unmeasured)
 ```
 
-A row's deadline is judged on the same clock as `e2e_ms`, and only rows that
-declared one are counted — a blank cell asks for nothing, so counting blanks as
-attained would let an almost-empty column report near-perfect attainment. A step
-is attained overall when it met **every** bound in force for it: the run's and
-its own. A run needs no `--slo` at all for this: a trace declaring the tag is
-enough to make attainment worth reporting, because a column read and discarded
-is worse than a column never read.
+Each row is judged only on the TTFT, TPOT, and E2E bounds it filled in. A row
+with all three cells blank is outside the per-request denominator; counting it
+as attained would let an almost-empty declaration report near-perfect
+attainment. A step is attained overall when it met every applicable run-level
+and per-request bound. A trace declaring the tag needs no `--slo` to produce
+attainment.
 
 The sidecar is the same convention `.manifest.json` and `.plan.json` already
 use, so a trace and everything true about it travel together:
@@ -1169,8 +1172,8 @@ output lengths these peak in different places.
 #### `max-rate-under-slo`
 
 Crossed when SLO attainment falls below `--target-attainment`.
-`--attainment-metric declared-deadline` watches the trace's own per-request
-deadlines instead of the run-level objective. Either way the run must have an
+`--attainment-metric declared-slo` watches the trace's own per-request metric
+bounds instead of the run-level objective. Either way the run must have an
 objective; a sweep whose every point reports `null` attainment fails rather than
 ramping to the ceiling and announcing a knee it never tested for.
 
@@ -1255,7 +1258,7 @@ Four figures, written beside the report under `figures/`:
 | File | Shows |
 |---|---|
 | `throughput.png` | delivered steps against offered load, with the knee bracket or peak plateau shaded, and the dashed reference a perfect server would have followed |
-| `attainment.png` | SLO attainment against offered load — the run's objective and the rows' own deadlines as separate series, never merged |
+| `attainment.png` | SLO attainment against offered load — the run's objective and per-request metric bounds as separate series, never merged |
 | `latency.png` | TTFT, TPOT and end-to-end distributions per rate, as boxes with p99 marked |
 | `arrivals_rate_*.png` | when each token actually arrived, per request, for the lowest and highest rates measured |
 
@@ -1403,7 +1406,7 @@ Every flag `session_runner` accepts. The axis columns map back to
 |---|---|---|
 | `--trace-format` | `session` | `session`, `independent` — axis 1. `session` reads a canonical trace; generate one with `tracegen` |
 | `--trace-kind` | `text_generation` | What a row is, from the shared taxonomy. Only `text_generation` can be submitted today; see [What a trace declares](#what-a-trace-declares-about-itself) |
-| `--trace-tags` | none | Comma-separated. `slo` adds `deadline_ms` and `priority` columns |
+| `--trace-tags` | none | Comma-separated. `slo` adds TTFT/TPOT/E2E bounds; `priority` adds scheduling priority |
 | `--backend` | `openai` | `openai`, `vllm-tokens`, `sglang-tokens` — axis 3 |
 | `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for `openai`, omit it for the native token endpoints |
 
@@ -1468,8 +1471,8 @@ A context-limit skip always ends its session, independently of this flag.
 │   │   ├── mod.rs            trace kinds, tags, column blocks, header check
 │   │   ├── media.rs          image/video/audio extents, decoding strategy
 │   │   ├── omni.rs           heterogeneous input/output segment JSON
-│   │   ├── scheduling.rs     the slo tag's columns: deadline_ms, priority
-│   │   ├── slo.rs            objective bounds + the attainment fold
+│   │   ├── scheduling.rs     the priority tag's scheduling declaration
+│   │   ├── slo.rs            run/trace/per-request bounds + attainment folds
 │   │   └── session_execution_v2.rs  the canonical schema, minting, validation
 │   ├── runner.rs             one run: validate, load, preflight, fan out, fold
 │   ├── slo_source.rs         --slo, the trace's sidecar, and which one won

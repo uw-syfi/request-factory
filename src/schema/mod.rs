@@ -28,7 +28,7 @@ use anyhow::{bail, Result};
 pub use media::{AudioExtent, DecodingStrategy, ImageExtent, VideoExtent};
 pub use omni::{OmniInputSegment, OmniOutputSpec};
 pub use scheduling::RequestScheduling;
-pub use slo::{SloMeasurement, SloSource, SloSpec, SloSummary};
+pub use slo::{RequestSlo, SloMeasurement, SloSource, SloSpec, SloSummary};
 
 /// Columns every native row carries, whatever its kind: who it is and when it
 /// arrives.
@@ -173,16 +173,18 @@ impl TraceKind {
 pub enum TraceTag {
     Session,
     Slo,
+    Priority,
     Speculative,
 }
 
 impl TraceTag {
-    pub const CHOICES: &'static [&'static str] = &["session", "slo", "speculative"];
+    pub const CHOICES: &'static [&'static str] = &["session", "slo", "priority", "speculative"];
 
     pub fn parse(name: &str) -> Result<Self> {
         Ok(match name {
             "session" => Self::Session,
             "slo" => Self::Slo,
+            "priority" => Self::Priority,
             "speculative" => Self::Speculative,
             other => bail!(
                 "unknown trace_tag {other:?} (expected one of {:?})",
@@ -198,7 +200,8 @@ impl TraceTag {
     pub fn columns(self) -> &'static [&'static str] {
         match self {
             Self::Session => &["session_id", "prefix_kv", "tool_wait_after_ms"],
-            Self::Slo => &["deadline_ms", "priority"],
+            Self::Slo => &["ttft_slo_ms", "tpot_slo_ms", "e2e_slo_ms"],
+            Self::Priority => &["priority"],
             Self::Speculative => &["accept_rate"],
         }
     }
@@ -206,13 +209,13 @@ impl TraceTag {
     /// Whether this tag can mean anything for the given kind.
     ///
     /// Only speculative decoding is excluded, and only because it *is* a
-    /// statement about token-by-token output. A deadline applies to anything,
-    /// and a session of image generations is a real workload -- what a
+    /// statement about token-by-token output. Latency bounds and priority apply
+    /// to anything, and a session of image generations is a real workload -- what a
     /// non-autoregressive session may not carry is a reusable KV prefix, which
     /// is a value-level rule its consumer enforces per row.
     pub fn applies_to(self, kind: TraceKind) -> bool {
         match self {
-            Self::Session | Self::Slo => true,
+            Self::Session | Self::Slo | Self::Priority => true,
             Self::Speculative => kind.is_autoregressive(),
         }
     }
@@ -297,7 +300,7 @@ impl TraceDeclaration {
     /// Tags that are *orthogonal* to the format are not implied and not
     /// forbidden: they are the mechanism by which a file says it carries more
     /// than the format's own columns, and refusing them here would mean a
-    /// canonical trace could never carry a per-request deadline.
+    /// canonical trace could never carry per-request metric bounds.
     pub fn parse_with_schema(kind: &str, tags: &[String], schema: &str) -> Result<Self> {
         let source_schema = SourceSchema::parse(schema)?;
         let mut declaration = Self::parse(kind, tags)?;
@@ -481,15 +484,32 @@ mod tests {
     }
 
     #[test]
+    fn slo_and_priority_are_independent_column_contracts() {
+        assert_eq!(
+            TraceTag::Slo.columns(),
+            &["ttft_slo_ms", "tpot_slo_ms", "e2e_slo_ms"]
+        );
+        assert_eq!(TraceTag::Priority.columns(), &["priority"]);
+
+        let slo_only = TraceDeclaration::parse("text_generation", &["slo".to_string()]).unwrap();
+        assert!(!slo_only.expected_columns().contains(&"priority"));
+        let priority_only =
+            TraceDeclaration::parse("text_generation", &["priority".to_string()]).unwrap();
+        assert!(!priority_only.expected_columns().contains(&"ttft_slo_ms"));
+    }
+
+    #[test]
     fn a_tag_that_presupposes_token_output_is_rejected_on_a_step_generated_kind() {
         let err = TraceDeclaration::parse("text_to_image", &["speculative".to_string()])
             .expect_err("speculative decoding has no meaning without token output");
         assert!(err.to_string().contains("speculative"));
 
-        // A deadline is a deadline, and a session of image generations is a real
-        // workload -- neither is excluded by the kind.
+        // Latency bounds, priority and sessions are meaningful for every request
+        // kind; only speculative token decoding depends on output units.
         TraceDeclaration::parse("text_to_image", &["slo".to_string()])
-            .expect("every kind can carry a deadline");
+            .expect("every kind can carry latency bounds");
+        TraceDeclaration::parse("text_to_image", &["priority".to_string()])
+            .expect("every kind can carry priority");
         TraceDeclaration::parse("text_to_image", &["session".to_string()])
             .expect("a session need not be autoregressive");
     }
@@ -546,7 +566,7 @@ mod tests {
             TraceDeclaration::parse_with_schema("text_generation", &[], "session-execution-v2")
                 .unwrap()
                 .verify_header(expected.iter().copied());
-        assert!(undeclared.unwrap_err().to_string().contains("deadline_ms"));
+        assert!(undeclared.unwrap_err().to_string().contains("ttft_slo_ms"));
     }
 
     #[test]

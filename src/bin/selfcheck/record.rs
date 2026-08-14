@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 /// The schema this harness knows how to read. Checked, not assumed: a bumped
 /// version means the fields below may mean something else.
-pub const EXPECTED_SCHEMA_VERSION: u32 = 10;
+pub const EXPECTED_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Deserialize)]
 pub struct Record {

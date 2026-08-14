@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 
 use crate::schema::session_execution_v2 as v2;
-use crate::schema::{RequestScheduling, TraceDeclaration};
+use crate::schema::{RequestScheduling, RequestSlo, TraceDeclaration};
 
 /// One round of one session, as the replay runtime executes it.
 ///
@@ -18,9 +18,10 @@ pub(crate) struct SessionStep {
     pub(crate) input_len: usize,
     pub(crate) output_len: usize,
     pub(crate) tool_wait_after_ms: f64,
-    /// What the `slo` tag declared for this round, empty when it was not
-    /// declared. Per round, not per session: within one conversation a tool-call
-    /// turn and a long answer owe different things.
+    /// Metric-specific bounds for this round. Per round, not per session: within
+    /// one conversation a tool-call turn and a long answer owe different things.
+    pub(crate) slo: RequestSlo,
+    /// The independently declared scheduling priority for this round.
     pub(crate) scheduling: RequestScheduling,
 }
 
@@ -56,6 +57,7 @@ pub(super) fn load(
             input_len: row.input_len,
             output_len: row.output_len,
             tool_wait_after_ms: row.tool_wait_after_ms,
+            slo: declared.slo,
             scheduling: declared.scheduling,
         };
         match sessions.last_mut() {

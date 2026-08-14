@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-use crate::schema::{RequestScheduling, TraceDeclaration, TraceTag};
+use crate::schema::{RequestScheduling, RequestSlo, TraceDeclaration, TraceTag};
 
 /// One independent request from the generic request CSV frontend.
 ///
@@ -14,6 +14,9 @@ pub(crate) struct IndependentRequest {
     pub(crate) output_len: usize,
     pub(crate) arrival_time: f64,
     /// What the `slo` tag declared for this row, empty when it was not declared.
+    #[serde(skip)]
+    pub(crate) slo: RequestSlo,
+    /// What the `priority` tag declared for this row.
     #[serde(skip)]
     pub(crate) scheduling: RequestScheduling,
 }
@@ -39,7 +42,8 @@ pub(super) fn load(
         .verify_header(headers.iter())
         .map_err(|mismatch| anyhow!("{path}: {mismatch}"))?;
 
-    let reads_scheduling = declaration.carries(TraceTag::Slo);
+    let reads_slo = declaration.carries(TraceTag::Slo);
+    let reads_priority = declaration.carries(TraceTag::Priority);
     let mut requests = Vec::new();
     for (index, record) in reader.records().enumerate() {
         if max_requests.is_some_and(|max| requests.len() >= max) {
@@ -50,7 +54,13 @@ pub(super) fn load(
         let mut request: IndependentRequest = record
             .deserialize(Some(&headers))
             .with_context(|| format!("{path}: failed to parse line {line}"))?;
-        if reads_scheduling {
+        if reads_slo {
+            request.slo = record
+                .deserialize(Some(&headers))
+                .with_context(|| format!("{path}: failed to parse line {line}"))?;
+            request.slo.validate(&format!("{path} line {line}"))?;
+        }
+        if reads_priority {
             request.scheduling = record
                 .deserialize(Some(&headers))
                 .with_context(|| format!("{path}: failed to parse line {line}"))?;
@@ -79,11 +89,11 @@ mod tests {
 
     #[test]
     fn an_undeclared_column_is_refused_rather_than_dropped() {
-        // serde alone would have ignored `deadline_ms` and produced a run that
-        // silently held every request to no deadline at all.
+        // serde alone would have ignored `ttft_slo_ms` and produced a run that
+        // silently held every request to no TTFT bound at all.
         let path = write(
             "undeclared",
-            "id,arrival_time,input_len,output_len,deadline_ms\nreq-1,0,16,4,500\n",
+            "id,arrival_time,input_len,output_len,ttft_slo_ms\nreq-1,0,16,4,500\n",
         );
 
         let error = load(path.to_str().unwrap(), &TraceDeclaration::text(), None)
@@ -91,24 +101,30 @@ mod tests {
             .to_string();
         std::fs::remove_file(&path).ok();
 
-        assert!(error.contains("deadline_ms"), "{error}");
+        assert!(error.contains("ttft_slo_ms"), "{error}");
     }
 
     #[test]
     fn a_declared_tag_is_read_per_row_and_may_be_blank_on_any_of_them() {
         let path = write(
             "declared",
-            "id,arrival_time,input_len,output_len,deadline_ms,priority\n\
-             req-1,0,16,4,500,7\n\
-             req-2,10,16,4,,\n",
+            "id,arrival_time,input_len,output_len,ttft_slo_ms,tpot_slo_ms,e2e_slo_ms,priority\n\
+             req-1,0,16,4,500,,2000,7\n\
+             req-2,10,16,4,,,,\n",
         );
-        let declaration = TraceDeclaration::parse("text_generation", &["slo".to_string()]).unwrap();
+        let declaration = TraceDeclaration::parse(
+            "text_generation",
+            &["slo".to_string(), "priority".to_string()],
+        )
+        .unwrap();
 
         let requests = load(path.to_str().unwrap(), &declaration, None).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(requests[0].scheduling.deadline_ms, Some(500.0));
+        assert_eq!(requests[0].slo.ttft_slo_ms, Some(500.0));
+        assert_eq!(requests[0].slo.e2e_slo_ms, Some(2000.0));
         assert_eq!(requests[0].scheduling.priority, Some(7));
+        assert!(requests[1].slo.is_empty());
         assert!(requests[1].scheduling.is_empty());
     }
 
@@ -116,7 +132,7 @@ mod tests {
     fn a_declared_column_that_is_missing_is_refused_before_any_row_is_read() {
         let path = write(
             "missing",
-            "id,arrival_time,input_len,output_len\nreq-1,0,16,4\n",
+            "id,arrival_time,input_len,output_len,priority\nreq-1,0,16,4,7\n",
         );
         let declaration = TraceDeclaration::parse("text_generation", &["slo".to_string()]).unwrap();
 
@@ -125,16 +141,16 @@ mod tests {
             .to_string();
         std::fs::remove_file(&path).ok();
 
-        assert!(error.contains("deadline_ms"), "{error}");
+        assert!(error.contains("ttft_slo_ms"), "{error}");
     }
 
     #[test]
-    fn an_impossible_deadline_names_the_line_it_is_on() {
+    fn an_impossible_metric_bound_names_the_line_it_is_on() {
         let path = write(
-            "bad-deadline",
-            "id,arrival_time,input_len,output_len,deadline_ms,priority\n\
-             req-1,0,16,4,500,0\n\
-             req-2,10,16,4,0,0\n",
+            "bad-slo",
+            "id,arrival_time,input_len,output_len,ttft_slo_ms,tpot_slo_ms,e2e_slo_ms\n\
+             req-1,0,16,4,500,,\n\
+             req-2,10,16,4,0,,\n",
         );
         let declaration = TraceDeclaration::parse("text_generation", &["slo".to_string()]).unwrap();
 

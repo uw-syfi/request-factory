@@ -220,6 +220,7 @@ mod tests {
             input_len: 10,
             output_len: 10,
             tool_wait_after_ms: 0.0,
+            slo: Default::default(),
             scheduling: Default::default(),
         };
         let sessions: SessionPlans = vec![("session".to_string(), vec![step])];
@@ -241,6 +242,7 @@ mod tests {
             input_len: 90,
             output_len: 9,
             arrival_time: 0.0,
+            slo: Default::default(),
             scheduling: Default::default(),
         };
 

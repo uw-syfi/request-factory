@@ -119,7 +119,7 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
 
     let replay_summary = ReplaySummary::empty_for(&workload);
     // A run reports attainment when it was given an objective *or* when the
-    // trace declares per-request deadlines -- a trace that sets its own budgets
+    // trace declares per-request metric bounds -- a trace that sets its own budgets
     // and a run that never mentions them would be a column read and discarded.
     let slo_summary = SloSummary::new(objective, declaration.carries(TraceTag::Slo));
     let workload_summary = WorkloadSummary::from_workload(&workload, args.max_model_len);

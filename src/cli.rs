@@ -41,7 +41,7 @@ pub struct Args {
     pub trace_kind: String,
 
     /// Orthogonal declarations this file carries, comma-separated: `slo` adds
-    /// `deadline_ms` and `priority` columns to whatever kind it is used with.
+    /// per-request TTFT/TPOT/E2E bounds; `priority` adds scheduling priority.
     ///
     /// A tag is how a trace says it carries more than its format's own columns.
     /// Undeclared extra columns are an error, not something to ignore: a column

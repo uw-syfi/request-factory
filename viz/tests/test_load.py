@@ -60,7 +60,7 @@ def test_a_missing_metric_is_counted_rather_than_interpolated():
 
 
 def test_a_metric_no_point_reported_yields_an_empty_series_not_zeros():
-    series = sweep().series("declared_deadline_attainment")
+    series = sweep().series("declared_slo_attainment")
 
     assert len(series) == 0
     assert series.missing == 3
