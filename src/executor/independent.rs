@@ -35,17 +35,18 @@ pub(crate) async fn run_independent_request(
         }
     };
     let prompt_ids = token_provider.take(request.input_len);
+    let prompt_len = prompt_ids.len();
     let prompt = Prompt::Tokens(&prompt_ids);
     let request_id = format!("independent_{}", request.id);
     state.common.stats.record_submit();
     let result = if state
         .common
         .policy
-        .skips_at_context_limit(prompt.token_len(), request.output_len)
+        .skips_at_context_limit(prompt_len, request.output_len)
     {
         context_limit_skip_result(
             request_id,
-            prompt.token_len(),
+            prompt_len,
             request.output_len,
             state.common.policy.max_model_len(),
         )
@@ -61,12 +62,8 @@ pub(crate) async fn run_independent_request(
             events: result.timeline,
         });
     }
-    let log = StepLog::independent_request(
-        &request,
-        prompt.token_len(),
-        arrival_release_lag_ms,
-        result.outcome,
-    );
+    let log =
+        StepLog::independent_request(&request, prompt_len, arrival_release_lag_ms, result.outcome);
     let success = log.outcome.is_success();
     let _ = log_tx.send(log).await;
     state.common.stats.record_result(success);

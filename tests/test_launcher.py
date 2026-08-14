@@ -196,6 +196,63 @@ def test_unknown_and_duplicate_keys_are_never_ignored(tmp_path: Path) -> None:
         load_task_config("run", duplicate_path)
 
 
+def test_multimodal_run_rejects_text_corpus_and_wrong_backend(tmp_path: Path) -> None:
+    with_corpus = write_config(
+        tmp_path,
+        """
+input:
+  trace: requests.jsonl
+  format: multimodal-independent-v1
+corpus:
+  text_file: corpus.txt
+  tokenizer: tokenizer.json
+server:
+  backend: openai-chat
+  model: bagel
+output:
+  directory: out
+""",
+        "with-corpus.yaml",
+    )
+    with pytest.raises(ConfigError, match="text-replay-only"):
+        load_task_config("run", with_corpus)
+
+    wrong_backend = write_config(
+        tmp_path,
+        """
+input:
+  trace: requests.jsonl
+  format: multimodal-independent-v1
+server:
+  backend: openai
+  model: bagel
+output:
+  directory: out
+""",
+        "wrong-backend.yaml",
+    )
+    with pytest.raises(ConfigError, match="requires server.backend: openai-chat"):
+        load_task_config("run", wrong_backend)
+
+
+def test_text_run_still_requires_corpus(tmp_path: Path) -> None:
+    config = write_config(
+        tmp_path,
+        """
+input:
+  trace: requests.csv
+  format: text-generation-independent
+server:
+  model: model
+output:
+  directory: out
+""",
+        "missing-corpus.yaml",
+    )
+    with pytest.raises(ConfigError, match="required 'corpus'"):
+        load_task_config("run", config)
+
+
 def test_terminal_filter_keeps_progress_but_hides_per_request_noise() -> None:
     assert ui.should_echo_engine_line("run", "sessions 2/2 | steps 4/4 completed=4")
     assert ui.should_echo_engine_line(

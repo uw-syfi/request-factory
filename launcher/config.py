@@ -241,7 +241,7 @@ def _build_common_run_arguments(
     paths: dict[str, Path],
 ) -> list[str]:
     input_config = _block(root, "input")
-    corpus = _block(root, "corpus")
+    corpus = _block(root, "corpus", required=False)
     server = _block(root, "server")
     replay = _block(root, "replay", required=False)
     measurement = _block(root, "measurement", required=False)
@@ -292,26 +292,34 @@ def _build_common_run_arguments(
             slo_parts.append(f"{metric_name}={threshold}")
 
     trace = _resolve_path(_required_string(input_config, "trace", "input"), config_path)
-    text_file = _resolve_path(
-        _required_string(corpus, "text_file", "corpus"), config_path
-    )
-    tokenizer = _resolve_tokenizer(
-        _required_string(corpus, "tokenizer", "corpus"), config_path
-    )
+    input_format = _required_string(input_config, "format", "input")
+    backend = _optional_string(server, "backend", "server", "openai")
+    is_multimodal = input_format == "multimodal-independent-v1"
+    if is_multimodal:
+        if corpus:
+            raise ConfigError(
+                "corpus is text-replay-only and must be omitted for multimodal-independent-v1"
+            )
+        if backend != "openai-chat":
+            raise ConfigError(
+                "multimodal-independent-v1 requires server.backend: openai-chat"
+            )
+        if context:
+            raise ConfigError(
+                "replay.context is text-replay-only and must be omitted for multimodal-independent-v1"
+            )
+    elif not corpus:
+        raise ConfigError("required 'corpus' must be a mapping for text replay")
 
     arguments = [
         "--trace",
         str(trace),
         "--input-file-format",
-        _required_string(input_config, "format", "input"),
-        "--text-file",
-        str(text_file),
-        "--tokenizer",
-        tokenizer,
+        input_format,
         "--model",
         _required_string(server, "model", "server"),
         "--backend",
-        _optional_string(server, "backend", "server", "openai"),
+        backend,
         "--base-url",
         _optional_string(server, "base_url", "server", "http://127.0.0.1:8000/v1"),
         "--temperature",
@@ -339,6 +347,19 @@ def _build_common_run_arguments(
         "--timeline-path",
         str(paths["timeline"]),
     ]
+    if not is_multimodal:
+        text_file = _resolve_path(
+            _required_string(corpus, "text_file", "corpus"), config_path
+        )
+        tokenizer = _resolve_tokenizer(
+            _required_string(corpus, "tokenizer", "corpus"), config_path
+        )
+        arguments[4:4] = [
+            "--text-file",
+            str(text_file),
+            "--tokenizer",
+            tokenizer,
+        ]
     if tags:
         arguments.extend(["--trace-tags", ",".join(tags)])
     _append_option(

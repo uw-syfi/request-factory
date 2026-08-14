@@ -2,11 +2,11 @@ use serde::Serialize;
 
 use crate::schema::format::text_generation::independent::IndependentRequest;
 use crate::schema::format::text_generation::session::SessionRound;
-use crate::schema::{RequestPriority, RequestSlo};
+use crate::schema::{Modality, RequestPriority, RequestSlo, RequestSpec};
 use crate::slo::SloMeasurement;
 use crate::util::prefix_hit_rate;
 
-const STEP_LOG_SCHEMA_VERSION: u32 = 11;
+const STEP_LOG_SCHEMA_VERSION: u32 = 12;
 
 /// One JSONL record: a typed source plus measurements shared by text generation.
 ///
@@ -25,6 +25,7 @@ pub(crate) struct StepLog {
 pub(crate) enum SourceRecord {
     IndependentRequest(IndependentRequestSource),
     SessionRound(SessionRoundSource),
+    MultimodalRequest(MultimodalRequestSource),
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +114,21 @@ pub(crate) struct IndependentRequestSource {
     pub(crate) slo: DeclaredSlo,
     #[serde(flatten)]
     pub(crate) priority: DeclaredPriority,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct MultimodalRequestSource {
+    pub(crate) id: String,
+    pub(crate) input_modalities: Vec<Modality>,
+    pub(crate) output_modalities: Vec<Modality>,
+    pub(crate) input_parts: usize,
+    pub(crate) assets: usize,
+    pub(crate) asset_bytes: usize,
+    pub(crate) output_len_target: usize,
+    pub(crate) arrival_time_ms: f64,
+    pub(crate) arrival_release_lag_ms: f64,
+    #[serde(flatten)]
+    pub(crate) slo: DeclaredSlo,
 }
 
 /// Measurements that have the same meaning for every text-generation source.
@@ -229,6 +245,31 @@ impl StepLog {
             outcome,
         }
     }
+
+    pub(crate) fn multimodal_request(
+        request: &RequestSpec,
+        asset_bytes: usize,
+        output_len_target: usize,
+        arrival_release_lag_ms: f64,
+        outcome: GenerationOutcome,
+    ) -> Self {
+        Self {
+            schema_version: STEP_LOG_SCHEMA_VERSION,
+            source: SourceRecord::MultimodalRequest(MultimodalRequestSource {
+                id: request.id.clone(),
+                input_modalities: request.input_modalities().into_iter().collect(),
+                output_modalities: request.output_modalities().into_iter().collect(),
+                input_parts: request.inputs.len(),
+                assets: request.assets().count(),
+                asset_bytes,
+                output_len_target,
+                arrival_time_ms: request.arrival_time_ms,
+                arrival_release_lag_ms,
+                slo: DeclaredSlo::default(),
+            }),
+            outcome,
+        }
+    }
 }
 
 impl StepLog {
@@ -249,6 +290,7 @@ impl StepLog {
         let declared_slo = match &self.source {
             SourceRecord::SessionRound(source) => &source.slo,
             SourceRecord::IndependentRequest(source) => &source.slo,
+            SourceRecord::MultimodalRequest(source) => &source.slo,
         };
         SloMeasurement {
             succeeded: self.outcome.is_success(),
@@ -327,7 +369,7 @@ mod tests {
             serde_json::to_value(StepLog::session_round(&step, 12, 8, 4, 0, outcome())).unwrap();
 
         assert_eq!(value["source"]["type"], "session_round");
-        assert_eq!(value["schema_version"], 11);
+        assert_eq!(value["schema_version"], 12);
         // A trace that declared no `slo` tag leaves no trace of it in the record:
         // absent, not null, so a reader can tell "the file had no such column"
         // from "the row left it blank".
@@ -393,5 +435,45 @@ mod tests {
         assert!(!data.contains_key("round_idx"));
         assert!(!data.contains_key("prefix_len"));
         assert!(!data.contains_key("tool_wait_after_ms"));
+    }
+
+    #[test]
+    fn multimodal_record_names_modalities_and_asset_cost_without_text_placeholders() {
+        let request = RequestSpec {
+            id: "food101-pizza".into(),
+            arrival_time_ms: 4.5,
+            inputs: vec![
+                crate::schema::InputPart::Image {
+                    asset: crate::schema::AssetRef {
+                        path: "pizza.jpg".into(),
+                        sha256: None,
+                        media_type: Some("image/jpeg".into()),
+                    },
+                },
+                crate::schema::InputPart::Text {
+                    text: "classify".into(),
+                },
+            ],
+            outputs: vec![crate::schema::OutputSpec::Text { max_tokens: 8 }],
+        };
+        let value = serde_json::to_value(StepLog::multimodal_request(
+            &request,
+            1234,
+            8,
+            0.5,
+            outcome(),
+        ))
+        .unwrap();
+
+        assert_eq!(value["source"]["type"], "multimodal_request");
+        let data = value["source"]["data"].as_object().unwrap();
+        assert_eq!(
+            data["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(data["output_modalities"], serde_json::json!(["text"]));
+        assert_eq!(data["asset_bytes"], 1234);
+        assert!(!data.contains_key("prompt_len"));
+        assert!(!data.contains_key("prefix_len"));
     }
 }

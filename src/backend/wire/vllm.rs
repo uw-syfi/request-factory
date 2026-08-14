@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::super::{Backend, GenRequest, Prompt, StreamEvent, Usage};
@@ -12,8 +13,10 @@ impl Backend for VllmTokensBackend {
         "/inference/v1/generate"
     }
 
-    fn build_payload(&self, req: &GenRequest) -> Value {
-        let Prompt::Tokens(prompt_ids) = req.prompt;
+    fn build_payload(&self, req: &GenRequest) -> Result<Value> {
+        let Prompt::Tokens(prompt_ids) = req.prompt else {
+            bail!("vllm-tokens requires token-id prompts")
+        };
         let mut payload = serde_json::json!({
             "model": req.model,
             // SGLang's OpenAI layer forwards this straight to GenerateReqInput,
@@ -32,7 +35,7 @@ impl Backend for VllmTokensBackend {
         if req.stream {
             payload["stream_options"] = serde_json::json!({"include_usage": true});
         }
-        payload
+        Ok(payload)
     }
 
     fn parse_event(&self, value: &Value) -> StreamEvent {
@@ -78,14 +81,16 @@ mod tests {
     #[test]
     fn vllm_tokens_backend_uses_native_token_protocol() {
         let backend = VllmTokensBackend;
-        let payload = backend.build_payload(&GenRequest {
-            model: "meta-llama/Meta-Llama-3-8B",
-            request_id: "req-1",
-            prompt: Prompt::Tokens(&[11, 22, 33]),
-            max_tokens: 4,
-            temperature: 0.0,
-            stream: true,
-        });
+        let payload = backend
+            .build_payload(&GenRequest {
+                model: "meta-llama/Meta-Llama-3-8B",
+                request_id: "req-1",
+                prompt: Prompt::Tokens(&[11, 22, 33]),
+                max_tokens: 4,
+                temperature: 0.0,
+                stream: true,
+            })
+            .unwrap();
 
         assert_eq!(backend.endpoint_suffix(), "/inference/v1/generate");
         assert_eq!(payload["token_ids"], serde_json::json!([11, 22, 33]));

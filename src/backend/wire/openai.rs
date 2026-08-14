@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::super::{Backend, GenRequest, Prompt, StreamEvent, Usage};
@@ -11,8 +12,10 @@ impl Backend for OpenAiCompletionsBackend {
         "/completions"
     }
 
-    fn build_payload(&self, req: &GenRequest) -> Value {
-        let Prompt::Tokens(prompt_ids) = req.prompt;
+    fn build_payload(&self, req: &GenRequest) -> Result<Value> {
+        let Prompt::Tokens(prompt_ids) = req.prompt else {
+            bail!("openai completions requires token-id prompts")
+        };
         let mut payload = serde_json::json!({
             "model": req.model,
             // SGLang's OpenAI layer forwards this straight to GenerateReqInput,
@@ -38,7 +41,7 @@ impl Backend for OpenAiCompletionsBackend {
             // are the whole point of this runner.
             payload["stream_options"] = serde_json::json!({"include_usage": true});
         }
-        payload
+        Ok(payload)
     }
 
     fn parse_event(&self, value: &Value) -> StreamEvent {

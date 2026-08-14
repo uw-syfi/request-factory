@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use tokio::time::timeout;
 
-use crate::cli::Args;
+use crate::cli::{Args, BackendKind};
 use crate::record::{GenerationOutcome, ServerUsageLog};
 use crate::util::{elapsed_ms, ratio, unix_seconds_now};
 
 use super::integrity::{classify_prompt_echo, PromptEcho};
 use super::stream::StreamAccumulator;
 use super::wire::build_backend;
-use super::{Backend, GenRequest, GenerationResult, Prompt};
+use super::{request_build_failure_result, Backend, GenRequest, GenerationResult, Prompt};
 
 /// Shared streaming engine. It knows only normalized text-generation inputs and
 /// outcomes; frontend/source identity remains in the executor layer.
@@ -27,7 +27,7 @@ pub(crate) struct GenerationClient {
     // because it is a different concern, not because it is a different object.
     pub(super) endpoint: String,
     pub(super) client: reqwest::Client,
-    tokenizer: Arc<Tokenizer>,
+    tokenizer: Option<Arc<Tokenizer>>,
     pub(super) model: String,
     temperature: f64,
     stream_idle_timeout_secs: u64,
@@ -51,7 +51,31 @@ impl GenerationClient {
         Ok(Self {
             endpoint,
             client,
-            tokenizer,
+            tokenizer: Some(tokenizer),
+            model: args.model.clone(),
+            temperature: args.temperature,
+            stream_idle_timeout_secs: args.stream_idle_timeout_secs,
+            record_timeline: args.timeline,
+            backend,
+        })
+    }
+
+    pub(crate) fn new_chat(args: &Args) -> Result<Self> {
+        let backend = build_backend(BackendKind::OpenaiChat);
+        let endpoint = format!(
+            "{}{}",
+            args.base_url.trim_end_matches('/'),
+            backend.endpoint_suffix()
+        );
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(20_000)
+            .tcp_nodelay(true)
+            .timeout(Duration::from_secs(3600))
+            .build()?;
+        Ok(Self {
+            endpoint,
+            client,
+            tokenizer: None,
             model: args.model.clone(),
             temperature: args.temperature,
             stream_idle_timeout_secs: args.stream_idle_timeout_secs,
@@ -71,14 +95,17 @@ impl GenerationClient {
 
         // Submit raw token ids: no client-side decode, so even million-token prompts cost nothing
         // here and the server's prefix-cache keys match the exact ids we built.
-        let payload = self.backend.build_payload(&GenRequest {
+        let payload = match self.backend.build_payload(&GenRequest {
             model: &self.model,
             request_id: &request_id,
             prompt,
             max_tokens,
             temperature: self.temperature,
             stream: true,
-        });
+        }) {
+            Ok(payload) => payload,
+            Err(error) => return request_build_failure_result(request_id, error),
+        };
 
         let post_timestamp = Some(unix_seconds_now());
         // Monotonic anchor at the send instant: TTFT is measured from here.
@@ -120,7 +147,8 @@ impl GenerationClient {
         // Re-encode the output text for a diagnostic token count and as a carry-forward fallback.
         let reencoded_output_ids: Vec<u32> = self
             .tokenizer
-            .encode(output_text.clone(), false)
+            .as_ref()
+            .and_then(|tokenizer| tokenizer.encode(output_text.clone(), false).ok())
             .map(|encoding| encoding.get_ids().to_vec())
             .unwrap_or_default();
         let output_len_text_tokens = reencoded_output_ids.len();
@@ -129,10 +157,15 @@ impl GenerationClient {
         // unexplained excess fails the round: carrying either one forward would
         // corrupt the next prompt and every cache number derived from it.
         let mut echoed_prompt_tokens = 0usize;
-        let Prompt::Tokens(prompt_ids) = prompt;
         if status == "SUCCESS" {
+            let prompt_ids = match prompt {
+                Prompt::Tokens(prompt_ids) => Some(prompt_ids),
+                Prompt::Parts(_) => None,
+            };
             if let Some(completion_tokens) = server.completion_tokens {
-                match classify_prompt_echo(&output_token_ids, prompt_ids, completion_tokens) {
+                match prompt_ids.map_or(PromptEcho::None, |prompt_ids| {
+                    classify_prompt_echo(&output_token_ids, prompt_ids, completion_tokens)
+                }) {
                     PromptEcho::None => {}
                     PromptEcho::Leading(echoed) => {
                         output_token_ids.drain(..echoed);

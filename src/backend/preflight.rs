@@ -57,7 +57,7 @@ impl GenerationClient {
             max_tokens: 1,
             temperature: 0.0,
             stream: true,
-        });
+        })?;
         let response = self
             .client
             .post(&self.endpoint)

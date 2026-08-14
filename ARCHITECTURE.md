@@ -71,7 +71,7 @@ Both tasks share the same nested blocks:
 
 ```text
 input       file, complete format, and tags
-corpus      text corpus, tokenizer, and token-pool limit
+corpus      text corpus, tokenizer, and token-pool limit (text replay only)
 server      endpoint, backend, model, and sampling
 replay      arrival, capacity, context-limit, and failure policy
 measurement timeline and optional run-level SLO
@@ -223,19 +223,20 @@ are meanings encoded in the bytes. They are not optional replay policy.
 
 ### Valid schema does not imply executable by this client
 
-The shared schema defines several request families, so a media format may be
-valid and parseable even though this HTTP replay runtime currently implements
-only text-generation prompt builders. `load_workload` rejects a valid but
-unsupported family at the runtime boundary; the schema layer does not pretend
-the format does not exist.
+The shared schema defines several request families. The runtime executes the
+two text formats and asset-backed `multimodal-independent-v1`; shape-only media
+CSV formats remain parseable but non-executable because dimensions and token
+counts are not media content. `load_workload` rejects them at the runtime
+boundary rather than inventing assets.
 
 ## 5. Why `ReplayWorkload` still exists after loading
 
-The two loaders return different Rust types:
+The loaders return different Rust types:
 
 ```text
 independent::load(...) → Vec<IndependentRequest>
 session::load(...)     → SessionPlans
+multimodal::load(...)  → Vec<RequestSpec>
 ```
 
 Because `--input-file-format` is known only at runtime, `load_workload` cannot
@@ -246,6 +247,7 @@ sum type that carries either result:
 enum ReplayWorkload {
     IndependentRequests(Vec<IndependentRequest>),
     Sessions(SessionPlans),
+    MultimodalRequests(Vec<RequestSpec>),
 }
 ```
 
@@ -253,8 +255,9 @@ It does not parse rows again or introduce another schema. Each variant directly
 owns one loader's output. One whole file selects one variant, and the runner
 enters only the corresponding executor.
 
-The branch itself is real: independent requests release separately, while
-session rounds execute as a predecessor-ordered closed loop. Removing the enum
+The branch itself is real: independent requests release separately, multimodal
+requests need asset preparation, and session rounds execute as a
+predecessor-ordered closed loop. Removing the enum
 would either move the same `match` into `runner.rs` and duplicate later setup,
 or replace it with a more elaborate trait abstraction. Flattening sessions into
 independent rows would instead lose dependency and tool-wait semantics.
@@ -285,12 +288,10 @@ Before tasks start, `runner.rs` performs one-time setup:
 
 ```text
 WorkloadSummary / dry-run early return
-  ↓
-load tokenizer + build or reuse the synthetic token pool
+  ├─ text → tokenizer + synthetic token pool → prefix-cache preflight
+  └─ multimodal → verify/read/hash/base64 assets before run_start
   ↓
 construct GenerationClient and its protocol adapter
-  ↓
-prefix-cache capability preflight
   ↓
 create AppState, concurrency gate, log channel, optional timeline channel
 ```
@@ -298,14 +299,26 @@ create AppState, concurrency gate, log channel, optional timeline channel
 `--dry-run` returns before corpus construction and network access. It validates
 the input and workload shaping, not the serving endpoint.
 
-`CorpusCache` can reuse the tokenizer and synthetic corpus across sweep points.
-The backend preflight confirms that the server exposes required prefix-cache
-usage before replay, so missing telemetry cannot silently appear as zero hits.
+`CorpusCache` can reuse the tokenizer and synthetic corpus across text sweep
+points. The text backend preflight confirms that the server exposes required
+prefix-cache usage before replay. Multimodal replay has no corpus or cache
+preflight; it validates backend capabilities and prepares immutable assets
+before starting the arrival clock.
 
 ## 7. `executor/` owns release, dependencies, and admission
 
-The runner spawns one task per top-level workload unit and follows one of two
+The runner spawns one task per top-level workload unit and follows one of three
 paths selected by `ReplayWorkload`.
+
+### Multimodal independent request
+
+```text
+wait for request arrival
+  → acquire concurrency slot
+  → send prevalidated ordered text/media parts
+  → fold the streamed text response through the shared client
+  → StepLog with modalities and asset byte counts
+```
 
 ### Independent request
 
