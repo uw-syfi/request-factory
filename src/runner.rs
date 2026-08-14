@@ -19,16 +19,16 @@ use crate::executor::{
 };
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
-use crate::schema::slo::SloSummary;
-use crate::schema::{TraceDeclaration, TraceTag};
+use crate::schema::{InputFileFormat, InputFileSchema, TraceTag};
+use crate::slo::SloSummary;
 use crate::slo_source;
 use crate::summary::{
     write_logs, write_summary_if_requested, ClientRuntimeSummary, ReplaySummary, RunSummary,
 };
 use crate::timeline::{self, TimelineSummary};
 use crate::tokens::{build_token_pool, load_tokenizer};
-use crate::trace::{load_workload, ReplayWorkload};
 use crate::workload::WorkloadSummary;
+use crate::workload::{load_workload, ReplayWorkload};
 
 /// Tokenizer and synthetic corpus, kept across runs that can share them.
 ///
@@ -105,11 +105,13 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
 
     // What the file says it is, before it is opened. Every reader below checks
     // its header against this rather than trusting whatever columns turn up.
-    let declaration = TraceDeclaration::parse_with_schema(
-        &args.trace_kind,
-        &args.trace_tags,
-        args.trace_format.source_schema().name(),
-    )?;
+    let input_file_format = InputFileFormat::parse(&args.input_file_format)?;
+    let tags = args
+        .trace_tags
+        .iter()
+        .map(|name| TraceTag::parse(name))
+        .collect::<Result<Vec<_>>>()?;
+    let declaration = InputFileSchema::new(input_file_format, tags)?;
     // Resolved before anything is loaded, so a malformed objective fails in a
     // second rather than after a corpus has been tokenized.
     let objective = slo_source::resolve(&args.trace, args.slo.as_deref())?;

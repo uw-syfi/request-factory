@@ -25,7 +25,7 @@ pub(crate) mod synthetic;
 use std::path::Path;
 
 use anyhow::Result;
-use req_frontend::schema::session_execution_v2::ExecutionRow;
+use req_frontend::schema::format::text_generation::session::ExecutionRow;
 
 /// What one generator produced.
 pub(crate) struct Generated {

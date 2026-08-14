@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 
 use crate::release::ArrivalMode;
-use crate::trace::TraceFormat;
+use crate::schema::InputFileFormat;
 
 /// Inference-server wire protocol selected with `--backend`.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,24 +21,19 @@ pub enum BackendKind {
     about = "Typed trace workload runner for OpenAI-compatible inference servers"
 )]
 pub struct Args {
-    /// Source trace CSV interpreted by --trace-format.
+    /// Source CSV interpreted by --input-file-format.
     #[arg(long)]
     pub trace: String,
 
-    /// Input schema frontend. New source formats are separate typed frontends,
-    /// not sparse variants of one universal row. `session` reads a canonical
-    /// execution trace; generate one from a raw CSV with `tracegen`.
-    #[arg(long, value_enum, default_value = "session")]
-    pub trace_format: TraceFormat,
-
-    /// What a row of this trace *is*, from the shared taxonomy:
-    /// `text_generation`, `image_to_text`, `text_to_image`, ...
-    ///
-    /// Declared, never sniffed from the header. This client can submit only
-    /// `text_generation` today and says so for anything else, rather than
-    /// parsing a media trace and then inventing content for it.
-    #[arg(long, default_value = "text_generation")]
-    pub trace_kind: String,
+    /// Complete input-file format. It determines the request family, exact base
+    /// columns, loader, and structural validation rules; no separate family
+    /// selector exists.
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(InputFileFormat::CHOICES),
+        default_value = "text-generation-session-execution-v2"
+    )]
+    pub input_file_format: String,
 
     /// Orthogonal declarations this file carries, comma-separated: `slo` adds
     /// per-request TTFT/TPOT/E2E bounds; `priority` adds scheduling priority.
@@ -156,4 +151,43 @@ pub struct Args {
     /// Overrides an objective the trace declares in its `.slo.json` sidecar.
     #[arg(long)]
     pub slo: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn required_arguments() -> Vec<&'static str> {
+        vec![
+            "session_runner",
+            "--trace",
+            "trace.csv",
+            "--text-file",
+            "corpus.txt",
+            "--tokenizer",
+            "tokenizer.json",
+            "--model",
+            "model",
+        ]
+    }
+
+    #[test]
+    fn a_complete_input_file_format_is_the_only_schema_selector() {
+        let mut arguments = required_arguments();
+        arguments.extend(["--input-file-format", "image-to-text-independent"]);
+
+        let parsed = Args::try_parse_from(arguments).unwrap();
+        assert_eq!(parsed.input_file_format, "image-to-text-independent");
+    }
+
+    #[test]
+    fn retired_split_format_and_family_flags_are_rejected() {
+        let mut old_format = required_arguments();
+        old_format.extend(["--trace-format", "session"]);
+        assert!(Args::try_parse_from(old_format).is_err());
+
+        let mut old_family = required_arguments();
+        old_family.extend(["--trace-kind", "text_generation"]);
+        assert!(Args::try_parse_from(old_family).is_err());
+    }
 }

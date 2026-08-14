@@ -2,7 +2,8 @@
 //!
 //! Two things live here, and they are here for the same reason.
 //!
-//! [`v2`] defines the `session-execution-v2` schema and its validator. It is in a
+//! [`schema::format::text_generation::session`] defines the canonical schema and its
+//! validator. It is in a
 //! library rather than a binary because the generator that writes a file and the
 //! runtime that replays it must agree on every rule; a second implementation of
 //! those rules is exactly the drift the canonical trace exists to eliminate.
@@ -34,6 +35,8 @@ mod record;
 #[cfg(feature = "runtime")]
 mod runner;
 #[cfg(feature = "runtime")]
+mod slo;
+#[cfg(feature = "runtime")]
 mod slo_source;
 #[cfg(feature = "runtime")]
 mod summary;
@@ -41,8 +44,6 @@ mod summary;
 mod timeline;
 #[cfg(feature = "runtime")]
 mod tokens;
-#[cfg(feature = "runtime")]
-mod trace;
 #[cfg(feature = "runtime")]
 mod util;
 #[cfg(feature = "runtime")]
@@ -55,5 +56,3 @@ pub use release::ArrivalMode;
 pub use runner::{run_once, run_once_reusing, CorpusCache};
 #[cfg(feature = "runtime")]
 pub use summary::{RunMetrics, RunSummary};
-#[cfg(feature = "runtime")]
-pub use trace::TraceFormat;

@@ -4,7 +4,7 @@
 //! a trace declare service bounds without also claiming that it carries a
 //! scheduling priority, and vice versa.
 //!
-//! Kept out of [`super::session_execution_v2::ExecutionRow`] on purpose. The
+//! Kept out of [`crate::schema::format::text_generation::session::ExecutionRow`] on purpose. The
 //! canonical column set *is* the format; a tag is something a file carries in
 //! addition to its format, and folding tag columns into the format's own row
 //! type would make every canonical file grow a column it does not want.
@@ -21,7 +21,7 @@ pub const DEFAULT_PRIORITY: i64 = 0;
 
 /// What the `priority` tag declares about one request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct RequestScheduling {
+pub struct RequestPriority {
     /// Server-side scheduling priority.
     ///
     /// A replay client carries this and does not act on it: it has no queue of
@@ -32,7 +32,7 @@ pub struct RequestScheduling {
     pub priority: Option<i64>,
 }
 
-impl RequestScheduling {
+impl RequestPriority {
     pub fn is_empty(&self) -> bool {
         self.priority.is_none()
     }
@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn a_blank_row_uses_the_default_priority() {
-        let blank = RequestScheduling::default();
+        let blank = RequestPriority::default();
 
         assert!(blank.is_empty());
         assert_eq!(blank.priority_or_default(), DEFAULT_PRIORITY);
@@ -61,9 +61,9 @@ mod tests {
 
     #[test]
     fn an_explicit_priority_is_preserved() {
-        let scheduling = RequestScheduling { priority: Some(7) };
+        let priority = RequestPriority { priority: Some(7) };
 
-        assert_eq!(scheduling.priority_or_default(), 7);
-        scheduling.validate("row 2").unwrap();
+        assert_eq!(priority.priority_or_default(), 7);
+        priority.validate("row 2").unwrap();
     }
 }

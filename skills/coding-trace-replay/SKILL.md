@@ -30,15 +30,16 @@ answers.
 3. **Always dry-run first**: add `--dry-run` to parse the trace, print the
    workload summary, and contact no server. It catches schema and axis errors in
    under a second.
-4. Decide all three axes explicitly before running. Defaults are `--trace-format
-   session --arrival-mode trace-timed --backend openai`; a default that was never
+4. Decide all three axes explicitly before running. Defaults are
+   `--input-file-format text-generation-session-execution-v2`,
+   `--arrival-mode trace-timed`, and `--backend openai`; a default that was never
    chosen is the usual source of a result nobody can interpret later.
 
 ## The Three Axes
 
 Read `README.md` § *Configuration axes* for the full tables. The decisions:
 
-### Axis 1 — trace format
+### Axis 1 — input-file format
 
 | Choose | When |
 |---|---|
@@ -131,13 +132,13 @@ was generated at — read the manifest.
 ```bash
 # 1. Parse only. No server contacted.
 ./target/release/session_runner \
-  --trace trace/execution.csv --trace-format session \
+  --trace trace/execution.csv --input-file-format text-generation-session-execution-v2 \
   --text-file corpus.txt --tokenizer <hf-model-or-path> --model <served-name> \
   --dry-run
 
 # 2. Replay a canonical trace through native vLLM token-in/token-out.
 ./target/release/session_runner \
-  --trace trace/execution.csv --trace-format session \
+  --trace trace/execution.csv --input-file-format text-generation-session-execution-v2 \
   --text-file corpus.txt --tokenizer <hf-model-or-path> --model <served-name> \
   --base-url http://127.0.0.1:8000 --backend vllm-tokens \
   --log-path out/session_runner_output.jsonl --summary-path out/summary.json \
@@ -203,7 +204,7 @@ server's own token space.
   `<trace>.slo.json` sidecar; `--slo` overrides it and prints that it did, so
   check `slo.source` before attributing a number to a trace.
 - A trace's columns are checked against what it was **declared** to be
-  (`--trace-kind`, `--trace-tags`), and an undeclared column is an error. If a
+  (`--input-file-format`, `--trace-tags`), and an undeclared column is an error. If a
   run refuses a header, the file is not malformed — the declaration is wrong.
   Read the `expected exactly:` list in the message and add the tag the file
   needs, rather than editing the file.

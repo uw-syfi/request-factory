@@ -37,8 +37,8 @@ pub enum OmniInputSegment {
 /// One requested output segment from a token-generating omni model.
 ///
 /// Media targets count model or codec tokens. Step-based diffusion pipelines are
-/// separate kinds ([`super::TraceKind::TextToVideo`] and
-/// [`super::TraceKind::ImageToVideo`]), because steps and tokens are not the
+/// separate kinds ([`crate::schema::RequestFamily::TextToVideo`] and
+/// [`crate::schema::RequestFamily::ImageToVideo`]), because steps and tokens are not the
 /// same unit of progress.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

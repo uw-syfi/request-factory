@@ -6,9 +6,9 @@ use crate::backend::{context_limit_skip_result, GenerationResult, Prompt};
 use crate::executor::AppState;
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
+use crate::schema::format::text_generation::session::SessionRound;
 use crate::timeline::{RequestTimeline, TimelineSink};
 use crate::tokens::{PromptBuild, PromptBuilder, TokenProvider};
-use crate::trace::SessionStep;
 
 /// Replay one session as an ordered, closed-loop chain of rounds.
 pub(crate) async fn run_session(
@@ -21,7 +21,7 @@ pub(crate) async fn run_session(
     timeline_sink: Option<TimelineSink>,
     session_ordinal: usize,
     session_id: String,
-    steps: Vec<SessionStep>,
+    steps: Vec<SessionRound>,
 ) {
     wait_for_session_arrival(&state, &steps).await;
     // Bound to this scope on purpose: the session owns its slot for every round
@@ -107,7 +107,7 @@ pub(crate) async fn run_session(
     state.stats.record_unit_done();
 }
 
-async fn wait_for_session_arrival(state: &AppState, steps: &[SessionStep]) {
+async fn wait_for_session_arrival(state: &AppState, steps: &[SessionRound]) {
     if state.policy.arrival_mode == ArrivalMode::Saturated {
         return;
     }

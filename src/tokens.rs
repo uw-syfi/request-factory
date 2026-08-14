@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
-use crate::trace::SessionStep;
+use crate::schema::format::text_generation::session::SessionRound;
 
 /// Cursor over a shared synthetic token pool. Each session seeds at a distinct
 /// offset so replayed prompts are not byte-identical across sessions.
@@ -70,7 +70,7 @@ impl PromptBuilder {
         }
     }
 
-    pub(crate) fn build_prompt(&mut self, step: &SessionStep) -> PromptBuild {
+    pub(crate) fn build_prompt(&mut self, step: &SessionRound) -> PromptBuild {
         // Recoverable shortage (the runtime half of the contract). The file's
         // split was computed from target output lengths; a real server can
         // return fewer tokens or fail a round, leaving less context than the
@@ -193,8 +193,8 @@ pub(crate) fn build_token_pool(
 mod tests {
     use super::*;
 
-    fn step(prefix_len: usize, input_len: usize, output_len: usize) -> SessionStep {
-        SessionStep {
+    fn step(prefix_len: usize, input_len: usize, output_len: usize) -> SessionRound {
+        SessionRound {
             request_id: "session_s1_round_000000".to_string(),
             session_id: "session".to_string(),
             arrival_time: 0.0,
@@ -204,7 +204,7 @@ mod tests {
             output_len,
             tool_wait_after_ms: 0.0,
             slo: Default::default(),
-            scheduling: Default::default(),
+            priority: Default::default(),
         }
     }
 

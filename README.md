@@ -7,6 +7,8 @@
 Session chains · Independent requests · Exact token-ID prompts · Prefix-cache auditing · TTFT/TPOT
 
 [Quickstart](#quickstart) ·
+[Architecture](ARCHITECTURE.md) ·
+[中文架构](ARCHITECTURE.zh-CN.md) ·
 [Engine setup](#engine-side-setup-guide) ·
 [Configuration axes](#configuration-axes) ·
 [CSV formats](#input-csv-formats) ·
@@ -43,7 +45,7 @@ per axis.
 
 | # | Axis | Selected by | Supported values |
 |---|---|---|---|
-| 1 | **Trace format** — what a CSV row is, and whether requests chain | `--trace-format` | `session` (default), `independent` |
+| 1 | **Input-file format** — request family, row schema, and topology | `--input-file-format` | Complete names such as `text-generation-session-execution-v2` |
 | 2 | **Arrival and load control** — when top-level units are released, how many run at once | `--arrival-mode`, CSV `arrival_time`, `--rate`, `--max-concurrency`, `--max-items` | `trace-timed` (default) or `saturated`, each with an optional cap |
 | 3 | **Wire backend** — endpoint and output representation | `--backend` | `openai` (default), `vllm-tokens`, `sglang-tokens` |
 
@@ -52,7 +54,7 @@ is resolved once, when the canonical trace is generated, and recorded in that
 file's manifest — see
 [Canonical execution CSV](#canonical-execution-csv--session-execution-v2).
 
-### Axis 1 — trace format
+### Axis 1 — input-file format
 
 Two typed frontends with separate schemas. An independent request is never
 rewritten into a session row with placeholder fields, and a session round is
@@ -60,7 +62,8 @@ never flattened into a standalone one.
 
 | Value | Row means | Execution |
 |---|---|---|
-| `session` | One **already-materialized** round of a multi-round session | Rounds of one session are closed-loop: submit round `i`, await its full response, wait `tool_wait_after_ms`, then submit round `i + 1` |
+| `text-generation-session-execution-v2` | One **already-materialized** text-generation round | Rounds are closed-loop: submit round `i`, await its response, wait `tool_wait_after_ms`, then submit round `i + 1` |
+| `text-generation-independent` | One standalone text-generation request | Each row releases independently |
 | `independent` | One standalone request | One-shot; rows never share context |
 
 `session` reads a canonical `session-execution-v2` file: its `prefix_len` is
@@ -151,7 +154,7 @@ mkdir -p "$TMPDIR/req-frontend"
 
 ./target/release/session_runner \
   --trace examples/session_execution_v2_example.csv \
-  --trace-format session \
+  --input-file-format text-generation-session-execution-v2 \
   --text-file unused-in-dry-run \
   --tokenizer unused-in-dry-run \
   --model dry-run \
@@ -185,7 +188,7 @@ identity are not automatically proven today.
 ```bash
 ./target/release/session_runner \
   --trace examples/session_execution_v2_example.csv \
-  --trace-format session \
+  --input-file-format text-generation-session-execution-v2 \
   --text-file /path/to/large-text-corpus \
   --tokenizer /path/to/model-or-tokenizer.json \
   --model meta-llama/Meta-Llama-3-8B \
@@ -320,14 +323,15 @@ prefix caching, token mode, and `stream_interval`.
 
 ## Input CSV formats
 
-Select the parser explicitly with `--trace-format session` or `--trace-format
-independent`. The schemas are intentionally separate: independent requests are
+Select the complete parser explicitly with
+`--input-file-format text-generation-session-execution-v2` or
+`--input-file-format text-generation-independent`. The schemas are intentionally separate: independent requests are
 not converted into fake session rows with placeholder fields, and a header is
 never used to guess which schema a file is.
 
 ### Canonical execution CSV — `session-execution-v2`
 
-The only session input, selected by `--trace-format session`. Every column is
+The only session input, selected by `--input-file-format text-generation-session-execution-v2`. Every column is
 already materialized, so the file is the whole contract and the runner has
 nothing left to decide:
 
@@ -509,20 +513,20 @@ start of replay. `input_len` is the full prompt length, and `output_len` is the
 requested maximum output length. Rows remain independent and never share
 session context.
 
-Select this frontend with `--trace-format independent`. Its schema and runtime
+Select this frontend with `--input-file-format text-generation-independent`. Its schema and runtime
 semantics are generic and do not depend on any simulator or trace producer.
 There is no canonical variant of it: with no context to carry forward, there is
 nothing for a policy to materialize.
 
-### What a trace declares about itself
+### What an input file declares about itself
 
 A file is read against what it says it is, never against what its header looks
-like. Two things are declared, both shared with the simulator through
-`src/schema/`:
+like. Its complete format and orthogonal tags are shared with the simulator
+through `src/schema/`:
 
 | flag | default | meaning |
 | --- | --- | --- |
-| `--trace-kind` | `text_generation` | what a row *is* — the request family |
+| `--input-file-format` | `text-generation-session-execution-v2` | request family, base columns, loader, and structural rules |
 | `--trace-tags` | none | orthogonal additions, comma-separated |
 
 The declaration fixes the exact column set, and both directions are errors: a
@@ -531,8 +535,8 @@ file describes something the run was not told about. That second case is the one
 worth having — an undeclared column is data whose author expected it to matter,
 and serde would have silently dropped it.
 
-`slo` and `priority` are independent tags. They add these columns to whatever
-kind or format declares them, including the canonical one:
+`slo` and `priority` are independent tags. They add these columns to whichever
+complete format declares them, including the canonical one:
 
 | column | meaning |
 | --- | --- |
@@ -542,15 +546,15 @@ kind or format declares them, including the canonical one:
 | `priority` | added only by the `priority` tag; carried into the log and never acted on by this client |
 
 ```bash
---trace-format session --trace-tags slo,priority
+--input-file-format text-generation-session-execution-v2 --trace-tags slo,priority
 ```
 
-Declaring a kind or tag this client cannot execute is refused by name rather
-than half-attempted: a media kind (no prompt builder exists yet, so replaying one
+Selecting a format or tag this client cannot execute is refused by name rather
+than half-attempted: a media format (no prompt builder exists yet, so replaying one
 would mean inventing content the trace never described), the `speculative` tag
 (an acceptance rate is a simulation input; against a real server it is measured,
-not imposed), and the `session` tag on a native file (multi-round replay reads a
-canonical trace). The taxonomy is shared with a simulator that has more of it
+not imposed), and the `session` tag on an independent format (multi-round replay
+uses the canonical text session format). The taxonomy is shared with a simulator that has more of it
 implemented, so parsing a declaration is not a promise that a replay can carry
 it out.
 
@@ -1093,7 +1097,7 @@ cargo build --release --bin sweep
 
 ./target/release/sweep --mode max-sustainable-rate --out out/sweep \
   --start-rate 5 --max-rate 800 --tolerance 0.05 --densify-points 3 \
-  --trace trace/execution.csv --trace-format session \
+  --trace trace/execution.csv --input-file-format text-generation-session-execution-v2 \
   --text-file corpus.txt --tokenizer <hf-model-or-path> --model <served-name> \
   --base-url http://127.0.0.1:8000 --backend vllm-tokens
 ```
@@ -1373,7 +1377,7 @@ token-level plan.
 | Symptom | Meaning and action |
 |---|---|
 | `prefix-cache preflight failed` | Enable prefix caching and prompt-token usage details — for vLLM, `--enable-prompt-tokens-details` (or `ENABLE_PROMPT_TOKENS_DETAILS=1`) with prefix caching left on. Confirm both probe requests reach the same server/cache shard. |
-| `failed to parse a session-execution-v2 row` | The file is a raw, unmaterialized CSV. Run it through `tracegen coding-session` first; `--trace-format session` reads canonical traces only. |
+| `failed to parse a session-execution-v2 row` | The file is a raw, unmaterialized CSV. Run it through `tracegen coding-session` first; `--input-file-format text-generation-session-execution-v2` reads canonical traces only. |
 | `server streamed cumulative output` | The SGLang server is in its default cumulative streaming mode. Relaunch it with `--stream-output` (named `--incremental-streaming-output` in newer builds). |
 | `the extra leading ids do not match the prompt tail` | The server streamed more generated IDs than its own `completion_tokens` count, and the excess is not an echo of the prompt. req-frontend refuses to guess what those IDs are; inspect the raw response before trusting the run. |
 | `--rate ... --arrival-mode saturated` rejected | One rescales the recorded timeline, the other discards it. To bound a saturated run, use `--max-concurrency`. |
@@ -1395,7 +1399,7 @@ Every flag `session_runner` accepts. The axis columns map back to
 
 | Flag | Value | Notes |
 |---|---|---|
-| `--trace` | Path | Source CSV, interpreted by `--trace-format` |
+| `--trace` | Path | Source CSV, interpreted by `--input-file-format` |
 | `--text-file` | Path | Synthetic token corpus. Required even for `--dry-run`, which never opens it |
 | `--tokenizer` | Path or HF repo id | `tokenizer.json`, a directory containing one, or a repo id to download. Must match the served model |
 | `--model` | String | Model name placed in the request payload. Accepted but unused by `sglang-tokens`, whose server hosts one model and takes no model field |
@@ -1404,8 +1408,7 @@ Every flag `session_runner` accepts. The axis columns map back to
 
 | Flag | Default | Values |
 |---|---|---|
-| `--trace-format` | `session` | `session`, `independent` — axis 1. `session` reads a canonical trace; generate one with `tracegen` |
-| `--trace-kind` | `text_generation` | What a row is, from the shared taxonomy. Only `text_generation` can be submitted today; see [What a trace declares](#what-a-trace-declares-about-itself) |
+| `--input-file-format` | `text-generation-session-execution-v2` | Complete family-specific format. The HTTP client currently executes the two `text-generation-*` formats |
 | `--trace-tags` | none | Comma-separated. `slo` adds TTFT/TPOT/E2E bounds; `priority` adds scheduling priority |
 | `--backend` | `openai` | `openai`, `vllm-tokens`, `sglang-tokens` — axis 3 |
 | `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for `openai`, omit it for the native token endpoints |
@@ -1468,12 +1471,12 @@ A context-limit skip always ends its session, independently of this flag.
 │   ├── lib.rs                the public library: the trace schemas + run_once
 │   ├── release.rs            shared trace-timed/saturated eligibility vocabulary
 │   ├── schema/
-│   │   ├── mod.rs            trace kinds, tags, column blocks, header check
-│   │   ├── media.rs          image/video/audio extents, decoding strategy
-│   │   ├── omni.rs           heterogeneous input/output segment JSON
-│   │   ├── scheduling.rs     the priority tag's scheduling declaration
-│   │   ├── slo.rs            run/trace/per-request bounds + attainment folds
-│   │   └── session_execution_v2.rs  the canonical schema, minting, validation
+│   │   ├── input_file_schema.rs  complete format + orthogonal tags
+│   │   ├── format/           one typed row/validator/loader per family format
+│   │   ├── family/           media and omni family-specific declarations
+│   │   └── tag/              per-request SLO, priority, speculative declarations
+│   ├── workload.rs           runtime selection, item limit, arrival scaling, stats
+│   ├── slo.rs                runtime measurement, attainment, and aggregation
 │   ├── runner.rs             one run: validate, load, preflight, fan out, fold
 │   ├── slo_source.rs         --slo, the trace's sidecar, and which one won
 │   ├── main.rs               argument parsing; one call into the library

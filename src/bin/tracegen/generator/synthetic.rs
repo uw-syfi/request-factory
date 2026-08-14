@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
-use req_frontend::schema::session_execution_v2::{request_id, ExecutionRow};
+use req_frontend::schema::format::text_generation::session::{request_id, ExecutionRow};
 use serde::Serialize;
 
 use super::distribution::Distribution;
@@ -189,7 +189,7 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use req_frontend::schema::session_execution_v2 as v2;
+    use req_frontend::schema::format::text_generation::session as v2;
 
     fn args() -> Args {
         Args {

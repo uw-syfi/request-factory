@@ -1,8 +1,9 @@
 use serde::Serialize;
 
-use crate::schema::slo::SloMeasurement;
-use crate::schema::{RequestScheduling, RequestSlo};
-use crate::trace::{IndependentRequest, SessionStep};
+use crate::schema::format::text_generation::independent::IndependentRequest;
+use crate::schema::format::text_generation::session::SessionRound;
+use crate::schema::{RequestPriority, RequestSlo};
+use crate::slo::SloMeasurement;
 use crate::util::prefix_hit_rate;
 
 const STEP_LOG_SCHEMA_VERSION: u32 = 11;
@@ -56,7 +57,7 @@ pub(crate) struct SessionRoundSource {
     pub(crate) slo: DeclaredSlo,
     /// Scheduling priority declared independently of the SLO.
     #[serde(flatten)]
-    pub(crate) scheduling: DeclaredScheduling,
+    pub(crate) priority: DeclaredPriority,
 }
 
 /// The `slo` tag's bounds as they appear in a record.
@@ -82,17 +83,17 @@ impl From<RequestSlo> for DeclaredSlo {
 
 /// The `priority` tag's column as it appears in a record.
 #[derive(Debug, Default, Serialize)]
-pub(crate) struct DeclaredScheduling {
+pub(crate) struct DeclaredPriority {
     /// Carried, never acted on: this client has no queue of its own to reorder,
     /// and the server is the thing being measured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) declared_priority: Option<i64>,
 }
 
-impl From<RequestScheduling> for DeclaredScheduling {
-    fn from(scheduling: RequestScheduling) -> Self {
+impl From<RequestPriority> for DeclaredPriority {
+    fn from(priority: RequestPriority) -> Self {
         Self {
-            declared_priority: scheduling.priority,
+            declared_priority: priority.priority,
         }
     }
 }
@@ -111,7 +112,7 @@ pub(crate) struct IndependentRequestSource {
     #[serde(flatten)]
     pub(crate) slo: DeclaredSlo,
     #[serde(flatten)]
-    pub(crate) scheduling: DeclaredScheduling,
+    pub(crate) priority: DeclaredPriority,
 }
 
 /// Measurements that have the same meaning for every text-generation source.
@@ -177,7 +178,7 @@ pub(crate) struct ServerUsageLog {
 
 impl StepLog {
     pub(crate) fn session_round(
-        step: &SessionStep,
+        step: &SessionRound,
         prompt_len: usize,
         derived_prefix_len: usize,
         derived_append_len: usize,
@@ -201,7 +202,7 @@ impl StepLog {
                 tool_wait_after_ms: step.tool_wait_after_ms,
                 arrival_time_ms: step.arrival_time,
                 slo: step.slo.into(),
-                scheduling: step.scheduling.into(),
+                priority: step.priority.into(),
             }),
             outcome,
         }
@@ -223,7 +224,7 @@ impl StepLog {
                 arrival_time_ms: request.arrival_time,
                 arrival_release_lag_ms,
                 slo: request.slo.into(),
-                scheduling: request.scheduling.into(),
+                priority: request.priority.into(),
             }),
             outcome,
         }
@@ -310,7 +311,7 @@ mod tests {
 
     #[test]
     fn session_record_keeps_session_fields_inside_tagged_source() {
-        let step = SessionStep {
+        let step = SessionRound {
             request_id: "session_s1_round_000002".to_string(),
             session_id: "s1".to_string(),
             arrival_time: 0.0,
@@ -320,7 +321,7 @@ mod tests {
             output_len: 3,
             tool_wait_after_ms: 5.0,
             slo: Default::default(),
-            scheduling: Default::default(),
+            priority: Default::default(),
         };
         let value =
             serde_json::to_value(StepLog::session_round(&step, 12, 8, 4, 0, outcome())).unwrap();
@@ -343,7 +344,7 @@ mod tests {
 
     #[test]
     fn slo_and_priority_declarations_are_recorded_independently() {
-        let step = SessionStep {
+        let step = SessionRound {
             request_id: "r1".into(),
             session_id: "s1".into(),
             arrival_time: 0.0,
@@ -357,7 +358,7 @@ mod tests {
                 tpot_slo_ms: Some(20.0),
                 e2e_slo_ms: Some(500.0),
             },
-            scheduling: RequestScheduling { priority: Some(7) },
+            priority: RequestPriority { priority: Some(7) },
         };
 
         let value =
@@ -378,7 +379,7 @@ mod tests {
             output_len: 3,
             arrival_time: 0.0,
             slo: Default::default(),
-            scheduling: Default::default(),
+            priority: Default::default(),
         };
         let value =
             serde_json::to_value(StepLog::independent_request(&request, 12, 0.25, outcome()))

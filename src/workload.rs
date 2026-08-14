@@ -1,7 +1,180 @@
+//! Runtime operations over fully parsed input files.
+//!
+//! Format modules own CSV decoding and structural validation. This module starts
+//! after that boundary: it selects a format loader, applies the operator's
+//! top-level item limit and arrival-rate override, and summarizes the replayable
+//! workload. It deliberately does not define another row schema.
+
+use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 
-use crate::trace::{IndependentRequest, ReplayWorkload, SessionPlans};
+use crate::schema::format::text_generation::independent::{self, IndependentRequest};
+use crate::schema::format::text_generation::session::{self, SessionPlans};
+use crate::schema::{InputFileFormat, InputFileSchema, RequestFamily, TraceTag};
 use crate::util::reaches_context_limit;
+
+/// Typed replay plans produced by the format loaders.
+pub(crate) enum ReplayWorkload {
+    Sessions(SessionPlans),
+    IndependentRequests(Vec<IndependentRequest>),
+}
+
+/// The result of rescaling trace arrival offsets to a requested workload-unit rate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArrivalRateAdjustment {
+    pub(crate) trace_rate: f64,
+    pub(crate) target_rate: f64,
+    pub(crate) time_scale: f64,
+}
+
+/// Load and validate the whole file, then apply the runtime's item limit.
+///
+/// Validation intentionally precedes truncation: `--max-items 1` must not hide
+/// malformed rows later in the declared input artifact.
+pub(crate) fn load_workload(
+    path: &str,
+    input_file_schema: &InputFileSchema,
+    max_items: Option<usize>,
+) -> Result<ReplayWorkload> {
+    reject_unsupported_replay(input_file_schema)?;
+    let mut workload = match input_file_schema.input_file_format {
+        InputFileFormat::TextGenerationIndependent => {
+            ReplayWorkload::IndependentRequests(independent::load(path, input_file_schema)?)
+        }
+        InputFileFormat::TextGenerationSessionExecutionV2 => {
+            ReplayWorkload::Sessions(session::load(path, input_file_schema)?)
+        }
+        unsupported => bail!(
+            "input file format {:?} is valid, but this HTTP client has no request builder for {:?}",
+            unsupported.name(),
+            unsupported.request_family(),
+        ),
+    };
+    workload.truncate(max_items);
+    Ok(workload)
+}
+
+/// Refuse valid input declarations that this HTTP replay client cannot execute.
+fn reject_unsupported_replay(input_file_schema: &InputFileSchema) -> Result<()> {
+    if input_file_schema.request_family() != RequestFamily::TextGeneration {
+        bail!(
+            "request family {:?} is defined by the shared input schema, but this client can only \
+             submit text generation: no media prompt builder exists yet",
+            input_file_schema.request_family(),
+        );
+    }
+    if input_file_schema.carries(TraceTag::Speculative) {
+        bail!(
+            "the speculative tag declares an acceptance rate for simulation; a replay client \
+             measures the real server's acceptance rate and cannot impose one"
+        );
+    }
+    Ok(())
+}
+
+impl ReplayWorkload {
+    fn truncate(&mut self, max_items: Option<usize>) {
+        let Some(max_items) = max_items else {
+            return;
+        };
+        match self {
+            Self::Sessions(sessions) => sessions.truncate(max_items),
+            Self::IndependentRequests(requests) => requests.truncate(max_items),
+        }
+    }
+
+    pub(crate) fn unit_count(&self) -> usize {
+        match self {
+            Self::Sessions(sessions) => sessions.len(),
+            Self::IndependentRequests(requests) => requests.len(),
+        }
+    }
+
+    pub(crate) fn unit_label(&self) -> &'static str {
+        match self {
+            Self::Sessions(_) => "sessions",
+            Self::IndependentRequests(_) => "requests",
+        }
+    }
+
+    pub(crate) fn arrival_rate(&self) -> Option<f64> {
+        match self {
+            Self::Sessions(sessions) => arrival_rate(
+                sessions
+                    .iter()
+                    .filter_map(|(_, rounds)| rounds.first())
+                    .map(|round| round.arrival_time),
+            ),
+            Self::IndependentRequests(requests) => {
+                arrival_rate(requests.iter().map(|request| request.arrival_time))
+            }
+        }
+    }
+
+    pub(crate) fn apply_arrival_rate(&mut self, target_rate: f64) -> Result<ArrivalRateAdjustment> {
+        let trace_rate = self.arrival_rate().ok_or_else(|| {
+            anyhow!(
+                "cannot apply --rate: the selected workload needs at least two items with distinct arrival times"
+            )
+        })?;
+        validate_target_rate(target_rate)?;
+        let time_scale = trace_rate / target_rate;
+        if !time_scale.is_finite() {
+            return Err(anyhow!(
+                "--rate produced a non-finite arrival-time scale; choose a less extreme value"
+            ));
+        }
+        match self {
+            Self::Sessions(sessions) => {
+                for round in sessions.iter_mut().flat_map(|(_, rounds)| rounds) {
+                    round.arrival_time *= time_scale;
+                }
+            }
+            Self::IndependentRequests(requests) => {
+                for request in requests {
+                    request.arrival_time *= time_scale;
+                }
+            }
+        }
+        Ok(ArrivalRateAdjustment {
+            trace_rate,
+            target_rate,
+            time_scale,
+        })
+    }
+}
+
+fn arrival_rate(arrivals: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut arrivals = arrivals.map(|arrival| arrival.max(0.0));
+    let first = arrivals.next()?;
+    let mut min_arrival_ms = first;
+    let mut max_arrival_ms = first;
+    let mut count = 1usize;
+
+    for arrival_ms in arrivals {
+        if !arrival_ms.is_finite() {
+            return None;
+        }
+        min_arrival_ms = min_arrival_ms.min(arrival_ms);
+        max_arrival_ms = max_arrival_ms.max(arrival_ms);
+        count += 1;
+    }
+
+    let span_seconds = (max_arrival_ms - min_arrival_ms) / 1000.0;
+    if count < 2 || !first.is_finite() || span_seconds <= 0.0 {
+        return None;
+    }
+    Some((count - 1) as f64 / span_seconds)
+}
+
+fn validate_target_rate(target_rate: f64) -> Result<()> {
+    if !target_rate.is_finite() || target_rate <= 0.0 {
+        return Err(anyhow!(
+            "--rate must be a finite value greater than 0, got {target_rate}"
+        ));
+    }
+    Ok(())
+}
 
 /// Source-specific dry-run summaries. Variants intentionally retain different
 /// fields: independent requests do not have session prefix/tool metrics.
@@ -207,11 +380,128 @@ impl IndependentRequestSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::SessionStep;
+    use crate::schema::format::text_generation::session::{request_id, SessionRound};
+    use std::fs;
+
+    fn round(session_id: &str, arrival_time: f64, round_idx: usize) -> SessionRound {
+        SessionRound {
+            request_id: request_id(session_id, round_idx),
+            session_id: session_id.to_string(),
+            arrival_time,
+            round_idx,
+            prefix_len: 0,
+            input_len: 1,
+            output_len: 1,
+            tool_wait_after_ms: 0.0,
+            slo: Default::default(),
+            priority: Default::default(),
+        }
+    }
+
+    fn session_workload(arrivals: &[f64]) -> ReplayWorkload {
+        ReplayWorkload::Sessions(
+            arrivals
+                .iter()
+                .enumerate()
+                .map(|(index, &arrival_time)| {
+                    let session_id = index.to_string();
+                    (
+                        session_id.clone(),
+                        vec![
+                            round(&session_id, arrival_time, 0),
+                            round(&session_id, arrival_time, 1),
+                        ],
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn rescales_session_starts_and_every_round_to_the_target_rate() {
+        let mut workload = session_workload(&[0.0, 500.0, 1_000.0]);
+        let adjustment = workload.apply_arrival_rate(4.0).unwrap();
+
+        assert_eq!(adjustment.trace_rate, 2.0);
+        assert_eq!(adjustment.target_rate, 4.0);
+        assert_eq!(adjustment.time_scale, 0.5);
+        assert_eq!(workload.arrival_rate(), Some(4.0));
+        let ReplayWorkload::Sessions(sessions) = workload else {
+            panic!("expected session workload")
+        };
+        assert!(sessions[1]
+            .1
+            .iter()
+            .all(|round| round.arrival_time == 250.0));
+    }
+
+    #[test]
+    fn rejects_invalid_or_unmeasurable_target_rates() {
+        let mut valid = session_workload(&[0.0, 1_000.0]);
+        assert!(valid.apply_arrival_rate(0.0).is_err());
+        assert!(valid.apply_arrival_rate(f64::NAN).is_err());
+
+        let mut simultaneous = session_workload(&[0.0, 0.0]);
+        assert!(simultaneous.apply_arrival_rate(1.0).is_err());
+    }
+
+    #[test]
+    fn validates_the_whole_file_before_applying_the_item_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "req_frontend_validate_before_truncate_{}.csv",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "id,arrival_time,input_len,output_len,ttft_slo_ms,tpot_slo_ms,e2e_slo_ms\n\
+             valid,0,16,4,100,,\n\
+             invalid,1,16,4,0,,\n",
+        )
+        .unwrap();
+        let input_file_schema = InputFileSchema::new(
+            InputFileFormat::TextGenerationIndependent,
+            vec![TraceTag::Slo],
+        )
+        .unwrap();
+
+        let error = load_workload(path.to_str().unwrap(), &input_file_schema, Some(1))
+            .err()
+            .expect("the unselected malformed row must still fail validation");
+        fs::remove_file(path).ok();
+
+        assert!(error.to_string().contains("line 3"), "{error}");
+    }
+
+    #[test]
+    fn applies_the_item_limit_after_loading_a_valid_file() {
+        let path = std::env::temp_dir().join(format!(
+            "req_frontend_truncate_valid_{}.csv",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "id,arrival_time,input_len,output_len\nfirst,0,16,4\nsecond,1,16,4\n",
+        )
+        .unwrap();
+
+        let workload = load_workload(
+            path.to_str().unwrap(),
+            &InputFileSchema::text_generation_independent(),
+            Some(1),
+        )
+        .unwrap();
+        fs::remove_file(path).ok();
+
+        let ReplayWorkload::IndependentRequests(requests) = workload else {
+            panic!("expected independent requests")
+        };
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "first");
+    }
 
     #[test]
     fn session_static_limit_check_includes_output_and_reserves_headroom() {
-        let step = SessionStep {
+        let step = SessionRound {
             request_id: "session_s1_round_000000".to_string(),
             session_id: "session".to_string(),
             arrival_time: 0.0,
@@ -221,7 +511,7 @@ mod tests {
             output_len: 10,
             tool_wait_after_ms: 0.0,
             slo: Default::default(),
-            scheduling: Default::default(),
+            priority: Default::default(),
         };
         let sessions: SessionPlans = vec![("session".to_string(), vec![step])];
 
@@ -243,7 +533,7 @@ mod tests {
             output_len: 9,
             arrival_time: 0.0,
             slo: Default::default(),
-            scheduling: Default::default(),
+            priority: Default::default(),
         };
 
         let summary = IndependentRequestSummary::from_requests(&[request], Some(100));

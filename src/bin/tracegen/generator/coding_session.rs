@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use req_frontend::schema::session_execution_v2::{request_id, ExecutionRow};
+use req_frontend::schema::format::text_generation::session::{request_id, ExecutionRow};
 use serde::{Deserialize, Serialize};
 
 use super::{Generated, Generator};

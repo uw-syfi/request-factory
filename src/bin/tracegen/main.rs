@@ -31,8 +31,10 @@ use clap::Parser;
 use serde::Serialize;
 
 use generator::Registry;
-use req_frontend::schema::session_execution_v2 as v2;
-use req_frontend::schema::session_execution_v2::{ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME};
+use req_frontend::schema::format::text_generation::session as v2;
+use req_frontend::schema::format::text_generation::session::{
+    ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME,
+};
 
 #[derive(Parser, Debug)]
 #[command(

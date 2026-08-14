@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::schema::slo::{SloSource, SloSpec};
+use crate::slo::{SloSource, SloSpec};
 
 /// Suffix appended to a trace path to find its objective.
 const SIDECAR_SUFFIX: &str = ".slo.json";

@@ -5,10 +5,10 @@ use std::io::Write;
 use tokio::sync::mpsc;
 
 use crate::record::{GenerationOutcome, SessionRoundSource, SourceRecord, StepLog};
-use crate::schema::slo::SloSummary;
+use crate::slo::SloSummary;
 use crate::timeline::TimelineSummary;
-use crate::trace::ReplayWorkload;
 use crate::util::ratio;
+use crate::workload::ReplayWorkload;
 use crate::workload::WorkloadSummary;
 
 /// Replay summaries retain the workload type instead of exposing session-only
@@ -694,7 +694,7 @@ mod tests {
             tool_wait_after_ms: 0.0,
             arrival_time_ms: 0.0,
             slo: Default::default(),
-            scheduling: Default::default(),
+            priority: Default::default(),
         };
         let mut measured_outcome = outcome("r1", 0.0, 1.0, 10.0, Some(1.0), 4, "SUCCESS");
         measured_outcome.server_usage = Some(crate::record::ServerUsageLog {

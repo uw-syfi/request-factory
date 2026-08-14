@@ -12,7 +12,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use req_frontend::schema::session_execution_v2::{self as v2, request_id, ExecutionRow};
+use req_frontend::schema::format::text_generation::session::{
+    self as v2, request_id, ExecutionRow,
+};
 
 /// The shape of one fixture, so a check can state its expectation in these terms
 /// rather than in a magic number.

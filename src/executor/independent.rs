@@ -6,9 +6,9 @@ use crate::backend::{context_limit_skip_result, Prompt};
 use crate::executor::AppState;
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
+use crate::schema::format::text_generation::independent::IndependentRequest;
 use crate::timeline::{RequestTimeline, TimelineSink};
 use crate::tokens::TokenProvider;
-use crate::trace::IndependentRequest;
 
 /// Replay one independent request. This is deliberately separate from the session
 /// executor: independent requests have no round ordering, prefix carry-forward,

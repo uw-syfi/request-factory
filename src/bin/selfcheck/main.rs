@@ -181,7 +181,7 @@ async fn release_checks(
         corpus,
         RunSpec {
             trace: fixtures.independent.display().to_string(),
-            format: "independent",
+            format: "text-generation-independent",
             rate: Some(rate),
             directory: directory.clone(),
             timeline: true,
@@ -273,7 +273,7 @@ async fn timeline_checks(
                 corpus,
                 RunSpec {
                     trace: fixtures.independent.display().to_string(),
-                    format: "independent",
+                    format: "text-generation-independent",
                     rate: Some(300.0),
                     directory: arguments.out.join(format!("runs/timeline_{pair}_{label}")),
                     timeline,
@@ -364,7 +364,7 @@ async fn timing_checks(
         corpus,
         RunSpec {
             trace: fixtures.sessions.display().to_string(),
-            format: "session",
+            format: "text-generation-session-execution-v2",
             rate: Some(40.0),
             directory: arguments.out.join("runs/timing"),
             timeline: true,
@@ -577,7 +577,7 @@ async fn replay(
         "session_runner".into(),
         "--trace".into(),
         spec.trace,
-        "--trace-format".into(),
+        "--input-file-format".into(),
         spec.format.into(),
         "--text-file".into(),
         fixtures.corpus.display().to_string(),

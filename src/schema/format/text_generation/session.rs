@@ -1,4 +1,4 @@
-//! The `session-execution-v2` canonical trace: the one artifact a measured
+//! The canonical text-generation session format: the one artifact a measured
 //! replay and a simulated run are allowed to disagree about nothing in.
 //!
 //! A v2 file is *already materialized*. Its `prefix_len` is guaranteed to exist
@@ -18,8 +18,8 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::scheduling::RequestScheduling;
-use super::{RequestSlo, TraceDeclaration, TraceTag};
+use crate::schema::tag::{RequestPriority, RequestSlo};
+use crate::schema::{InputFileSchema, TraceTag};
 
 /// Schema name recorded in the manifest and named on the command line. Consumers
 /// select it explicitly; no consumer sniffs headers to discover it.
@@ -100,7 +100,7 @@ pub fn request_id(session_id: &str, round_idx: usize) -> String {
 /// Structural corruption fails here rather than surfacing later as a puzzling
 /// replay: the whole value of this format is that two independent consumers can
 /// trust it without re-deriving anything.
-pub fn load(path: &str, declaration: &TraceDeclaration) -> Result<Vec<DeclaredRow>> {
+pub fn load(path: &str, declaration: &InputFileSchema) -> Result<SessionPlans> {
     let mut reader = csv::Reader::from_path(path)
         .with_context(|| format!("failed to open {SCHEMA_NAME} trace: {path}"))?;
     let headers = reader
@@ -118,7 +118,7 @@ pub fn load(path: &str, declaration: &TraceDeclaration) -> Result<Vec<DeclaredRo
     let reads_priority = declaration.carries(TraceTag::Priority);
     let mut rows: Vec<ExecutionRow> = Vec::new();
     let mut slos: Vec<RequestSlo> = Vec::new();
-    let mut scheduling: Vec<RequestScheduling> = Vec::new();
+    let mut priority: Vec<RequestPriority> = Vec::new();
     for (index, record) in reader.records().enumerate() {
         let line = index + 2; // the header occupies line 1
         let record = record.with_context(|| format!("{path}: failed to read line {line}"))?;
@@ -138,41 +138,56 @@ pub fn load(path: &str, declaration: &TraceDeclaration) -> Result<Vec<DeclaredRo
         };
         slos.push(slo);
         let declared = if reads_priority {
-            let declared: RequestScheduling = record
+            let declared: RequestPriority = record
                 .deserialize(Some(&headers))
                 .context("failed to parse a session-execution-v2 row")?;
             declared.validate(&format!("{path} line {line}"))?;
             declared
         } else {
-            RequestScheduling::default()
+            RequestPriority::default()
         };
-        scheduling.push(declared);
+        priority.push(declared);
     }
     validate(&rows).with_context(|| format!("{path} is not a canonical {SCHEMA_NAME} trace"))?;
-    Ok(rows
-        .into_iter()
-        .zip(slos)
-        .zip(scheduling)
-        .map(|((row, slo), scheduling)| DeclaredRow {
-            row,
+    let mut sessions: SessionPlans = Vec::new();
+    for ((row, slo), priority) in rows.into_iter().zip(slos).zip(priority) {
+        let round = SessionRound {
+            request_id: row.request_id,
+            session_id: row.session_id,
+            arrival_time: row.arrival_time_ms,
+            round_idx: row.round_idx,
+            prefix_len: row.prefix_len,
+            input_len: row.input_len,
+            output_len: row.output_len,
+            tool_wait_after_ms: row.tool_wait_after_ms,
             slo,
-            scheduling,
-        })
-        .collect())
+            priority,
+        };
+        match sessions.last_mut() {
+            Some((session_id, rounds)) if *session_id == round.session_id => rounds.push(round),
+            _ => sessions.push((round.session_id.clone(), vec![round])),
+        }
+    }
+    Ok(sessions)
 }
 
-/// A canonical row together with whatever the file's declared tags added to it.
-///
-/// Two fields rather than a wider row type, because the canonical column set
-/// *is* the format: a tag is something a particular file carries in addition to
-/// its format, and merging the two would make every canonical file grow columns
-/// only some of them want.
+/// One validated round in the session topology encoded by this format.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeclaredRow {
-    pub row: ExecutionRow,
+pub struct SessionRound {
+    pub request_id: String,
+    pub session_id: String,
+    pub arrival_time: f64,
+    pub round_idx: usize,
+    pub prefix_len: usize,
+    pub input_len: usize,
+    pub output_len: usize,
+    pub tool_wait_after_ms: f64,
     pub slo: RequestSlo,
-    pub scheduling: RequestScheduling,
+    pub priority: RequestPriority,
 }
+
+/// Sessions in file/replay order, each containing rounds in round order.
+pub type SessionPlans = Vec<(String, Vec<SessionRound>)>;
 
 /// Validate the canonical layout and the per-row invariants.
 pub fn validate(rows: &[ExecutionRow]) -> Result<()> {
