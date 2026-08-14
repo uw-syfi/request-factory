@@ -90,6 +90,10 @@ pub struct MaterializedRound {
 }
 
 impl MaterializedRound {
+    /// Only the invariant tests below need this: the manifest's totals are
+    /// counted from the rows that were actually emitted, not from what the
+    /// materializer thought it produced.
+    #[cfg(test)]
     pub fn total_prompt_len(&self) -> usize {
         self.prefix_len + self.input_len
     }

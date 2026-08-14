@@ -76,6 +76,33 @@ impl Rng {
         }
     }
 
+    /// Uniform on `[0, 1)`.
+    pub(crate) fn unit(&mut self) -> f64 {
+        const SCALE: f64 = 1.0 / (1u64 << 53) as f64;
+        (self.next_u64() >> 11) as f64 * SCALE
+    }
+
+    /// Standard normal, by the polar Box-Muller transform.
+    ///
+    /// The polar form rather than the trigonometric one: it needs no `sin`/`cos`
+    /// and rejects the corners of the square, which is both faster and avoids
+    /// the precision cliff `cos` has near its zeros.
+    pub(crate) fn standard_normal(&mut self) -> f64 {
+        loop {
+            let x = 2.0 * self.next_open_unit() - 1.0;
+            let y = 2.0 * self.next_open_unit() - 1.0;
+            let squared = x * x + y * y;
+            if squared > 0.0 && squared < 1.0 {
+                return x * (-2.0 * squared.ln() / squared).sqrt();
+            }
+        }
+    }
+
+    /// True with the given probability.
+    pub(crate) fn chance(&mut self, probability: f64) -> bool {
+        self.unit() < probability
+    }
+
     /// Fisher-Yates, in place.
     pub(crate) fn shuffle<T>(&mut self, items: &mut [T]) {
         for index in (1..items.len()).rev() {

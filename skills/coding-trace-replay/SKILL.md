@@ -1,6 +1,6 @@
 ---
 name: coding-trace-replay
-description: "Configure, run, and read a req-frontend replay against a live inference server. Use when choosing a trace format or frontend (session, independent), generating a canonical trace with tracegen and picking its context policy (trace-reported versus monotonic), setting arrival mode and concurrency (--arrival-mode, --rate, --max-concurrency, --max-items), choosing a wire backend (openai, vllm-tokens, sglang-tokens) and the server flags it requires, launching vLLM or SGLang for a replay, diagnosing prefix-cache preflight failures, cumulative-streaming or echoed-prompt errors, or interpreting session_runner_output.jsonl and summary.json."
+description: "Configure, run, and read a req-frontend replay against a live inference server. Use when choosing a trace format or frontend (session, independent), generating a canonical trace with a tracegen generator (coding-session, synthetic) and picking its context policy (trace-reported versus monotonic) or its length distributions, setting arrival mode and concurrency (--arrival-mode, --rate, --max-concurrency, --max-items), choosing a wire backend (openai, vllm-tokens, sglang-tokens) and the server flags it requires, launching vLLM or SGLang for a replay, diagnosing prefix-cache preflight failures, cumulative-streaming or echoed-prompt errors, or interpreting session_runner_output.jsonl and summary.json."
 ---
 
 # Coding Trace Replay
@@ -42,11 +42,11 @@ Read `README.md` § *Configuration axes* for the full tables. The decisions:
 
 | Choose | When |
 |---|---|
-| `session` | Multi-round conversations. Reads a canonical `session-execution-v2` file whose prompt split is already materialized, so nothing is left for a runtime flag to change. A raw CSV is rejected at parse — run it through `tracegen` first. |
+| `session` | Multi-round conversations. Reads a canonical `session-execution-v2` file whose prompt split is already materialized, so nothing is left for a runtime flag to change. A raw CSV is rejected at parse — run it through `tracegen coding-session` first. |
 | `independent` | One-shot requests with no shared context. |
 
 The prefix/append split is **not** an axis of the run. It is chosen once with
-`tracegen --policy` and recorded in the trace's manifest; see *Generating A
+`tracegen coding-session --policy` and recorded in the trace's manifest; see *Generating A
 Canonical Trace* below.
 
 ### Axis 2 — arrival and capacity
@@ -73,20 +73,38 @@ differ in whether the server detokenizes on the way out.
 
 ## Generating A Canonical Trace
 
-Materialize a raw session CSV once, then hand the same bytes to every consumer:
+Produce the file once, then hand the same bytes to every consumer. `tracegen`
+is a registry: one subcommand per generator, all sharing validation, the CSV
+writer, the plan, and the manifest's totals.
 
 ```bash
-cargo run --release --bin tracegen -- \
+# Materialize something that was recorded.
+cargo run --release --bin tracegen -- coding-session \
   --source examples/multi_session_example.csv \
   --policy trace-reported \
   --max-sessions 200 \
   --out trace/execution.csv
+
+# Or draw one from distributions, with no corpus at all.
+cargo run --release --bin tracegen -- synthetic \
+  --sessions 500 --rounds 'uniform:1..8' \
+  --input-len 'lognormal:1024,0.8' --output-len 'lognormal:256,0.7' \
+  --arrival-rate 4 --out trace/synthetic.csv
 ```
 
-Writes `execution.csv`, `execution.manifest.json`, and `execution.plan.json`.
+Either writes `<stem>.csv`, `<stem>.manifest.json`, and `<stem>.plan.json`.
 
-**Read the manifest before quoting any cache number.** `folded_prefix_tokens`
-is how much prefix the source attributed to cache that the replay must actually
+Pick `coding-session` when the question is about real traffic and `synthetic`
+when it is about one dimension held against everything else — a sweep that wants
+to vary prompt length alone cannot get that from a recorded corpus, which has
+whatever mix it happened to have. Never describe a synthetic trace as
+representative of production.
+
+**Read the manifest before quoting any cache number.** Its totals are derived
+from the rows actually emitted; `parameters` is the generator's own record of
+how it produced them, so read `generator` before reading `parameters`. For
+`coding-session`, `parameters.folded_prefix_tokens` is how much prefix the
+source attributed to cache that the replay must actually
 prefill; on real coding-agent data this is dominated by first rounds, where the
 agent resumed from context the published trace does not contain. A large fold is
 not a bug, but a hit rate reported without it is misleading.
@@ -95,8 +113,8 @@ The raw source CSV is `session-rounds-v2` from TraceLab's exporter,
 `artifacts/trace_facts/csv_export/convert.py`. That exporter is deterministic
 and carries no timeline — the corpus has no arrival timestamps.
 
-So `tracegen` invents one, and every knob that shapes the workload lives here
-rather than upstream: `--arrival-rate` (default `1.0`/s), `--arrival-pattern`
+So `tracegen coding-session` invents one, and every knob that shapes the
+workload lives here rather than upstream: `--arrival-rate` (default `1.0`/s), `--arrival-pattern`
 (`poisson` or `constant`), `--session-order` (`source` or `shuffle`),
 `--max-sessions`, and `--seed`. All five land in the manifest, so a trace plus
 its manifest and source hash is a complete recipe.
@@ -151,7 +169,8 @@ server's own token space.
 - **A cap that changes nothing means the units never overlapped**, not that the
   cap was ignored. Compare the trace's arrival spacing against per-unit
   duration; use `--arrival-mode saturated` to force overlap.
-- `folded_prefix_tokens` lives in the **manifest** (planned, a trace property);
+- `folded_prefix_tokens` lives in the **manifest** under `parameters` (planned,
+  a trace property);
   `prefix_shortfall_tokens` lives in the **JSONL** (unplanned, a run property).
   Both are fresh work and neither is ever counted as a cache hit. A nonzero
   shortfall means a short or failed round upstream — investigate it rather than
@@ -216,7 +235,7 @@ configuration rather than server problems:
 | Symptom | Action |
 |---|---|
 | `prefix-cache preflight failed` | The server does not report cached prompt tokens. vLLM needs `--enable-prompt-tokens-details`; SGLang reports them by default. This is a hard abort by design — without it every hit rate silently reads zero. |
-| `failed to parse a session-execution-v2 row` | The trace is a raw, unmaterialized CSV. Generate a canonical one with `tracegen` first. |
+| `failed to parse a session-execution-v2 row` | The trace is a raw, unmaterialized CSV. Generate a canonical one with `tracegen coding-session` first. |
 | `server streamed cumulative output` | SGLang is in default cumulative mode. Relaunch with `--stream-output`. req-frontend fails rather than reporting the distorted late-token latency. |
 | `--rate` rejected with `saturated` | Pick one. To bound a saturated run, use `--max-concurrency`. |
 
@@ -224,11 +243,15 @@ configuration rather than server problems:
 
 When summarizing a replay run:
 
-- Lead with the three axis values, the trace path, and — for a canonical trace —
-  its manifest's policy and fold count. A run reported without its axes cannot
-  be reproduced or compared.
+- Lead with the three axis values, the trace path, and the manifest's
+  `generator` plus the `parameters` that shaped it — for `coding-session` the
+  policy and fold count, for `synthetic` the length distributions. A run
+  reported without its axes cannot be reproduced or compared.
 - State attempted versus completed rounds, and name any session that stopped
   early.
 - Report planned and server-observed prefix hit rates together, never one alone.
 - Call timing client-observed, and say whether a concurrency cap was in effect.
 - Do not describe the workload as replaying real prompts. It replays shapes.
+  And for a `synthetic` trace, shapes that were drawn rather than observed —
+  report what the deployment did under the requested shape, never as a claim
+  about production traffic.

@@ -364,10 +364,19 @@ What the format buys, and what it costs:
 
 #### Generating a canonical trace
 
-Generate one from a raw `session-rounds-v2` trace with `tracegen`:
+`tracegen` is a registry of generators, one subcommand each. They share
+everything that is true of *every* canonical trace — validation, the CSV writer,
+the plan, and the manifest's totals — and differ only in where the rows come
+from. A new way of producing a trace is a new file under `bin/tracegen/generator/`,
+not a new binary.
+
+| Generator | Rows come from | Use when |
+|---|---|---|
+| `coding-session` | a raw `session-rounds-v2` CSV, materialized under a context policy | You are replaying something that was recorded |
+| `synthetic` | distributions, no corpus at all | You want to vary one dimension and hold the rest fixed |
 
 ```bash
-cargo run --release --bin tracegen -- \
+cargo run --release --bin tracegen -- coding-session \
   --source examples/multi_session_example.csv \
   --policy trace-reported \
   --max-sessions 200 \
@@ -375,18 +384,54 @@ cargo run --release --bin tracegen -- \
 ```
 
 It writes `execution.csv` plus `execution.manifest.json` and
-`execution.plan.json` beside it. The manifest records the source hash, the
-policy and its thresholds, the selection rule, the arrival synthesis, how many
-tokens were folded from prefix into fresh input, and the planned prefix hit rate
-— read it before quoting any cache number, because a fold that is large is not
-a bug but does mean the source attributed to cache what the replay must actually
-prefill. The plan is the normalized per-round expansion, which is what a
-simulator compares against to prove both sides scheduled the same work.
+`execution.plan.json` beside it. The manifest records which generator ran, the
+totals counted from the rows that were actually emitted, and — under
+`parameters` — everything that generator needed to produce them: for
+`coding-session` the source hash, the policy and its thresholds, the selection
+rule, the arrival synthesis, and how many tokens were folded from prefix into
+fresh input. Read it before quoting any cache number, because a fold that is
+large is not a bug but does mean the source attributed to cache what the replay
+must actually prefill. The plan is the normalized per-round expansion, which is
+what a simulator compares against to prove both sides scheduled the same work.
 
-Between the source hash and those fields, the manifest is a complete recipe:
-given the same raw CSV, the flags it records regenerate the trace byte for byte.
+The totals live outside `parameters` because they are derived from the file
+rather than reported by whatever made it; a generator cannot mis-state them.
+Between them and `parameters`, the manifest is a complete recipe: given the same
+inputs, the flags it records regenerate the trace byte for byte.
+
+#### Drawing a trace instead of recording one
+
+```bash
+cargo run --release --bin tracegen -- synthetic \
+  --sessions 500 \
+  --rounds 'uniform:1..8' \
+  --input-len 'lognormal:1024,0.8' \
+  --output-len 'lognormal:256,0.7' \
+  --compaction-probability 0.1 \
+  --arrival-rate 4 \
+  --out trace/synthetic.csv
+```
+
+Every length knob takes a distribution: `512` or `fixed:512` for a constant,
+`uniform:256..1024` for an even sweep, `lognormal:2048,0.8` for the long right
+tail real prompt and completion lengths actually have. The lognormal is
+parameterized by its **median**, not by the underlying normal's mean, so
+`lognormal:2048,0.8` is a claim you can check against a corpus.
+
+A drawn trace carries the same guarantees as a recorded one — a round only
+reuses a prefix an earlier round actually produced, and the same seed produces
+the same file — but it is not a model of anything. It tells you how a deployment
+responds to the shape you asked for, which is a different claim from telling you
+how it responds to real traffic. Say which one you measured.
+
+`--compaction-probability` is drawn per round; the manifest records the count
+that *came out* (`compaction_rounds`), because on any finite file that differs
+from the probability that went in, and the count is the property of this file.
 
 #### Shaping the workload
+
+These apply to `coding-session`, which materializes a corpus that has no
+timeline of its own.
 
 The raw trace says what each session *did*, never when it arrived — the corpus
 has no arrival timestamps. So the timeline is invented here, and so is the
@@ -1271,7 +1316,7 @@ token-level plan.
 | Symptom | Meaning and action |
 |---|---|
 | `prefix-cache preflight failed` | Enable prefix caching and prompt-token usage details — for vLLM, `--enable-prompt-tokens-details` (or `ENABLE_PROMPT_TOKENS_DETAILS=1`) with prefix caching left on. Confirm both probe requests reach the same server/cache shard. |
-| `failed to parse a session-execution-v2 row` | The file is a raw, unmaterialized CSV. Run it through `tracegen` first; `--trace-format session` reads canonical traces only. |
+| `failed to parse a session-execution-v2 row` | The file is a raw, unmaterialized CSV. Run it through `tracegen coding-session` first; `--trace-format session` reads canonical traces only. |
 | `server streamed cumulative output` | The SGLang server is in its default cumulative streaming mode. Relaunch it with `--stream-output` (named `--incremental-streaming-output` in newer builds). |
 | `the extra leading ids do not match the prompt tail` | The server streamed more generated IDs than its own `completion_tokens` count, and the excess is not an echo of the prompt. req-frontend refuses to guess what those IDs are; inspect the raw response before trusting the run. |
 | `--rate ... --arrival-mode saturated` rejected | One rescales the recorded timeline, the other discards it. To bound a saturated run, use `--max-concurrency`. |
@@ -1382,9 +1427,14 @@ A context-limit skip always ends its session, independently of this flag.
 │   │   ├── integrity.rs      may this response be believed at all
 │   │   └── preflight.rs      the prefix-cache gate run once before a workload
 │   ├── bin/tracegen/
-│   │   ├── main.rs           raw trace -> canonical trace + manifest
+│   │   ├── main.rs           shared path: validate, write CSV, plan, manifest
+│   │   ├── generator/
+│   │   │   ├── mod.rs        the Generator trait and the registry
+│   │   │   ├── coding_session.rs  raw recorded trace -> canonical rows
+│   │   │   ├── synthetic.rs  rows drawn from distributions, no corpus
+│   │   │   └── distribution.rs   fixed / uniform / lognormal, parsed and recorded
 │   │   ├── arrivals.rs       seeded arrival synthesis + session selection
-│   │   └── policy.rs         context-policy arithmetic (generation-time only)
+│   │   └── policy.rs         context-policy arithmetic (coding-session only)
 │   ├── bin/sweep/
 │   │   ├── main.rs           CLI, orchestration, sweep.json
 │   │   ├── search.rs         ramp -> bisect -> densify: locate a boundary

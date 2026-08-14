@@ -1,236 +1,127 @@
-//! Turn a raw session trace into a canonical `session-execution-v2` trace.
+//! Produce a canonical `session-execution-v2` trace, whichever way it was made.
 //!
-//! This is the seam the whole alignment story rests on. Upstream, a raw trace
-//! reports what a coding agent actually did — including prefixes that only
-//! existed in a conversation the published data does not contain. Downstream,
-//! two very different consumers (a live replay against a real server, and a
-//! discrete-event simulation) must agree on every integer. Resolving the first
-//! into the second is a decision, so it happens once, here, and is recorded.
+//! Two consumers — a live replay against a real server, and a discrete-event
+//! simulation — must agree on every integer in the file they read. So the file
+//! is produced once, here, and everything true of *every* canonical trace lives
+//! in this one place: validating what was produced, writing the CSV, deriving
+//! the plan, and computing the manifest's totals.
+//!
+//! Where the rows came from is the generator's business. `generator/` holds the
+//! registry; a generator returns rows plus a record of how it made them, and
+//! this file does the rest. That is what lets a new trace category be a new file
+//! in one directory rather than a new binary.
 //!
 //! What comes out is three files:
 //!
 //! - the canonical CSV, which both consumers read verbatim;
-//! - a manifest, which records the source, the policy, and how much of the raw
-//!   trace had to be folded to make it replayable;
+//! - a manifest, which records the generator, its parameters, and totals derived
+//!   from the rows actually emitted;
 //! - a normalized plan, which is what a differential test compares.
 
 mod arrivals;
+mod generator;
 mod policy;
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use arrivals::{ArrivalPattern, Rng, SessionOrder};
-use policy::{
-    ContextChain, RawRound, SessionContextPolicy, MAJOR_COMPACTION_MIN_DROP_RATIO,
-    MAJOR_COMPACTION_MIN_DROP_TOKENS,
-};
+use generator::Registry;
 use req_frontend::schema::session_execution_v2 as v2;
 use req_frontend::schema::session_execution_v2::{
-    format_milliseconds, request_id, ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME,
+    format_milliseconds, ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME,
 };
-
-/// Raw schema name accepted by `--source-schema`. Declared rather than sniffed:
-/// a new raw format is a new declared schema, not a header guess.
-const RAW_SCHEMA_SESSION_ROUNDS_V2: &str = "session-rounds-v2";
-
-/// One row of the raw trace TraceLab's
-/// `artifacts/trace_facts/csv_export/convert.py` exports.
-///
-/// It carries no arrival time: the corpus has none, so this tool invents the
-/// timeline. Every field here is something the source actually observed.
-///
-/// Unknown columns are rejected rather than ignored. A `session-rounds-v1` file
-/// still has every column v2 needs, so without this it would parse cleanly and
-/// its recorded `arrival_time` would be silently replaced by a synthetic one —
-/// the exact failure mode of quietly accepting a file from the wrong schema.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRow {
-    session_id: String,
-    round_idx: usize,
-    input_len: usize,
-    output_len: usize,
-    prefix_len: usize,
-    tool_wait_after_ms: f64,
-}
 
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
-    about = "Materialize a raw session trace into a canonical session-execution-v2 trace"
+    about = "Generate a canonical session-execution-v2 trace",
+    subcommand_help_heading = "Generators"
 )]
 struct Args {
-    /// Raw session trace CSV.
-    #[arg(long)]
-    source: PathBuf,
-
-    /// Declared raw schema. Never inferred from the header.
-    #[arg(long, default_value = RAW_SCHEMA_SESSION_ROUNDS_V2)]
-    source_schema: String,
-
-    /// Context policy to resolve into the canonical trace. The generated file
-    /// carries no policy switch; this choice is recorded in the manifest.
-    #[arg(long, value_enum, default_value = "trace-reported")]
-    policy: SessionContextPolicy,
-
-    /// Output canonical CSV. The manifest and plan are written beside it.
-    #[arg(long)]
-    out: PathBuf,
-
-    /// Keep only the first N sessions, in the emitted session order.
-    #[arg(long)]
-    max_sessions: Option<usize>,
-
-    /// Session order before arrivals are assigned.
-    #[arg(long, value_enum, default_value = "source")]
-    session_order: SessionOrder,
-
-    /// Synthetic session arrival rate, in sessions per second. The source has
-    /// no arrival times, so this timeline is invented here and recorded.
-    #[arg(long, default_value_t = 1.0)]
-    arrival_rate: f64,
-
-    /// Synthetic session arrival process.
-    #[arg(long, value_enum, default_value = "poisson")]
-    arrival_pattern: ArrivalPattern,
-
-    /// Seed for session shuffling and Poisson arrivals. Same seed, same trace.
-    #[arg(long, default_value_t = 0)]
-    seed: u64,
+    #[command(subcommand)]
+    generator: Registry,
 }
 
 /// Everything needed to explain, and reproduce, one canonical trace.
+///
+/// The totals are derived from the emitted rows rather than accumulated by the
+/// generator, so the manifest describes the file rather than the generator's own
+/// bookkeeping. The two used to be able to drift.
 #[derive(Debug, Serialize)]
 struct Manifest {
     schema: &'static str,
-    source_path: String,
-    source_schema: String,
-    source_sha256: String,
-    source_bytes: u64,
-    context_policy: &'static str,
-    major_compaction_min_drop_tokens: usize,
-    major_compaction_min_drop_ratio: f64,
+    /// Which entry in the registry produced this. Reading `parameters` without
+    /// knowing this is reading a blob whose keys mean whatever they meant to
+    /// some generator.
+    generator: &'static str,
     millisecond_decimals: usize,
-    selection_rule: &'static str,
-    max_sessions: Option<usize>,
-    /// How the timeline was invented. The source has no arrival times, so
-    /// without these four fields a trace cannot be reproduced from its source.
-    session_order: &'static str,
-    arrival_rate_per_second: f64,
-    arrival_pattern: &'static str,
-    seed: u64,
     sessions: usize,
     rounds: usize,
-    /// How much of the raw trace was not replayable as reported. These are the
-    /// headline numbers, not a footnote: on a real coding-agent trace most
-    /// sessions report a first-round prefix that the published data never
-    /// contained, and every one of those tokens becomes prefill work here.
-    folded_prefix_tokens: u64,
-    folded_rounds: usize,
-    folded_first_rounds: usize,
-    major_compaction_rounds: usize,
     total_prompt_tokens: u64,
     total_prefix_tokens: u64,
     total_output_tokens: u64,
     planned_prefix_hit_rate: f64,
+    /// The generator's own parameters and statistics, verbatim. This is the half
+    /// of reproducibility this file cannot know anything about.
+    parameters: serde_json::Value,
+}
+
+impl Manifest {
+    fn derive(
+        generator: &'static str,
+        rows: &[ExecutionRow],
+        parameters: serde_json::Value,
+    ) -> Self {
+        let mut total_prompt_tokens = 0u64;
+        let mut total_prefix_tokens = 0u64;
+        let mut total_output_tokens = 0u64;
+        let mut sessions: BTreeSet<&str> = BTreeSet::new();
+        for row in rows {
+            sessions.insert(row.session_id.as_str());
+            total_prompt_tokens += (row.prefix_len + row.input_len) as u64;
+            total_prefix_tokens += row.prefix_len as u64;
+            total_output_tokens += row.output_len as u64;
+        }
+        Self {
+            schema: SCHEMA_NAME,
+            generator,
+            millisecond_decimals: MILLISECOND_DECIMALS,
+            sessions: sessions.len(),
+            rounds: rows.len(),
+            total_prompt_tokens,
+            total_prefix_tokens,
+            total_output_tokens,
+            planned_prefix_hit_rate: if total_prompt_tokens == 0 {
+                0.0
+            } else {
+                total_prefix_tokens as f64 / total_prompt_tokens as f64
+            },
+            parameters,
+        }
+    }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let generator = args.generator.selected();
 
-    if args.source_schema != RAW_SCHEMA_SESSION_ROUNDS_V2 {
-        bail!(
-            "unknown --source-schema {:?}; this build reads {RAW_SCHEMA_SESSION_ROUNDS_V2:?}",
-            args.source_schema
-        );
-    }
-    if !(args.arrival_rate.is_finite() && args.arrival_rate > 0.0) {
-        bail!(
-            "--arrival-rate must be finite and positive, got {}",
-            args.arrival_rate
-        );
-    }
-
-    let raw_rows = read_raw(&args.source)?;
-    let sessions = group_sessions(raw_rows)?;
-
-    // One RNG drives both the permutation and the gaps, so a seed names the
-    // whole timeline rather than half of it.
-    let mut rng = Rng::new(args.seed);
-    let selected = select_sessions(sessions, args.max_sessions, args.session_order, &mut rng);
-    // Arrivals are drawn for the sessions that survived selection, so capping
-    // shortens the trace without changing the offered rate.
-    let arrivals = arrivals::synthesize(
-        &mut rng,
-        selected.len(),
-        args.arrival_rate,
-        args.arrival_pattern,
-    );
-
-    let mut rows: Vec<ExecutionRow> = Vec::new();
-    let mut manifest = new_manifest(&args)?;
-
-    for ((session_id, rounds), &arrival_time_ms) in selected.iter().zip(&arrivals) {
-        let mut chain = ContextChain::new();
-        for (round_idx, raw) in rounds.iter().enumerate() {
-            let materialized = chain.materialize(
-                RawRound {
-                    prefix_len: raw.prefix_len,
-                    input_len: raw.input_len,
-                    output_len: raw.output_len,
-                },
-                args.policy,
-            );
-
-            if materialized.folded_tokens > 0 {
-                manifest.folded_prefix_tokens += materialized.folded_tokens as u64;
-                manifest.folded_rounds += 1;
-                if round_idx == 0 {
-                    manifest.folded_first_rounds += 1;
-                }
-            }
-            if materialized.major_compaction {
-                manifest.major_compaction_rounds += 1;
-            }
-            manifest.total_prompt_tokens += materialized.total_prompt_len() as u64;
-            manifest.total_prefix_tokens += materialized.prefix_len as u64;
-            manifest.total_output_tokens += materialized.output_len as u64;
-
-            rows.push(ExecutionRow {
-                request_id: request_id(session_id, round_idx),
-                session_id: session_id.clone(),
-                round_idx,
-                arrival_time_ms,
-                prefix_len: materialized.prefix_len,
-                input_len: materialized.input_len,
-                output_len: materialized.output_len,
-                tool_wait_after_ms: raw.tool_wait_after_ms,
-            });
-        }
-    }
-
-    manifest.sessions = selected.len();
-    manifest.rounds = rows.len();
-    manifest.planned_prefix_hit_rate = if manifest.total_prompt_tokens == 0 {
-        0.0
-    } else {
-        manifest.total_prefix_tokens as f64 / manifest.total_prompt_tokens as f64
-    };
+    let generated = generator.generate()?;
+    let manifest = Manifest::derive(generator.name(), &generated.rows, generated.record);
 
     // Validate what we just produced, with the same code a consumer will run.
     // A generator that trusts itself is how a "canonical" format stops being one.
-    v2::validate(&rows).context("generated trace failed canonical validation")?;
+    v2::validate(&generated.rows).context("generated trace failed canonical validation")?;
 
-    write_trace(&args.out, &rows)?;
-    let manifest_path = sibling(&args.out, "manifest.json");
-    let plan_path = sibling(&args.out, "plan.json");
+    let out = generator.out();
+    write_trace(out, &generated.rows)?;
+    let manifest_path = sibling(out, "manifest.json");
+    let plan_path = sibling(out, "plan.json");
     fs::write(
         &manifest_path,
         serde_json::to_string_pretty(&manifest)? + "\n",
@@ -238,128 +129,25 @@ fn main() -> Result<()> {
     .with_context(|| format!("failed to write {}", manifest_path.display()))?;
     fs::write(
         &plan_path,
-        serde_json::to_string_pretty(&v2::plan(&rows))? + "\n",
+        serde_json::to_string_pretty(&v2::plan(&generated.rows))? + "\n",
     )
     .with_context(|| format!("failed to write {}", plan_path.display()))?;
 
     eprintln!(
-        "{SCHEMA_NAME} | policy={} sessions={} rounds={} prompt_tokens={} planned_prefix_hit_rate={:.4}",
-        manifest.context_policy,
+        "{SCHEMA_NAME} | generator={} sessions={} rounds={} prompt_tokens={} planned_prefix_hit_rate={:.4}",
+        manifest.generator,
         manifest.sessions,
         manifest.rounds,
         manifest.total_prompt_tokens,
         manifest.planned_prefix_hit_rate,
     );
     eprintln!(
-        "folded to fresh input | tokens={} rounds={} of which first rounds={} major_compactions={}",
-        manifest.folded_prefix_tokens,
-        manifest.folded_rounds,
-        manifest.folded_first_rounds,
-        manifest.major_compaction_rounds,
-    );
-    eprintln!(
         "wrote | {} {} {}",
-        args.out.display(),
+        out.display(),
         manifest_path.display(),
         plan_path.display()
     );
     Ok(())
-}
-
-fn new_manifest(args: &Args) -> Result<Manifest> {
-    let source_bytes = fs::metadata(&args.source)
-        .with_context(|| format!("failed to stat {}", args.source.display()))?
-        .len();
-    Ok(Manifest {
-        schema: SCHEMA_NAME,
-        source_path: args.source.display().to_string(),
-        source_schema: args.source_schema.clone(),
-        source_sha256: sha256_file(&args.source)?,
-        source_bytes,
-        context_policy: args.policy.label(),
-        major_compaction_min_drop_tokens: MAJOR_COMPACTION_MIN_DROP_TOKENS,
-        major_compaction_min_drop_ratio: MAJOR_COMPACTION_MIN_DROP_RATIO,
-        millisecond_decimals: MILLISECOND_DECIMALS,
-        selection_rule: "first_n_in_emitted_session_order",
-        max_sessions: args.max_sessions,
-        session_order: args.session_order.label(),
-        arrival_rate_per_second: args.arrival_rate,
-        arrival_pattern: args.arrival_pattern.label(),
-        seed: args.seed,
-        sessions: 0,
-        rounds: 0,
-        folded_prefix_tokens: 0,
-        folded_rounds: 0,
-        folded_first_rounds: 0,
-        major_compaction_rounds: 0,
-        total_prompt_tokens: 0,
-        total_prefix_tokens: 0,
-        total_output_tokens: 0,
-        planned_prefix_hit_rate: 0.0,
-    })
-}
-
-fn read_raw(path: &Path) -> Result<Vec<RawRow>> {
-    let mut reader = csv::Reader::from_path(path)
-        .with_context(|| format!("failed to open raw trace: {}", path.display()))?;
-    let mut rows = Vec::new();
-    for record in reader.deserialize() {
-        rows.push(record.context("failed to parse a raw session row")?);
-    }
-    if rows.is_empty() {
-        bail!("raw trace {} has no rows", path.display());
-    }
-    Ok(rows)
-}
-
-/// Group raw rows into sessions, preserving first-appearance order and sorting
-/// each session's rounds by the raw `round_idx`.
-///
-/// First-appearance order is the source's own order, which is the default
-/// emission order, so it is preserved rather than replaced by a sort on the
-/// identifier — that is lexicographic and means nothing here.
-fn group_sessions(rows: Vec<RawRow>) -> Result<Vec<(String, Vec<RawRow>)>> {
-    let mut order: Vec<String> = Vec::new();
-    let mut grouped: BTreeMap<String, Vec<RawRow>> = BTreeMap::new();
-    for row in rows {
-        if row.session_id.is_empty() {
-            bail!("raw trace has a row with an empty session id");
-        }
-        let entry = grouped.entry(row.session_id.clone()).or_insert_with(|| {
-            order.push(row.session_id.clone());
-            Vec::new()
-        });
-        entry.push(row);
-    }
-
-    let mut sessions = Vec::with_capacity(order.len());
-    for session_id in order {
-        let mut rounds = grouped.remove(&session_id).expect("session was recorded");
-        rounds.sort_by_key(|round| round.round_idx);
-        sessions.push((session_id, rounds));
-    }
-    Ok(sessions)
-}
-
-/// Order the sessions, then keep the first `max`.
-///
-/// Selection happens before arrivals are drawn, so a cap takes a prefix of the
-/// session order rather than the earliest slice of a timeline. That keeps the
-/// offered rate of a capped trace equal to the rate of the full one instead of
-/// silently compressing it.
-fn select_sessions(
-    mut sessions: Vec<(String, Vec<RawRow>)>,
-    max: Option<usize>,
-    order: SessionOrder,
-    rng: &mut Rng,
-) -> Vec<(String, Vec<RawRow>)> {
-    if order == SessionOrder::Shuffle {
-        rng.shuffle(&mut sessions);
-    }
-    if let Some(max) = max {
-        sessions.truncate(max);
-    }
-    sessions
 }
 
 fn write_trace(path: &Path, rows: &[ExecutionRow]) -> Result<()> {
@@ -405,9 +193,9 @@ fn sibling(path: &Path, name: &str) -> PathBuf {
     path.with_file_name(format!("{stem}.{name}"))
 }
 
-/// Minimal SHA-256 so the manifest can pin its source without adding a
+/// Minimal SHA-256 so a manifest can pin its source without adding a
 /// dependency to a crate that a public release ships.
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -491,90 +279,58 @@ fn sha256_file(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn raw_row(session_id: &str, round_idx: usize) -> RawRow {
-        RawRow {
+    fn row(session_id: &str, round_idx: usize, prefix_len: usize) -> ExecutionRow {
+        ExecutionRow {
+            request_id: v2::request_id(session_id, round_idx),
             session_id: session_id.to_string(),
             round_idx,
+            arrival_time_ms: 0.0,
+            prefix_len,
             input_len: 10,
             output_len: 4,
-            prefix_len: 0,
             tool_wait_after_ms: 0.0,
         }
     }
 
-    fn ids(sessions: &[(String, Vec<RawRow>)]) -> Vec<&str> {
-        sessions.iter().map(|(id, _)| id.as_str()).collect()
+    /// The reason the totals moved out of the generators: they are a property of
+    /// the file, so they are counted from the file.
+    #[test]
+    fn the_manifests_totals_describe_the_rows_that_were_emitted() {
+        let rows = vec![row("a", 0, 0), row("a", 1, 14), row("b", 0, 0)];
+
+        let manifest = Manifest::derive("test", &rows, serde_json::json!({}));
+
+        assert_eq!(manifest.sessions, 2);
+        assert_eq!(manifest.rounds, 3);
+        assert_eq!(manifest.total_prompt_tokens, 10 + 24 + 10);
+        assert_eq!(manifest.total_prefix_tokens, 14);
+        assert_eq!(manifest.total_output_tokens, 12);
+        assert!((manifest.planned_prefix_hit_rate - 14.0 / 44.0).abs() < 1e-12);
     }
 
     #[test]
-    fn grouping_preserves_first_appearance_and_orders_rounds() {
-        let sessions =
-            group_sessions(vec![raw_row("b", 1), raw_row("a", 0), raw_row("b", 0)]).unwrap();
+    fn an_empty_trace_reports_a_zero_hit_rate_rather_than_dividing_by_zero() {
+        let manifest = Manifest::derive("test", &[], serde_json::json!({}));
 
-        assert_eq!(ids(&sessions), ["b", "a"]);
-        let round_indices: Vec<usize> = sessions[0].1.iter().map(|row| row.round_idx).collect();
-        assert_eq!(round_indices, [0, 1]);
+        assert_eq!(manifest.planned_prefix_hit_rate, 0.0);
+    }
+
+    /// The generator's record goes into the manifest untouched. Nothing here
+    /// interprets it, so nothing here can quietly drop a knob out of it.
+    #[test]
+    fn the_generators_record_is_carried_verbatim() {
+        let record = serde_json::json!({"seed": 7, "nested": {"kept": true}});
+
+        let manifest = Manifest::derive("test", &[], record.clone());
+
+        assert_eq!(manifest.parameters, record);
     }
 
     #[test]
-    fn grouping_rejects_an_empty_session_id() {
-        let error = group_sessions(vec![raw_row("", 0)])
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("empty session id"), "{error}");
-    }
-
-    #[test]
-    fn selection_in_source_order_takes_a_prefix_of_the_file() {
-        let sessions =
-            group_sessions(vec![raw_row("c", 0), raw_row("a", 0), raw_row("b", 0)]).unwrap();
-
-        let selected = select_sessions(sessions, Some(2), SessionOrder::Source, &mut Rng::new(0));
-
-        assert_eq!(ids(&selected), ["c", "a"]);
-    }
-
-    /// Shuffling happens before truncation, so a cap samples across the whole
-    /// file rather than re-cutting the same prefix under a different name.
-    #[test]
-    fn shuffled_selection_samples_the_whole_file_and_is_seed_reproducible() {
-        let rows: Vec<RawRow> = (0..32)
-            .map(|index| raw_row(&format!("s{index:02}"), 0))
-            .collect();
-
-        let take = |seed: u64| {
-            let sessions = group_sessions(rows.clone()).unwrap();
-            let selected = select_sessions(
-                sessions,
-                Some(4),
-                SessionOrder::Shuffle,
-                &mut Rng::new(seed),
-            );
-            ids(&selected)
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-        };
-
-        let shuffled = take(1);
-        assert_eq!(shuffled.len(), 4);
-        assert_eq!(shuffled, take(1), "the same seed must select the same four");
-        assert_ne!(
-            shuffled,
-            ["s00", "s01", "s02", "s03"],
-            "a shuffle that returns the source prefix is not shuffling"
+    fn siblings_are_named_after_the_trace_they_describe() {
+        assert_eq!(
+            sibling(Path::new("out/execution.csv"), "manifest.json"),
+            PathBuf::from("out/execution.manifest.json")
         );
-    }
-
-    /// The whole point of drawing arrivals after selection: a capped trace has
-    /// the same offered rate as the full one, not a compressed slice of it.
-    #[test]
-    fn capping_does_not_change_the_offered_rate() {
-        let mut rng = Rng::new(0);
-        let capped = arrivals::synthesize(&mut rng, 10, 2.0, ArrivalPattern::Constant);
-
-        assert_eq!(capped.last().copied(), Some(4500.0));
-        assert!(capped.windows(2).all(|pair| pair[1] - pair[0] == 500.0));
     }
 }
