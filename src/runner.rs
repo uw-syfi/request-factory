@@ -238,12 +238,10 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
     });
 
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
-    let log_task = tokio::spawn(write_logs(
-        args.log_path.clone(),
-        log_rx,
-        replay_summary,
-        slo_summary,
-    ));
+    let log_path = args.log_path.clone();
+    let log_task = tokio::task::spawn_blocking(move || {
+        write_logs(log_path, log_rx, replay_summary, slo_summary)
+    });
     let status_handle = tokio::spawn(status_task(
         state.common.stats.clone(),
         workload.unit_count(),
@@ -372,12 +370,10 @@ async fn run_multimodal(
         (None, None)
     };
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
-    let log_task = tokio::spawn(write_logs(
-        args.log_path.clone(),
-        log_rx,
-        replay_summary,
-        slo_summary,
-    ));
+    let log_path = args.log_path.clone();
+    let log_task = tokio::task::spawn_blocking(move || {
+        write_logs(log_path, log_rx, replay_summary, slo_summary)
+    });
     let status_handle = tokio::spawn(status_task(
         state.common.stats.clone(),
         total_steps,
