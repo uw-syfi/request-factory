@@ -25,6 +25,30 @@ use crate::util::unix_seconds_now;
 pub(crate) use client::GenerationClient;
 pub(crate) use media_client::MediaClient;
 
+#[cfg(feature = "bench-internals")]
+pub(crate) fn bench_serialize_vllm_request(prompt_ids: &[u32]) -> Vec<u8> {
+    wire::VllmTokensBackend
+        .serialize_payload(&GenRequest {
+            model: "bench-model",
+            request_id: "bench-request",
+            prompt: Prompt::Tokens(prompt_ids),
+            max_tokens: 32,
+            temperature: 0.0,
+            stream: true,
+        })
+        .expect("benchmark request must serialize")
+}
+
+#[cfg(feature = "bench-internals")]
+pub(crate) fn bench_parse_vllm_event(data: &[u8]) -> usize {
+    let event = wire::VllmTokensBackend
+        .parse_event(data)
+        .expect("benchmark event must parse");
+    event.token_ids.as_ref().map_or(0, Vec::len)
+        + usize::from(event.finish_reason.is_some())
+        + usize::from(event.usage.is_some())
+}
+
 /// What one request sends as its input.
 ///
 /// One variant today, and an enum anyway on purpose. The second variant is

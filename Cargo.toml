@@ -32,8 +32,15 @@ name = "selfcheck"
 path = "src/bin/selfcheck/main.rs"
 required-features = ["runtime"]
 
+[[bin]]
+name = "loadgen_transport_bench"
+path = "src/bin/loadgen_transport_bench.rs"
+required-features = ["transport-bench"]
+
 [features]
 default = ["runtime"]
+bench-internals = ["runtime"]
+transport-bench = ["runtime", "dep:hyper"]
 
 # The replay runtime: the HTTP client, the tokenizer, the CLI, the executors.
 #
@@ -78,10 +85,24 @@ clap = { version = "4.5", features = ["derive"], optional = true }
 fdlimit = { version = "0.3", optional = true }
 futures = { version = "0.3", optional = true }
 hf-hub = { version = "0.3", optional = true }
+hyper = { version = "0.14", features = ["client", "http1", "tcp"], optional = true }
 reqwest = { version = "0.11", features = ["json", "stream"], optional = true }
 sha2 = { version = "0.10", optional = true }
 tokenizers = { version = "0.21", optional = true }
 tokio = { version = "1.36", features = ["full"], optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "dispatch"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "vllm_wire"
+harness = false
+required-features = ["bench-internals"]
 
 # This crate is also vendored as a submodule below larger Rust workspaces. Keep
 # it an independent workspace so Cargo never inherits the host repository's
