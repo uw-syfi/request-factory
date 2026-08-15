@@ -251,6 +251,8 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
                 sessions,
                 args.max_concurrency,
                 |session_ordinal, (session_id, steps)| {
+                    let session_ordinal =
+                        global_shard_ordinal(session_ordinal, args.shard_count, args.shard_index);
                     let state_ref = state.clone();
                     let log_tx_ref = log_tx.clone();
                     let timeline_ref = timeline_sink.clone();
@@ -274,6 +276,8 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
                 requests,
                 args.max_concurrency,
                 |request_ordinal, request| {
+                    let request_ordinal =
+                        global_shard_ordinal(request_ordinal, args.shard_count, args.shard_index);
                     let state_ref = state.clone();
                     let log_tx_ref = log_tx.clone();
                     let timeline_ref = timeline_sink.clone();
@@ -379,6 +383,8 @@ async fn run_multimodal(
         prepared,
         args.max_concurrency,
         |request_ordinal, request| {
+            let request_ordinal =
+                global_shard_ordinal(request_ordinal, args.shard_count, args.shard_index);
             let state_ref = state.clone();
             let log_tx_ref = log_tx.clone();
             let timeline_ref = timeline_sink.clone();
@@ -476,6 +482,12 @@ fn validate(args: &Args) -> Result<()> {
     Ok(())
 }
 
+fn global_shard_ordinal(local_ordinal: usize, shard_count: usize, shard_index: usize) -> usize {
+    local_ordinal
+        .saturating_mul(shard_count)
+        .saturating_add(shard_index)
+}
+
 /// Say on stderr which arrival timeline this run will actually replay, and
 /// rescale the workload when `--rate` asked for a different one.
 fn report_arrival_rate(
@@ -516,5 +528,17 @@ fn client_runtime_summary(sampled_global_queue_depth_peak: usize) -> ClientRunti
     ClientRuntimeSummary {
         tokio_worker_threads: tokio::runtime::Handle::current().metrics().num_workers(),
         sampled_global_queue_depth_peak,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::global_shard_ordinal;
+
+    #[test]
+    fn shard_local_ordinals_map_back_to_their_canonical_prompt_seeds() {
+        assert_eq!(global_shard_ordinal(0, 3, 1), 1);
+        assert_eq!(global_shard_ordinal(1, 3, 1), 4);
+        assert_eq!(global_shard_ordinal(2, 3, 1), 7);
     }
 }
