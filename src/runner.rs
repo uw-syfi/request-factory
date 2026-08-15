@@ -414,6 +414,9 @@ async fn run_multimodal(
 /// Reject argument combinations that are contradictory rather than merely
 /// unusual, before anything is loaded or any request is sent.
 fn validate(args: &Args) -> Result<()> {
+    if args.runtime_worker_threads == Some(0) {
+        return Err(anyhow!("--runtime-worker-threads must be greater than 0"));
+    }
     if args.max_concurrency == Some(0) {
         return Err(anyhow!("--max-concurrency must be greater than 0"));
     }

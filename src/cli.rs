@@ -121,6 +121,14 @@ pub struct Args {
     #[arg(long)]
     pub max_concurrency: Option<usize>,
 
+    /// Tokio worker threads used by the load generator.
+    ///
+    /// Defaults to at most eight: profiling shows larger worker pools contend
+    /// on this request-oriented workload. Override after profiling the target
+    /// host when its optimum differs.
+    #[arg(long)]
+    pub runtime_worker_threads: Option<usize>,
+
     /// Parse and statically summarize the workload without loading tokens or contacting a server.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
