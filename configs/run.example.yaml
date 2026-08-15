@@ -18,6 +18,10 @@ replay:
   dry_run: false
   arrival_mode: trace-timed
   max_concurrency: 8
+  # Profile the host before overriding the default cap of 8.
+  runtime_worker_threads: 8
+  # Scale-out is currently supported for saturated runs only.
+  processes: 1
   stop_session_on_error: true
   stream_idle_timeout_seconds: 600
   context:
@@ -26,6 +30,7 @@ replay:
 
 measurement:
   timeline: true
+  request_log: true
   # Omit this block when the run declares no global objective.
   slo:
     ttft_ms: 500
