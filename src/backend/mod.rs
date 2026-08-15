@@ -133,10 +133,13 @@ pub(crate) struct StreamEvent {
 pub(crate) trait Backend: Send + Sync {
     /// Path appended to `--base-url` to form the request endpoint.
     fn endpoint_suffix(&self) -> &str;
-    /// Shape one generation request into this backend's request body.
-    fn build_payload(&self, req: &GenRequest) -> Result<Value>;
-    /// Normalize one response JSON object (a stream chunk or a full body).
-    fn parse_event(&self, value: &Value) -> StreamEvent;
+    /// Serialize one generation request directly into this backend's JSON wire
+    /// representation. Keeping the DOM out of this hot path avoids allocating
+    /// a tree only for reqwest to immediately walk it again.
+    fn serialize_payload(&self, req: &GenRequest) -> Result<Vec<u8>>;
+    /// Deserialize and normalize one response JSON object directly from its
+    /// SSE bytes.
+    fn parse_event(&self, data: &[u8]) -> serde_json::Result<StreamEvent>;
 }
 
 /// Backend result shared by every text-generation source. Source identity stays
