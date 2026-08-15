@@ -119,12 +119,11 @@ pub(crate) async fn run_multimodal_request(
     state: Arc<MultimodalState>,
     log_tx: mpsc::Sender<StepLog>,
     timeline_sink: Option<TimelineSink>,
-    request_ordinal: usize,
+    _request_ordinal: usize,
     request: PreparedMultimodalRequest,
 ) {
     let arrival_release_lag_ms =
         wait_for_common_arrival(&state.common, request.source.arrival_time_ms).await;
-    let _concurrency_permit = state.common.acquire_capacity_slot(request_ordinal).await;
     state.common.stats.record_submit();
     let result = match &request.output {
         OutputSpec::Text { max_tokens } => {

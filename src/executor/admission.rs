@@ -1,135 +1,104 @@
-//! Deterministic ordering of capacity-slot admission.
+//! Bounded workload dispatch without one parked task per trace row.
 //!
-//! Every workload unit runs as its own task, so without help the order in which
-//! units reach the concurrency semaphore is whatever the tokio scheduler picked
-//! that run. That is invisible while the run is uncapped — nobody queues — but
-//! under `--max-concurrency` it decides *which* unit gets the freed slot, and
-//! two runs of the same trace can then admit different units.
-//!
-//! VibeSim has no such freedom: its release cursor walks the canonical rows in
-//! order and never releases row k+1 before row k. This gate gives the measured
-//! runner the same rule, which is what makes an admission sequence comparable
-//! between the two systems at all.
-//!
-//! Ordinals are the unit's canonical position, and canonical order is
-//! nondecreasing by arrival, so waiting for your turn never means waiting for a
-//! unit that arrives later than you.
+//! Declaration order is the admission order: the dispatcher consumes the
+//! canonical iterator from front to back and starts at most `limit` units.
+//! A completed unit makes room for exactly the next row. This preserves the
+//! deterministic capacity semantics while keeping scheduler memory proportional
+//! to active concurrency rather than trace length.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::Future;
 
-use tokio::sync::Notify;
+use tokio::task::JoinSet;
 
-/// Hands out the right to contend for a capacity slot, one ordinal at a time.
-///
-/// One `Notify` per unit rather than one shared one: a broadcast would wake
-/// every queued unit on every advance, which under a saturated arrival mode is
-/// quadratic wake churn inside the very tool that measures latency.
-#[derive(Debug)]
-pub(crate) struct AdmissionOrder {
-    next: AtomicUsize,
-    turn: Vec<Notify>,
-}
+pub(crate) async fn drive_bounded<I, F, Fut>(items: I, limit: Option<usize>, mut make: F)
+where
+    I: IntoIterator,
+    I::IntoIter: Send,
+    I::Item: Send + 'static,
+    F: FnMut(usize, I::Item) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let mut items = items.into_iter().enumerate();
+    let window = limit.unwrap_or(usize::MAX);
+    debug_assert!(window > 0);
+    let mut active = JoinSet::new();
 
-impl AdmissionOrder {
-    pub(crate) fn new(unit_count: usize) -> Self {
-        Self {
-            next: AtomicUsize::new(0),
-            turn: (0..unit_count).map(|_| Notify::new()).collect(),
+    loop {
+        while active.len() < window {
+            let Some((ordinal, item)) = items.next() else {
+                break;
+            };
+            active.spawn(make(ordinal, item));
         }
-    }
 
-    /// Wait until `ordinal` is the one being admitted.
-    ///
-    /// Dropping the returned guard passes the turn on. It advances on drop
-    /// rather than on an explicit call so that a unit which panics or returns
-    /// early cannot strand every later unit behind it.
-    pub(crate) async fn wait_for_turn(&self, ordinal: usize) -> TurnGuard<'_> {
-        if let Some(turn) = self.turn.get(ordinal) {
-            loop {
-                // Registered before the load, so an `advance` racing us here is
-                // still observed by the `await` below rather than lost.
-                let notified = turn.notified();
-                if self.next.load(Ordering::Acquire) >= ordinal {
-                    break;
-                }
-                notified.await;
-            }
+        let Some(result) = active.join_next().await else {
+            break;
+        };
+        if let Err(error) = result {
+            eprintln!("workload task join error: {error}");
         }
-        TurnGuard { order: self }
-    }
-
-    fn advance(&self) {
-        let next = self.next.fetch_add(1, Ordering::Release) + 1;
-        if let Some(turn) = self.turn.get(next) {
-            turn.notify_one();
-        }
-    }
-}
-
-/// Holds the admission turn; passes it on when dropped.
-pub(crate) struct TurnGuard<'a> {
-    order: &'a AdmissionOrder,
-}
-
-impl Drop for TurnGuard<'_> {
-    fn drop(&mut self) {
-        self.order.advance();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Barrier;
 
-    /// Tasks spawned in reverse order still take their turns in ordinal order.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn turns_are_taken_in_ordinal_order_regardless_of_spawn_order() {
-        let order = Arc::new(AdmissionOrder::new(16));
-        let admitted = Arc::new(Mutex::new(Vec::new()));
-        let mut tasks = Vec::new();
+    async fn bounds_active_units_and_starts_them_in_declaration_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Mutex::new(Vec::new()));
 
-        for ordinal in (0..16).rev() {
-            let order = order.clone();
-            let admitted = admitted.clone();
-            tasks.push(tokio::spawn(async move {
-                let _turn = order.wait_for_turn(ordinal).await;
-                admitted.lock().await.push(ordinal);
-                // Hold the turn across an await point, the way a real unit holds
-                // it across the semaphore acquisition.
+        drive_bounded(0..40, Some(4), |ordinal, item| {
+            let active = active.clone();
+            let peak = peak.clone();
+            let started = started.clone();
+            async move {
+                started.lock().unwrap().push((ordinal, item));
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
                 tokio::task::yield_now().await;
-            }));
-        }
-        for task in tasks {
-            task.await.unwrap();
-        }
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
+        })
+        .await;
 
-        assert_eq!(*admitted.lock().await, (0..16).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::SeqCst) <= 4);
+        let mut observed = started.lock().unwrap().clone();
+        observed.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        assert_eq!(
+            observed,
+            (0..40).map(|value| (value, value)).collect::<Vec<_>>()
+        );
     }
 
-    /// A unit that dies without ever finishing must not strand the rest.
-    #[tokio::test]
-    async fn a_panicking_unit_still_passes_its_turn_on() {
-        let order = Arc::new(AdmissionOrder::new(2));
-        let panicking = tokio::spawn({
-            let order = order.clone();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unbounded_run_starts_every_unit_without_a_window() {
+        let barrier = Arc::new(Barrier::new(17));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let driver = tokio::spawn({
+            let barrier = barrier.clone();
+            let completed = completed.clone();
             async move {
-                let _turn = order.wait_for_turn(0).await;
-                panic!("unit died mid-admission");
+                drive_bounded(0..16, None, |_ordinal, _item| {
+                    let barrier = barrier.clone();
+                    let completed = completed.clone();
+                    async move {
+                        barrier.wait().await;
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .await;
             }
         });
-        assert!(panicking.await.is_err());
-
-        let follower = tokio::spawn({
-            let order = order.clone();
-            async move {
-                let _turn = order.wait_for_turn(1).await;
-            }
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(5), follower)
-            .await
-            .expect("ordinal 1 was stranded behind the dead unit")
-            .unwrap();
+        // The test itself is the final barrier participant. If the dispatcher
+        // imposed an undocumented window, it would deadlock here.
+        barrier.wait().await;
+        driver.await.unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), 16);
     }
 }

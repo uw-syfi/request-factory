@@ -10,14 +10,13 @@
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 
 use crate::backend::{GenerationClient, MediaClient};
 use crate::cli::Args;
 use crate::executor::{
-    prepare_multimodal_requests, run_independent_request, run_multimodal_request, run_session,
-    status_task, AdmissionOrder, CommonState, MultimodalState, RunPolicy, Stats,
-    TextGenerationState,
+    drive_bounded, prepare_multimodal_requests, run_independent_request, run_multimodal_request,
+    run_session, status_task, CommonState, MultimodalState, RunPolicy, Stats, TextGenerationState,
 };
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
@@ -226,14 +225,6 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
             policy: RunPolicy::from_args(&args),
             stats: Arc::new(Stats::default()),
             run_start: Instant::now(),
-            concurrency_semaphore: args
-                .max_concurrency
-                .map(|limit| Arc::new(Semaphore::new(limit))),
-            // Only under a cap, because it exists to order contention and there is
-            // none without one.
-            admission_order: args
-                .max_concurrency
-                .map(|_| Arc::new(AdmissionOrder::new(workload.unit_count()))),
         },
     });
 
@@ -250,42 +241,51 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
         state.common.run_start,
     ));
 
-    let mut join_set = tokio::task::JoinSet::new();
     match workload {
         ReplayWorkload::Sessions(sessions) => {
-            for (session_ordinal, (session_id, steps)) in sessions.into_iter().enumerate() {
-                let state_ref = state.clone();
-                let log_tx_ref = log_tx.clone();
-                let timeline_ref = timeline_sink.clone();
-                join_set.spawn(async move {
-                    run_session(
-                        state_ref,
-                        log_tx_ref,
-                        timeline_ref,
-                        session_ordinal,
-                        session_id,
-                        steps,
-                    )
-                    .await;
-                });
-            }
+            drive_bounded(
+                sessions,
+                args.max_concurrency,
+                |session_ordinal, (session_id, steps)| {
+                    let state_ref = state.clone();
+                    let log_tx_ref = log_tx.clone();
+                    let timeline_ref = timeline_sink.clone();
+                    async move {
+                        run_session(
+                            state_ref,
+                            log_tx_ref,
+                            timeline_ref,
+                            session_ordinal,
+                            session_id,
+                            steps,
+                        )
+                        .await;
+                    }
+                },
+            )
+            .await;
         }
         ReplayWorkload::IndependentRequests(requests) => {
-            for (request_ordinal, request) in requests.into_iter().enumerate() {
-                let state_ref = state.clone();
-                let log_tx_ref = log_tx.clone();
-                let timeline_ref = timeline_sink.clone();
-                join_set.spawn(async move {
-                    run_independent_request(
-                        state_ref,
-                        log_tx_ref,
-                        timeline_ref,
-                        request_ordinal,
-                        request,
-                    )
-                    .await;
-                });
-            }
+            drive_bounded(
+                requests,
+                args.max_concurrency,
+                |request_ordinal, request| {
+                    let state_ref = state.clone();
+                    let log_tx_ref = log_tx.clone();
+                    let timeline_ref = timeline_sink.clone();
+                    async move {
+                        run_independent_request(
+                            state_ref,
+                            log_tx_ref,
+                            timeline_ref,
+                            request_ordinal,
+                            request,
+                        )
+                        .await;
+                    }
+                },
+            )
+            .await;
         }
         ReplayWorkload::MultimodalRequests(_) => {
             unreachable!("multimodal workloads return through their own runtime branch")
@@ -294,12 +294,6 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
     // Both writers finish when their last sender is gone.
     drop(log_tx);
     drop(timeline_sink);
-
-    while let Some(result) = join_set.join_next().await {
-        if let Err(err) = result {
-            eprintln!("workload task join error: {err}");
-        }
-    }
 
     let folded = log_task.await?;
     status_handle.await?;
@@ -336,12 +330,6 @@ async fn run_multimodal(
         policy: RunPolicy::from_args(args),
         stats: Arc::new(Stats::default()),
         run_start: Instant::now(),
-        concurrency_semaphore: args
-            .max_concurrency
-            .map(|limit| Arc::new(Semaphore::new(limit))),
-        admission_order: args
-            .max_concurrency
-            .map(|_| Arc::new(AdmissionOrder::new(total_steps))),
     };
     let state = Arc::new(MultimodalState {
         common,
@@ -382,30 +370,28 @@ async fn run_multimodal(
         state.common.run_start,
     ));
 
-    let mut join_set = tokio::task::JoinSet::new();
-    for (request_ordinal, request) in prepared.into_iter().enumerate() {
-        let state_ref = state.clone();
-        let log_tx_ref = log_tx.clone();
-        let timeline_ref = timeline_sink.clone();
-        join_set.spawn(async move {
-            run_multimodal_request(
-                state_ref,
-                log_tx_ref,
-                timeline_ref,
-                request_ordinal,
-                request,
-            )
-            .await;
-        });
-    }
+    drive_bounded(
+        prepared,
+        args.max_concurrency,
+        |request_ordinal, request| {
+            let state_ref = state.clone();
+            let log_tx_ref = log_tx.clone();
+            let timeline_ref = timeline_sink.clone();
+            async move {
+                run_multimodal_request(
+                    state_ref,
+                    log_tx_ref,
+                    timeline_ref,
+                    request_ordinal,
+                    request,
+                )
+                .await;
+            }
+        },
+    )
+    .await;
     drop(log_tx);
     drop(timeline_sink);
-    while let Some(result) = join_set.join_next().await {
-        if let Err(error) = result {
-            eprintln!("workload task join error: {error}");
-        }
-    }
-
     let folded = log_task.await?;
     status_handle.await?;
     let timeline_summary = match timeline_task {
