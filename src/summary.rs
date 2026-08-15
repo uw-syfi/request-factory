@@ -506,12 +506,15 @@ pub(crate) struct ClientRuntimeSummary {
 /// is how two numbers that must agree stop agreeing.
 pub(crate) fn write_logs(
     path: String,
+    persist_records: bool,
     mut rx: mpsc::Receiver<StepLog>,
     mut summary: ReplaySummary,
     mut slo: Option<SloSummary>,
 ) -> LogFold {
-    let file = File::create(&path).expect("failed to create log file");
-    let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+    let mut writer = persist_records.then(|| {
+        let file = File::create(&path).expect("failed to create log file");
+        std::io::BufWriter::with_capacity(1024 * 1024, file)
+    });
     let mut measurements = ReplayMeasurements::default();
 
     while let Some(record) = rx.blocking_recv() {
@@ -520,11 +523,15 @@ pub(crate) fn write_logs(
         if let Some(slo) = slo.as_mut() {
             slo.add(&record.slo_measurement());
         }
-        if serde_json::to_writer(&mut writer, &record).is_ok() {
-            let _ = writer.write_all(b"\n");
+        if let Some(writer) = writer.as_mut() {
+            if serde_json::to_writer(&mut *writer, &record).is_ok() {
+                let _ = writer.write_all(b"\n");
+            }
         }
     }
-    let _ = writer.flush();
+    if let Some(writer) = writer.as_mut() {
+        let _ = writer.flush();
+    }
     summary.finalize(&mut measurements);
     log_server_prefix_hit_rate_summary(&summary);
     if let Some(slo) = slo.as_ref() {

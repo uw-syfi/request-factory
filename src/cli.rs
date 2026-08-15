@@ -82,6 +82,15 @@ pub struct Args {
     #[arg(long, alias = "max-sessions")]
     pub max_items: Option<usize>,
 
+    /// Number of load-generator processes partitioning this trace.
+    #[arg(long, default_value_t = 1)]
+    pub shard_count: usize,
+
+    /// Zero-based partition owned by this process. Units are assigned by their
+    /// canonical ordinal modulo --shard-count.
+    #[arg(long, default_value_t = 0)]
+    pub shard_index: usize,
+
     /// Target top-level arrival rate: sessions/s or independent requests/s.
     /// Only meaningful under `--arrival-mode trace-timed`.
     #[arg(long)]
@@ -94,6 +103,12 @@ pub struct Args {
 
     #[arg(long, default_value = "session_runner_output.jsonl")]
     pub log_path: String,
+
+    /// Persist one full JSON record per request. Disable for capacity tests
+    /// whose storage bandwidth would otherwise become the measured bottleneck;
+    /// aggregate summaries are still computed.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    pub request_log: bool,
 
     /// Optional directory for generated image/audio artifacts. Measurements are
     /// taken before artifact writes so local storage cannot inflate latency.

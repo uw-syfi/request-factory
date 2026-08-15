@@ -54,6 +54,7 @@ class LaunchSpec:
     terminal_log: Path
     result_file: Path | None
     postprocess_viz: bool = False
+    processes: int = 1
 
 
 def load_task_config(task: str, config_path: Path) -> LaunchSpec:
@@ -257,6 +258,8 @@ def _build_common_run_arguments(
             "rate",
             "max_items",
             "max_concurrency",
+            "processes",
+            "runtime_worker_threads",
             "stream_idle_timeout_seconds",
             "stop_session_on_error",
             "dry_run",
@@ -264,7 +267,7 @@ def _build_common_run_arguments(
         },
         "replay",
     )
-    _reject_unknown(measurement, {"timeline", "slo"}, "measurement")
+    _reject_unknown(measurement, {"timeline", "request_log", "slo"}, "measurement")
 
     tags = input_config.get("tags", [])
     if not isinstance(tags, list) or not all(
@@ -341,6 +344,8 @@ def _build_common_run_arguments(
         str(_optional_bool(replay, "stop_session_on_error", "replay", True)).lower(),
         "--timeline",
         str(timeline_enabled).lower(),
+        "--request-log",
+        str(_optional_bool(measurement, "request_log", "measurement", True)).lower(),
         "--log-path",
         str(paths["requests"]),
         "--summary-path",
@@ -387,6 +392,11 @@ def _build_common_run_arguments(
     )
     _append_option(
         arguments,
+        "--runtime-worker-threads",
+        _optional_integer(replay, "runtime_worker_threads", "replay", positive=True),
+    )
+    _append_option(
+        arguments,
         "--max-model-len",
         _optional_integer(context, "max_model_len", "replay.context", positive=True),
     )
@@ -409,6 +419,13 @@ def _build_run(root: dict[str, Any], config_path: Path) -> LaunchSpec:
         root, config_path, default_directory="out/run"
     )
     arguments = _build_common_run_arguments(root, config_path, paths)
+    replay = _block(root, "replay", required=False)
+    processes = _optional_integer(replay, "processes", "replay", 1, positive=True)
+    assert processes is not None
+    if processes > 1 and replay.get("arrival_mode", "trace-timed") != "saturated":
+        raise ConfigError(
+            "replay.processes greater than 1 currently requires replay.arrival_mode: saturated"
+        )
     return LaunchSpec(
         task="run",
         binary="session_runner",
@@ -416,6 +433,7 @@ def _build_run(root: dict[str, Any], config_path: Path) -> LaunchSpec:
         output_directory=output_directory,
         terminal_log=paths["terminal"],
         result_file=paths["summary"],
+        processes=processes,
     )
 
 
@@ -468,6 +486,8 @@ def _build_sweep(root: dict[str, Any], config_path: Path) -> LaunchSpec:
         raise ConfigError(
             "replay.dry_run cannot measure a sweep and must be false or omitted"
         )
+    if replay.get("processes", 1) != 1:
+        raise ConfigError("replay.processes is supported by run, not sweep")
 
     arguments = [
         "--out",

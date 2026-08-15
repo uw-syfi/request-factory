@@ -119,6 +119,9 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
     let mut workload = load_workload(&args.trace, &declaration, args.max_items)?;
     let unit_label = workload.unit_label();
     report_arrival_rate(&args, &mut workload, unit_label)?;
+    // Rescale before partitioning so --rate remains the aggregate offered rate,
+    // rather than being independently applied by every shard.
+    workload.shard(args.shard_count, args.shard_index);
 
     let replay_summary = ReplaySummary::empty_for(&workload);
     // A run reports attainment when it was given an objective *or* when the
@@ -230,8 +233,9 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
 
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
     let log_path = args.log_path.clone();
+    let request_log = args.request_log;
     let log_task = tokio::task::spawn_blocking(move || {
-        write_logs(log_path, log_rx, replay_summary, slo_summary)
+        write_logs(log_path, request_log, log_rx, replay_summary, slo_summary)
     });
     let status_handle = tokio::spawn(status_task(
         state.common.stats.clone(),
@@ -359,8 +363,9 @@ async fn run_multimodal(
     };
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
     let log_path = args.log_path.clone();
+    let request_log = args.request_log;
     let log_task = tokio::task::spawn_blocking(move || {
-        write_logs(log_path, log_rx, replay_summary, slo_summary)
+        write_logs(log_path, request_log, log_rx, replay_summary, slo_summary)
     });
     let status_handle = tokio::spawn(status_task(
         state.common.stats.clone(),
@@ -414,6 +419,16 @@ async fn run_multimodal(
 /// Reject argument combinations that are contradictory rather than merely
 /// unusual, before anything is loaded or any request is sent.
 fn validate(args: &Args) -> Result<()> {
+    if args.shard_count == 0 {
+        return Err(anyhow!("--shard-count must be greater than 0"));
+    }
+    if args.shard_index >= args.shard_count {
+        return Err(anyhow!(
+            "--shard-index {} must be less than --shard-count {}",
+            args.shard_index,
+            args.shard_count
+        ));
+    }
     if args.runtime_worker_threads == Some(0) {
         return Err(anyhow!("--runtime-worker-threads must be greater than 0"));
     }

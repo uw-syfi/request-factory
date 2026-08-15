@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from launcher import ui
-from launcher.config import ConfigError, load_task_config
+from launcher.__main__ import _shard_command
+from launcher.config import ConfigError, LaunchSpec, load_task_config
 
 
 def write_config(directory: Path, text: str, name: str = "task.yaml") -> Path:
@@ -57,8 +58,62 @@ def test_run_config_lowers_nested_blocks_and_resolves_paths(tmp_path: Path) -> N
     assert arguments[arguments.index("--trace-tags") + 1] == "slo,priority"
     assert arguments[arguments.index("--arrival-mode") + 1] == "saturated"
     assert arguments[arguments.index("--timeline") + 1] == "false"
+    assert arguments[arguments.index("--request-log") + 1] == "true"
     assert arguments[arguments.index("--slo") + 1] == "ttft_ms=500,e2e_ms=2000"
     assert "--skip-when-reaching-limit" in arguments
+
+
+def test_run_config_exposes_profiled_workers_and_process_shards(tmp_path: Path) -> None:
+    config_text = minimal_run_yaml().replace(
+        "  max_concurrency: 4\n",
+        "  max_concurrency: 4\n  runtime_worker_threads: 6\n  processes: 4\n",
+    )
+    specification = load_task_config("run", write_config(tmp_path, config_text))
+
+    assert specification.processes == 4
+    arguments = list(specification.arguments)
+    assert arguments[arguments.index("--runtime-worker-threads") + 1] == "6"
+
+
+def test_process_shards_require_saturated_arrivals(tmp_path: Path) -> None:
+    config_text = minimal_run_yaml().replace(
+        "  arrival_mode: saturated\n",
+        "  arrival_mode: trace-timed\n  processes: 2\n",
+    )
+    with pytest.raises(ConfigError, match="requires replay.arrival_mode: saturated"):
+        load_task_config("run", write_config(tmp_path, config_text))
+
+
+def test_shard_commands_isolate_every_output(tmp_path: Path) -> None:
+    specification = LaunchSpec(
+        task="run",
+        binary="session_runner",
+        arguments=(),
+        output_directory=tmp_path,
+        terminal_log=tmp_path / "terminal.log",
+        result_file=tmp_path / "summary.json",
+        processes=3,
+    )
+    command, terminal, summary = _shard_command(
+        specification,
+        [
+            "session_runner",
+            "--log-path",
+            "requests.jsonl",
+            "--summary-path",
+            "summary.json",
+            "--timeline-path",
+            "timeline.parquet",
+        ],
+        1,
+    )
+
+    assert command[-4:] == ["--shard-count", "3", "--shard-index", "1"]
+    assert command[command.index("--log-path") + 1] == str(
+        tmp_path / "shards/01/requests.jsonl"
+    )
+    assert terminal == tmp_path / "shards/01/terminal.log"
+    assert summary == tmp_path / "shards/01/summary.json"
 
 
 def test_sweep_owns_rate_and_can_request_visualization(tmp_path: Path) -> None:
