@@ -18,8 +18,8 @@ replay:
   dry_run: false
   arrival_mode: trace-timed
   max_concurrency: 8
-  # Profile the host before overriding the default cap of 8.
-  runtime_worker_threads: 8
+  # Profile the host before overriding the default cap of 16.
+  runtime_worker_threads: 16
   # Scale-out is currently supported for saturated runs only.
   processes: 1
   stop_session_on_error: true

@@ -138,9 +138,9 @@ pub struct Args {
 
     /// Tokio worker threads used by the load generator.
     ///
-    /// Defaults to at most eight: profiling shows larger worker pools contend
-    /// on this request-oriented workload. Override after profiling the target
-    /// host when its optimum differs.
+    /// Defaults to at most 16: profiling shows larger worker pools contend on
+    /// this request-oriented workload. Override after profiling the target host
+    /// when its optimum differs.
     #[arg(long)]
     pub runtime_worker_threads: Option<usize>,
 

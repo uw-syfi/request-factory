@@ -2,7 +2,7 @@
 
 The load generator has two capacity tiers:
 
-- A single `session_runner` process defaults to at most eight Tokio workers. Use
+- A single `session_runner` process defaults to at most 16 Tokio workers. Use
   `--runtime-worker-threads` to override that value after profiling the host.
 - A saturated YAML run can set `replay.processes` to partition top-level trace
   units across independent processes. The launcher writes each process's logs,
@@ -13,7 +13,7 @@ The load generator has two capacity tiers:
 replay:
   arrival_mode: saturated
   max_concurrency: 256
-  runtime_worker_threads: 8
+  runtime_worker_threads: 16
   processes: 4
 
 measurement:
@@ -60,8 +60,15 @@ Profile findings and corresponding changes:
 - Callgrind attributed about 29% of `run_step` instructions to request JSON
   construction/serialization and response DOM parsing. Typed byte-level wire
   data raised the pinned median from 111,725 to 130,976 requests/s (+17.2%).
-- A runtime sweep found a contention knee around eight workers. Eight workers
-  delivered a 122,507 requests/s median versus 64,604 at 32 workers (1.90x).
+- A post-serialization runtime sweep moved the knee to 16 workers. At saturated
+  concurrency 256, 16 workers delivered a 180,612 requests/s median versus
+  135,300 at eight workers (+33.5%); 24 workers regressed to 101,566. The
+  default therefore caps itself at 16, while preserving the explicit override.
+- A persistent dispatch-worker candidate was 7–13x faster in its deliberately
+  narrow task-lifecycle benchmark, but its end-to-end median was unchanged
+  (128,528 versus 128,057 requests/s), so production keeps the simpler bounded
+  dispatcher. A dedicated-connection HTTP candidate was likewise rejected
+  after its transport median trailed the shared Reqwest pool.
 
 The original pinned Rust-responder baseline was 26,912 requests/s. Three
 four-process launcher runs against one 16-worker responder completed the same
@@ -70,6 +77,15 @@ four-process launcher runs against one 16-worker responder completed the same
 four-client, four-endpoint run reached 303,684 requests/s. The responder was
 intentionally CPU-only; real deployment capacity remains bounded by the server,
 network, request size, response event count, and enabled measurement outputs.
+
+For the single-process design, a longer 1,000,000-request run at 16 runtime
+workers and concurrency 32 produced 191,258, 194,640, 202,221, 203,492, and
+210,777 requests/s (median 202,221, 7.51x the original baseline). A separate
+three-run series reached a 225,485 median, but the lower five-run figure is the
+conservative capacity claim. The current single-runtime result therefore has
+about 202k requests/s of demonstrated localhost capacity, not 300k; the
+component and end-to-end benchmarks in `benches/README.md` are the guardrails
+for further work.
 
 For reproducible comparisons, record CPU affinity, Tokio worker count, request
 shape, concurrency, timeline/request-log settings, backend topology, and the

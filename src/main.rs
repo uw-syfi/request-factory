@@ -24,5 +24,5 @@ fn main() -> Result<()> {
 fn default_runtime_worker_threads() -> usize {
     std::thread::available_parallelism()
         .map_or(1, usize::from)
-        .min(8)
+        .min(16)
 }
