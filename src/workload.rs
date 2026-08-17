@@ -38,9 +38,9 @@ pub(crate) fn load_workload(
 ) -> Result<ReplayWorkload> {
     reject_unsupported_replay(input_file_schema)?;
     let mut workload = match input_file_schema.input_file_format {
-        InputFileFormat::TextGenerationIndependent => {
-            ReplayWorkload::IndependentRequests(independent::load(path, input_file_schema)?)
-        }
+        InputFileFormat::TextGenerationIndependent => ReplayWorkload::IndependentRequests(
+            independent::load_requests(path, input_file_schema)?,
+        ),
         InputFileFormat::TextGenerationSessionExecutionV2 => {
             ReplayWorkload::Sessions(session::load(path, input_file_schema)?)
         }
@@ -395,6 +395,7 @@ mod tests {
             tool_wait_after_ms: 0.0,
             slo: Default::default(),
             priority: Default::default(),
+            speculative: Default::default(),
         }
     }
 
@@ -512,6 +513,7 @@ mod tests {
             tool_wait_after_ms: 0.0,
             slo: Default::default(),
             priority: Default::default(),
+            speculative: Default::default(),
         };
         let sessions: SessionPlans = vec![("session".to_string(), vec![step])];
 
