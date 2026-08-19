@@ -170,10 +170,12 @@ Independent of every axis above, a live run:
   fabricated;
 - sends `output_len` as `max_tokens` with `ignore_eos: true`, so output length
   is the trace's, not the model's stopping point;
-- requires server-side prefix caching plus cached-prompt-token usage details,
-  and aborts on a two-request preflight if they are missing — this holds for
-  `independent` workloads too, because the accounting is what proves the
-  planned reuse actually happened.
+- requires server-side prefix caching plus cached-prompt-token usage details for
+  **session** workloads, and aborts on a two-request preflight if they are
+  missing, because the accounting is what proves the planned reuse actually
+  happened. `independent` workloads seed every unit at a distinct pool offset so
+  reuse is never planned; their hit rate is ~0 by construction, and they are not
+  gated on a feature they do not use.
 
 For what is deliberately *not* implemented, see [Current scope](#current-scope).
 
@@ -207,9 +209,15 @@ RESULT
   SLO           not declared
 ```
 
-Before measured requests, every live run performs a two-request prefix-cache
-preflight. vLLM must keep prefix caching enabled and expose prompt-token details
-with `--enable-prompt-tokens-details`. For native token-in/token-out, launch
+Before measured requests, a live **session** run performs a two-request
+prefix-cache preflight; an `independent` run skips it. vLLM must then keep prefix
+caching enabled and expose prompt-token details with
+`--enable-prompt-tokens-details`. The probe is 8k tokens because a server caches
+whole blocks only, and a hybrid attention/SSM model's block can be far larger
+than a typical one (1056 tokens for Qwen3.6-35B-A3B, sized so the attention page
+covers the mamba page); a probe shorter than one block can never register a hit.
+Note that vLLM disables prefix caching by default for hybrid models, calling the
+feature experimental. For native token-in/token-out, launch
 vLLM with `--tokens-only` and set:
 
 ```yaml
@@ -247,8 +255,8 @@ and use `--base-url http://127.0.0.1:8000 --backend vllm-tokens`.
 
 | Server setting | Why req-frontend needs it |
 |---|---|
-| `--enable-prefix-caching` | Enables the cache behavior audited by the mandatory two-request preflight. |
-| `--enable-prompt-tokens-details` | Returns cached-token usage needed to prove the preflight and report cache alignment. |
+| `--enable-prefix-caching` | Enables the cache behavior audited by the session-workload preflight. Off by default for hybrid models. |
+| `--enable-prompt-tokens-details` | Returns cached-token usage needed to prove the preflight and report cache alignment. Useful on `independent` runs too, as evidence the hit rate really is ~0. |
 | `--stream-interval 1` | Requests one-token streaming cadence. It does not guarantee one SSE event per token if the API process falls behind. |
 | `--api-server-count N` | Adds independent HTTP API **processes**, not threads, for request parsing and streamed-output drain. |
 | `--tokens-only` | Enables `/inference/v1/generate` and removes server-side detokenization from the native-token path. |

@@ -170,13 +170,29 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
 
     // Fail fast if the server won't report prefix-cache hits: otherwise every measured hit
     // rate would silently read as zero. Dry-run returns earlier and never reaches here.
-    // Probe the TAIL of the pool: workload unit 0 seeds at offset 0, so a head
-    // probe would warm its first prompt and fabricate a cache hit there.
-    let probe_len = token_pool.len().min(512);
-    client
-        .preflight_cache_check(&token_pool[token_pool.len() - probe_len..])
-        .await
-        .context("prefix-cache preflight failed")?;
+    // Only workloads that actually reuse prefixes are held to this; see
+    // `WorkloadSummary::depends_on_prefix_cache`.
+    if workload_summary.depends_on_prefix_cache() {
+        // Probe the TAIL of the pool: workload unit 0 seeds at offset 0, so a head
+        // probe would warm its first prompt and fabricate a cache hit there.
+        //
+        // The probe must span at least one whole block, because that is the
+        // granularity a server caches at. Blocks are usually tiny (vLLM
+        // defaults to 16), but a hybrid attention/SSM model sizes its attention
+        // block so the attention page covers the mamba page — 1056 tokens for
+        // Qwen3.6-35B-A3B. A 512-token probe spans zero full blocks there, so
+        // the gate could never pass however the server was configured, and it
+        // would blame "prefix caching disabled" for what is really a probe too
+        // short to cache. 8k clears any block size in practice while staying
+        // bounded, so a long-context workload does not pay for two extra
+        // full-length prefills.
+        const PREFLIGHT_PROBE_TOKENS: usize = 8192;
+        let probe_len = token_pool.len().min(PREFLIGHT_PROBE_TOKENS);
+        client
+            .preflight_cache_check(&token_pool[token_pool.len() - probe_len..])
+            .await
+            .context("prefix-cache preflight failed")?;
+    }
 
     // Bounded in requests, not events: it caps how far the writer may fall
     // behind before timelines are dropped rather than queued. Deep enough that

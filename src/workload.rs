@@ -239,6 +239,21 @@ impl WorkloadSummary {
         }
     }
 
+    /// Whether this workload's result depends on server-side prefix reuse.
+    ///
+    /// A session round replays a prefix its earlier rounds already sent, so a
+    /// server that silently fails to report — or to perform — cache hits
+    /// invalidates the measurement outright. Independent requests each seed at
+    /// a distinct pool offset precisely so cross-unit sharing never happens;
+    /// their hit rate is ~0 by construction, and holding them to the session
+    /// requirement would block runs that do not use the feature at all.
+    pub(crate) fn depends_on_prefix_cache(&self) -> bool {
+        match self {
+            Self::Sessions(_) => true,
+            Self::IndependentRequests(_) => false,
+        }
+    }
+
     /// Workload units this trace offers — what `--rate` counts.
     ///
     /// A session, not a round: `--rate` rescales session arrivals, and a
