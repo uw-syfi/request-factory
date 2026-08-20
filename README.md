@@ -328,6 +328,13 @@ and use `--base-url http://127.0.0.1:8000 --backend vllm-tokens`.
 |---|---|
 | `--enable-prefix-caching` | Enables the cache behavior audited by the mandatory two-request preflight. |
 | `--enable-prompt-tokens-details` | Returns cached-token usage needed to prove the preflight and report cache alignment. |
+
+**SGLang and `--backend openai`.** SGLang's OpenAI-compatible `/v1/completions`
+returns a usage block with no cached-token field *on any flag* — verified
+against a live server by sending one prompt twice and reading the streamed
+usage. The prefix-cache preflight therefore cannot pass on that route, and it
+aborts by design rather than reporting a hit rate it cannot see. Use
+`--backend sglang-tokens`, whose `meta_info` carries `cached_tokens`.
 | `--stream-interval 1` | Requests one-token streaming cadence. It does not guarantee one SSE event per token if the API process falls behind. |
 | `--api-server-count N` | Adds independent HTTP API **processes**, not threads, for request parsing and streamed-output drain. |
 | `--tokens-only` | Enables `/inference/v1/generate` and removes server-side detokenization from the native-token path. |

@@ -34,10 +34,10 @@ impl GenerationClient {
         match usage.cached_prompt_tokens {
             Some(cached) if cached > 0 => Ok(()),
             other => Err(anyhow!(
-                "preflight: server reported no prefix-cache hit (prompt_tokens={:?}, cached_tokens={:?}). \
-                 Launch the server with prompt-token details and prefix caching enabled \
-                 (vLLM: --enable-prompt-tokens-details / ENABLE_PROMPT_TOKENS_DETAILS=1); see README.md.",
-                usage.prompt_tokens, other
+                "preflight: server reported no prefix-cache hit (prompt_tokens={:?}, cached_tokens={:?}). {}",
+                usage.prompt_tokens,
+                other,
+                self.backend.prefix_cache_remedy()
             )),
         }
     }
@@ -109,6 +109,24 @@ fn final_usage_from_sse(backend: &dyn Backend, body: &str) -> Option<Usage> {
 mod tests {
     use super::super::wire::VllmTokensBackend;
     use super::*;
+
+    #[test]
+    fn the_remedy_names_the_transport_that_can_actually_answer() {
+        use super::super::wire::{OpenAiCompletionsBackend, SglangTokensBackend};
+        // Observed against a real SGLang server: its OpenAI layer returns a
+        // usage block with no cached-token field on any flag, so telling an
+        // operator to set a vLLM flag sends them somewhere that cannot help.
+        let openai = OpenAiCompletionsBackend.prefix_cache_remedy();
+        assert!(openai.contains("sglang-tokens"), "{openai}");
+        assert!(
+            openai.contains("--enable-prompt-tokens-details"),
+            "{openai}"
+        );
+        // The native transports do report it, so they keep the generic advice.
+        assert!(SglangTokensBackend
+            .prefix_cache_remedy()
+            .contains("prefix caching"));
+    }
 
     #[test]
     fn vllm_tokens_backend_reads_final_streaming_usage_for_preflight() {
