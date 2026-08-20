@@ -15,6 +15,23 @@ from launcher.config import load_task_config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+PREFLIGHT_ID = "req-frontend-preflight"
+
+
+def workload_rows(log: Path) -> list[dict]:
+    """Server-side rows for the measured workload only.
+
+    A multimodal run is preceded by preflight probes -- one with media and one
+    without -- which the server logs like any other request. They are not the
+    workload and would otherwise be read as its first rows.
+    """
+    return [
+        row
+        for row in (json.loads(line) for line in log.read_text().splitlines())
+        if row.get("request_id") != PREFLIGHT_ID
+    ]
+
+
 
 def _food101_fixture(root: Path, count: int = 8) -> Path:
     dataset = root / "food-101"
@@ -181,7 +198,7 @@ def test_cpu_mock_receives_assets_and_streams_concurrent_replay(tmp_path: Path) 
         result = json.loads(summary.read_text())
         assert result["replay"]["kind"] == "multimodal_requests"
         assert result["replay"]["common"]["success_steps"] == 8
-        records = [json.loads(line) for line in server_log.read_text().splitlines()]
+        records = workload_rows(server_log)
         assert len(records) == 8
         assert all(record["media_parts"] == 1 for record in records)
         assert all(record["media_bytes"] > 100 for record in records)
@@ -325,7 +342,7 @@ def test_cpu_mock_validates_generated_image_and_streaming_audio_outputs(
                 assert result["real_time_factor_measured_steps"] == 2
                 assert result["audio_duration_s"] > 0
             assert len(list(artifacts.iterdir())) == 2
-        received = [json.loads(line) for line in server_log.read_text().splitlines()]
+        received = workload_rows(server_log)
         qwen = [row for row in received if row["output_modality"] == "audio" and row["system_prompts"]]
         speech = [row for row in received if row["output_modality"] == "audio" and not row["system_prompts"]]
         assert len(qwen) == 2
@@ -451,7 +468,7 @@ def test_image_edit_and_video_surfaces_replay_against_mstar(tmp_path: Path) -> N
         process.terminate()
         process.wait(timeout=10)
 
-    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    rows = workload_rows(log)
     edit_rows = [row for row in rows if row["surface"] == "image_edits"]
     video_rows = [row for row in rows if row["surface"] == "videos"]
     assert len(edit_rows) == 2
@@ -488,7 +505,7 @@ def test_transcription_and_translation_surfaces_replay_against_sglang_omni(
         process.terminate()
         process.wait(timeout=10)
 
-    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    rows = workload_rows(log)
     assert len([r for r in rows if r["surface"] == "audio_transcriptions"]) == 2
     assert len([r for r in rows if r["surface"] == "audio_translations"]) == 2
     assert all(row["upload_bytes"] == 64 for row in rows)
