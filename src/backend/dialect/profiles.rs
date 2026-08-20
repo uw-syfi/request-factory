@@ -8,7 +8,8 @@
 use anyhow::{anyhow, Result};
 
 use super::{
-    AudioDeltas, Dialect, KnobNames, KnobSlot, MediaInput, MediaRead, SpeechShape, VoiceSlot,
+    AudioDeltas, Dialect, KnobNames, KnobSlot, MediaInput, MediaRead, RealtimeShape, RealtimeTurn,
+    SpeechShape, VoiceSlot,
 };
 
 pub(crate) const ALL: &[&str] = &[
@@ -79,6 +80,16 @@ const OPENAI: Dialect = Dialect {
         deltas: AudioDeltas::RawBytes,
         response_format: "pcm",
     },
+    realtime_suffix: Some("/realtime"),
+    realtime: RealtimeShape {
+        turn: RealtimeTurn::ItemThenResponse,
+        audio_delta_type: "response.output_audio.delta",
+        audio_delta_field: "delta",
+        text_delta_type: "response.output_text.delta",
+        text_delta_field: "delta",
+        done_types: &["response.done"],
+        modalities: &["text", "audio"],
+    },
 };
 
 /// Stock vLLM's OpenAI-compatible server: OpenAI plus the `_url` media parts and
@@ -120,6 +131,16 @@ const VLLM: Dialect = Dialect {
         stream_format_value: "audio",
         deltas: AudioDeltas::RawBytes,
         response_format: "pcm",
+    },
+    realtime_suffix: None,
+    realtime: RealtimeShape {
+        turn: RealtimeTurn::ItemThenResponse,
+        audio_delta_type: "response.output_audio.delta",
+        audio_delta_field: "delta",
+        text_delta_type: "response.output_text.delta",
+        text_delta_field: "delta",
+        done_types: &["response.done"],
+        modalities: &["text", "audio"],
     },
 };
 
@@ -168,6 +189,16 @@ const VLLM_OMNI: Dialect = Dialect {
         deltas: AudioDeltas::SpeechSse,
         response_format: "pcm",
     },
+    realtime_suffix: Some("/realtime"),
+    realtime: RealtimeShape {
+        turn: RealtimeTurn::AudioBufferCommit,
+        audio_delta_type: "response.audio.delta",
+        audio_delta_field: "audio",
+        text_delta_type: "response.text.delta",
+        text_delta_field: "delta",
+        done_types: &["response.done", "response.audio.done"],
+        modalities: &["text", "audio"],
+    },
 };
 
 /// SGLang-Omni. Keeps `content` plain and hangs media off the request root.
@@ -211,6 +242,16 @@ const SGLANG_OMNI: Dialect = Dialect {
         stream_format_value: "audio",
         deltas: AudioDeltas::RawBytes,
         response_format: "wav",
+    },
+    realtime_suffix: Some("/realtime"),
+    realtime: RealtimeShape {
+        turn: RealtimeTurn::ItemThenResponse,
+        audio_delta_type: "response.audio.delta",
+        audio_delta_field: "delta",
+        text_delta_type: "response.text.delta",
+        text_delta_field: "delta",
+        done_types: &["response.done"],
+        modalities: &["text", "audio"],
     },
 };
 
@@ -265,6 +306,16 @@ const MSTAR: Dialect = Dialect {
         deltas: AudioDeltas::RawBytes,
         response_format: "wav",
     },
+    realtime_suffix: None,
+    realtime: RealtimeShape {
+        turn: RealtimeTurn::ItemThenResponse,
+        audio_delta_type: "response.audio.delta",
+        audio_delta_field: "delta",
+        text_delta_type: "response.text.delta",
+        text_delta_field: "delta",
+        done_types: &["response.done"],
+        modalities: &["text", "audio"],
+    },
 };
 
 /// NVIDIA Dynamo. Namespaces its extensions under `nvext`.
@@ -310,6 +361,16 @@ const DYNAMO: Dialect = Dialect {
         stream_format_value: "audio",
         deltas: AudioDeltas::RawBytes,
         response_format: "pcm",
+    },
+    realtime_suffix: None,
+    realtime: RealtimeShape {
+        turn: RealtimeTurn::ItemThenResponse,
+        audio_delta_type: "response.audio.delta",
+        audio_delta_field: "delta",
+        text_delta_type: "response.text.delta",
+        text_delta_field: "delta",
+        done_types: &["response.done"],
+        modalities: &["text", "audio"],
     },
 };
 

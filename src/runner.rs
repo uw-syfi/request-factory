@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::backend::{GenerationClient, MediaClient};
+use crate::backend::{GenerationClient, MediaClient, RealtimeClient};
 use crate::cli::Args;
 use crate::executor::{
     prepare_multimodal_requests, run_independent_request, run_multimodal_request, run_session,
@@ -355,7 +355,12 @@ async fn run_multimodal(
         // needs the token-streaming one for text output. Constructing it here is
         // also what surfaces "this dialect does not serve X" at startup, since
         // `MediaClient::new` resolves the endpoint from the dialect table.
-        media_client: Some(Arc::new(MediaClient::new(args)?)),
+        media_client: (args.backend != crate::cli::BackendKind::OpenaiRealtime)
+            .then(|| MediaClient::new(args).map(Arc::new))
+            .transpose()?,
+        realtime_client: (args.backend == crate::cli::BackendKind::OpenaiRealtime)
+            .then(|| RealtimeClient::new(args).map(Arc::new))
+            .transpose()?,
     });
 
     const TIMELINE_QUEUE_REQUESTS: usize = 4_096;
@@ -455,6 +460,7 @@ fn validate(args: &Args) -> Result<()> {
                 | crate::cli::BackendKind::OpenaiSpeech
                 | crate::cli::BackendKind::OpenaiTranscriptions
                 | crate::cli::BackendKind::OpenaiTranslations
+                | crate::cli::BackendKind::OpenaiRealtime
         ) {
             return Err(anyhow!(
                 "multimodal-independent-v1 requires a media --backend; the token transports replay text traces"

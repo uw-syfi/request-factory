@@ -62,19 +62,19 @@ impl Rendered {
     }
 }
 
-struct MediaFold {
-    modality: Modality,
-    bytes: Vec<u8>,
-    first_output_ms: Option<f64>,
-    last_output_ms: Option<f64>,
-    output_chunk_count: usize,
-    duration_ms: f64,
-    timeline: Vec<TimelineEvent>,
-    error: Option<String>,
+pub(super) struct MediaFold {
+    pub(super) modality: Modality,
+    pub(super) bytes: Vec<u8>,
+    pub(super) first_output_ms: Option<f64>,
+    pub(super) last_output_ms: Option<f64>,
+    pub(super) output_chunk_count: usize,
+    pub(super) duration_ms: f64,
+    pub(super) timeline: Vec<TimelineEvent>,
+    pub(super) error: Option<String>,
 }
 
 impl MediaFold {
-    fn new(modality: Modality, record_timeline: bool) -> Self {
+    pub(super) fn new(modality: Modality, record_timeline: bool) -> Self {
         Self {
             modality,
             bytes: Vec::new(),
@@ -91,7 +91,7 @@ impl MediaFold {
         }
     }
 
-    fn absorb(&mut self, payload: &[u8], at_ms: f64, duration_ms: Option<f64>) {
+    pub(super) fn absorb(&mut self, payload: &[u8], at_ms: f64, duration_ms: Option<f64>) {
         if payload.is_empty() {
             return;
         }
@@ -112,7 +112,7 @@ impl MediaFold {
         }
     }
 
-    fn fail(&mut self, error: impl Into<String>) {
+    pub(super) fn fail(&mut self, error: impl Into<String>) {
         if self.error.is_none() {
             self.error = Some(error.into());
         }
@@ -848,7 +848,7 @@ fn read_images<'a>(shapes: &[MediaRead], value: &'a Value) -> Vec<&'a str> {
     found
 }
 
-fn data_url_payload(url: &str) -> Option<&str> {
+pub(super) fn data_url_payload(url: &str) -> Option<&str> {
     url.split_once(',').map(|(_, payload)| payload)
 }
 
@@ -922,7 +922,7 @@ fn text_prompt(parts: &[PreparedInputPart]) -> Result<String> {
     Ok(texts.join("\n"))
 }
 
-fn pcm16_duration_ms(bytes: usize, sample_rate_hz: u32, channels: u16) -> f64 {
+pub(super) fn pcm16_duration_ms(bytes: usize, sample_rate_hz: u32, channels: u16) -> f64 {
     bytes as f64 * 1_000.0 / (sample_rate_hz as f64 * channels as f64 * 2.0)
 }
 
@@ -952,7 +952,7 @@ fn wav_duration_ms(bytes: &[u8]) -> Option<f64> {
     Some(data_len? * 1_000.0 / byte_rate?)
 }
 
-fn media_failure(
+pub(super) fn media_failure(
     request_id: String,
     modality: Modality,
     timestamp: f64,

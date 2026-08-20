@@ -146,7 +146,8 @@ fn reset_endpoint(args: &Args) -> Option<String> {
         | req_frontend::BackendKind::OpenaiImageEdits
         | req_frontend::BackendKind::OpenaiVideos
         | req_frontend::BackendKind::OpenaiTranscriptions
-        | req_frontend::BackendKind::OpenaiTranslations => None,
+        | req_frontend::BackendKind::OpenaiTranslations
+        | req_frontend::BackendKind::OpenaiRealtime => None,
     }
 }
 

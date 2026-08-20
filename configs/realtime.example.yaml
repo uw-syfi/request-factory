@@ -1,0 +1,31 @@
+# The /realtime WebSocket surface: one session per request.
+#
+# Only OpenAI, vLLM-Omni and SGLang-Omni serve it, and they disagree about both
+# the audio event name and how a turn is driven -- see the realtime table in
+# README.md. Picking the wrong dialect reads zero bytes from a working stream,
+# so it is declared rather than sniffed.
+
+input:
+  trace: ../out/realtime/requests.jsonl
+  format: multimodal-independent-v1
+
+server:
+  backend: openai-realtime
+  # sglang-omni: response.audio.delta / delta, item-driven turns.
+  # vllm-omni:   response.audio.delta / audio, input-buffer-driven turns.
+  # openai:      response.output_audio.delta / delta, item-driven turns.
+  dialect: sglang-omni
+  # http:// is rewritten to ws:// for the socket; one base_url serves both.
+  base_url: http://127.0.0.1:8000/v1
+  model: THE_SERVED_MODEL_NAME
+  temperature: 0.0
+
+replay:
+  arrival_mode: trace-timed
+  # Each unit holds a socket for its whole turn, so this bounds concurrent
+  # sessions rather than concurrent HTTP requests.
+  max_concurrency: 8
+  stream_idle_timeout_seconds: 600
+
+output:
+  directory: ../out/realtime-run

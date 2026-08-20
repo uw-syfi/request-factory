@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use tokio::sync::mpsc;
 
 use crate::assets::AssetStore;
-use crate::backend::{GenerationClient, MediaClient, PreparedInputPart, Prompt};
+use crate::backend::{GenerationClient, MediaClient, PreparedInputPart, Prompt, RealtimeClient};
 use crate::cli::BackendKind;
 use crate::executor::independent::wait_for_common_arrival;
 use crate::executor::CommonState;
@@ -18,6 +18,7 @@ pub(crate) struct MultimodalState {
     pub(crate) common: CommonState,
     pub(crate) text_client: Option<Arc<GenerationClient>>,
     pub(crate) media_client: Option<Arc<MediaClient>>,
+    pub(crate) realtime_client: Option<Arc<RealtimeClient>>,
 }
 
 pub(crate) struct PreparedMultimodalRequest {
@@ -64,6 +65,10 @@ pub(crate) fn prepare_multimodal_requests(
                 .into_iter()
                 .collect(),
             [Modality::Video].into_iter().collect(),
+        ),
+        BackendKind::OpenaiRealtime => (
+            [Modality::Text, Modality::Audio].into_iter().collect(),
+            [Modality::Text, Modality::Audio].into_iter().collect(),
         ),
         BackendKind::OpenaiTranscriptions | BackendKind::OpenaiTranslations => (
             [Modality::Text, Modality::Audio].into_iter().collect(),
@@ -164,26 +169,34 @@ pub(crate) async fn run_multimodal_request(
     // translation also answer with text, but over a one-shot multipart surface
     // with no token stream to fold. The surface decides the client, not the
     // output modality alone.
-    let result = match (&request.output, &state.text_client) {
-        (OutputSpec::Text { max_tokens }, Some(text_client)) => {
-            text_client
-                .run_step(
-                    request.source.id.clone(),
-                    Prompt::Parts(&request.parts),
-                    *max_tokens,
-                )
-                .await
-        }
-        (OutputSpec::Tensor { .. }, _) => {
-            unreachable!("capability validation rejects tensor output")
-        }
-        _ => {
-            state
-                .media_client
-                .as_ref()
-                .expect("validated media request has a media client")
-                .run_step(request.source.id.clone(), &request.parts, &request.output)
-                .await
+    // The realtime socket owns its whole turn, so it is selected before the
+    // HTTP surfaces rather than by output modality.
+    let result = if let Some(realtime) = &state.realtime_client {
+        realtime
+            .run_step(request.source.id.clone(), &request.parts, &request.output)
+            .await
+    } else {
+        match (&request.output, &state.text_client) {
+            (OutputSpec::Text { max_tokens }, Some(text_client)) => {
+                text_client
+                    .run_step(
+                        request.source.id.clone(),
+                        Prompt::Parts(&request.parts),
+                        *max_tokens,
+                    )
+                    .await
+            }
+            (OutputSpec::Tensor { .. }, _) => {
+                unreachable!("capability validation rejects tensor output")
+            }
+            _ => {
+                state
+                    .media_client
+                    .as_ref()
+                    .expect("validated media request has a media client")
+                    .run_step(request.source.id.clone(), &request.parts, &request.output)
+                    .await
+            }
         }
     };
     if let Some(sink) = &timeline_sink {

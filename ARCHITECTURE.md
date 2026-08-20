@@ -516,6 +516,7 @@ execution policy.
 | `synthetic.rs` | generated image/audio/video bytes from a declared shape |
 | `backend/wire/` | protocol-specific JSON shaping and parsing |
 | `backend/dialect/` | per-serving-system wire vocabulary: field names, knob placement, media framing |
+| `backend/realtime_client.rs` | the `/realtime` WebSocket: one session per request, same fold as the HTTP media surfaces |
 | `backend/client.rs` | shared token/text HTTP streaming engine and integrity measurements |
 | `backend/media_client.rs` | generated image/audio transport and modality-neutral measurements |
 | `record.rs` | per-step source-plus-outcome JSONL contract |

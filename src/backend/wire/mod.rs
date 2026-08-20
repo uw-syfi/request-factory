@@ -29,7 +29,8 @@ pub(crate) fn build_backend(kind: BackendKind, dialect: &'static Dialect) -> Box
         | BackendKind::OpenaiImageEdits
         | BackendKind::OpenaiVideos
         | BackendKind::OpenaiTranscriptions
-        | BackendKind::OpenaiTranslations => {
+        | BackendKind::OpenaiTranslations
+        | BackendKind::OpenaiRealtime => {
             unreachable!("generated-media backends use MediaClient")
         }
     }

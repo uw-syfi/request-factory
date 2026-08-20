@@ -12,6 +12,7 @@ mod dialect;
 mod integrity;
 mod media_client;
 mod preflight;
+mod realtime_client;
 mod stream;
 mod wire;
 
@@ -28,6 +29,7 @@ use crate::util::unix_seconds_now;
 pub(crate) use client::GenerationClient;
 pub(crate) use dialect::{dialect_for, Dialect};
 pub(crate) use media_client::MediaClient;
+pub(crate) use realtime_client::RealtimeClient;
 
 /// What one request sends as its input.
 ///

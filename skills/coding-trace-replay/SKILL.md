@@ -72,7 +72,8 @@ Use the blocks in `configs/run.example.yaml` and `configs/sweep.example.yaml`:
   byte-identical content across requests and omit it for unique content;
 - `server`: for multimodal formats the media surfaces are `openai-chat`,
   `openai-images`, `openai-image-edits`, `openai-videos`, `openai-speech`,
-  `openai-transcriptions`, and `openai-translations`; a surface the chosen
+  `openai-transcriptions`, `openai-translations`, and `openai-realtime` (a
+  WebSocket, one session per request); a surface the chosen
   dialect does not serve is rejected at startup, not mid-run;
 - `server`: select backend, endpoint, model, and temperature; for multimodal
   formats also set `dialect` (`openai`, `vllm`, `vllm-omni`, `sglang-omni`,
