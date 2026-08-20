@@ -46,6 +46,12 @@ pub(crate) struct MediaClient {
 struct Rendered {
     body: Value,
     file: Option<FilePart>,
+    /// Whether the body goes out as `multipart/form-data`.
+    ///
+    /// Declared rather than inferred from `file.is_some()`: a text-only video
+    /// request carries no upload and still has to be a form, and a live
+    /// vLLM-Omni rejects the JSON version with "Field required: prompt".
+    multipart: bool,
 }
 
 #[derive(Debug)]
@@ -58,7 +64,19 @@ struct FilePart {
 
 impl Rendered {
     fn json(body: Value) -> Self {
-        Self { body, file: None }
+        Self {
+            body,
+            file: None,
+            multipart: false,
+        }
+    }
+
+    fn form(body: Value, file: Option<FilePart>) -> Self {
+        Self {
+            body,
+            file,
+            multipart: true,
+        }
     }
 }
 
@@ -355,10 +373,7 @@ impl MediaClient {
                 });
                 self.put_image_controls(&mut payload, output)?;
                 let file = upload_from(parts, Modality::Image, "image")?;
-                Ok(Rendered {
-                    body: payload,
-                    file: Some(file),
-                })
+                Ok(Rendered::form(payload, Some(file)))
             }
             (
                 BackendKind::OpenaiVideos,
@@ -408,10 +423,10 @@ impl MediaClient {
                 if dialect.video.multipart {
                     // vLLM-Omni's video routes take multipart/form-data, so the
                     // same declared shape goes out as form fields instead.
-                    return Ok(Rendered {
-                        body: payload,
-                        file: upload_from(parts, Modality::Image, "input_reference_image").ok(),
-                    });
+                    return Ok(Rendered::form(
+                        payload,
+                        upload_from(parts, Modality::Image, "input_reference_image").ok(),
+                    ));
                 }
                 Ok(Rendered::json(payload))
             }
@@ -431,10 +446,7 @@ impl MediaClient {
                     payload["prompt"] = prompt.into();
                 }
                 let file = upload_from(parts, Modality::Audio, "file")?;
-                Ok(Rendered {
-                    body: payload,
-                    file: Some(file),
-                })
+                Ok(Rendered::form(payload, Some(file)))
             }
             (backend, requested) => bail!(
                 "backend {backend:?} cannot produce {:?} output",
@@ -507,9 +519,10 @@ impl MediaClient {
             .client
             .post(&self.endpoint)
             .header("x-request-id", request_id);
-        let request = match &rendered.file {
-            None => request.json(&rendered.body),
-            Some(file) => {
+        let request = if !rendered.multipart {
+            request.json(&rendered.body)
+        } else {
+            {
                 let mut form = reqwest::multipart::Form::new();
                 for (key, value) in rendered.body.as_object().into_iter().flatten() {
                     // Scalars go as their bare text; anything structured goes as
@@ -520,14 +533,17 @@ impl MediaClient {
                     };
                     form = form.text(key.clone(), rendered_value);
                 }
-                let part = match reqwest::multipart::Part::bytes(file.bytes.clone())
-                    .file_name(file.filename.clone())
-                    .mime_str(&file.mime)
-                {
-                    Ok(part) => part,
-                    Err(error) => return fold.fail(format!("invalid upload mime: {error}")),
-                };
-                request.multipart(form.part(file.field, part))
+                if let Some(file) = &rendered.file {
+                    let part = match reqwest::multipart::Part::bytes(file.bytes.clone())
+                        .file_name(file.filename.clone())
+                        .mime_str(&file.mime)
+                    {
+                        Ok(part) => part,
+                        Err(error) => return fold.fail(format!("invalid upload mime: {error}")),
+                    };
+                    form = form.part(file.field, part);
+                }
+                request.multipart(form)
             }
         };
         let response = request.send().await;
@@ -1337,6 +1353,27 @@ mod tests {
         // Flat for M*, exactly as on the JSON surface.
         assert_eq!(rendered.body["num_inference_steps"], 50);
         assert_eq!(rendered.body["cfg_renorm_type"], "text_channel");
+    }
+
+    #[test]
+    fn a_form_surface_stays_a_form_even_with_nothing_to_upload() {
+        // A live vLLM-Omni rejects the JSON version of a text-only video
+        // request with "Field required: prompt" -- it reads a form, and an
+        // absent upload is not a reason to stop sending one.
+        let rendered = MediaClient::for_test("vllm-omni", BackendKind::OpenaiVideos)
+            .build_payload(&text_part(), &video_output())
+            .unwrap();
+        assert!(rendered.multipart, "vllm-omni's video route takes a form");
+        assert!(rendered.file.is_none(), "text-only: nothing to upload");
+        assert_eq!(rendered.body["prompt"], "a cat");
+    }
+
+    #[test]
+    fn a_json_video_surface_is_unaffected() {
+        let rendered = MediaClient::for_test("mstar", BackendKind::OpenaiVideos)
+            .build_payload(&text_part(), &video_output())
+            .unwrap();
+        assert!(!rendered.multipart);
     }
 
     #[test]
