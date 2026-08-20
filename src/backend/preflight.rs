@@ -173,6 +173,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_probe_image_is_a_real_png() {
+        // The whole check rests on a server tokenizing this into visible
+        // prompt tokens. A malformed probe would be rejected instead, and the
+        // preflight would fail every run for the wrong reason.
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(PROBE_PNG_BASE64)
+            .expect("probe must be valid base64");
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+        assert_eq!(&bytes[12..16], b"IHDR");
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        // Large enough that a vision model does not discard it as a thumbnail.
+        assert_eq!((width, height), (64, 64));
+        assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 4], b"IEND");
+    }
+
+    #[test]
     fn the_remedy_names_the_transport_that_can_actually_answer() {
         use super::super::wire::{OpenAiCompletionsBackend, SglangTokensBackend};
         // Observed against a real SGLang server: its OpenAI layer returns a
