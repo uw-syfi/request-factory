@@ -226,6 +226,14 @@ pub(crate) struct StreamEvent {
 pub(crate) trait Backend: Send + Sync {
     /// Path appended to `--base-url` to form the request endpoint.
     fn endpoint_suffix(&self) -> &str;
+    /// What an operator should do when this transport's server reports no
+    /// cached prompt tokens. Backend-specific because the remedy is: SGLang's
+    /// OpenAI layer never reports them on any flag, while vLLM's does behind
+    /// one, so identical advice would send half of them to the wrong place.
+    fn prefix_cache_remedy(&self) -> &'static str {
+        "Launch the server with prompt-token details and prefix caching enabled \
+         (vLLM: --enable-prompt-tokens-details / ENABLE_PROMPT_TOKENS_DETAILS=1); see README.md."
+    }
     /// Shape one generation request into this backend's request body.
     fn build_payload(&self, req: &GenRequest) -> Result<Value>;
     /// Normalize one response JSON object (a stream chunk or a full body).
