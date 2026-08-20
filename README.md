@@ -238,6 +238,15 @@ Two consequences worth stating plainly:
   recognize, so a misplaced knob costs a default value and no error. Declaring
   the dialect is what turns that into a table entry someone can check.
 
+**A semantic knob's wire name can be model-specific, not just system-specific.**
+`steps` maps to the spelling a dialect uses most commonly — `num_inference_steps`
+for M\*'s diffusion-video models, per its `docs/models.rst`. BAGEL on the same
+server reads `num_timesteps` instead (`mstar/model/bagel/config.py`), and M\*'s
+own benchmark adapter sends neither. When a model disagrees with its system, put
+the name the model reads in `model_params` rather than expecting `steps` to
+cover it; verified against a live M\* serving BAGEL, where neither spelling
+changed generation latency, so the server is the authority on what it honours.
+
 Model-specific knobs live in the trace, namespaced by the dialect that reads
 them, and only that dialect's namespace is ever sent:
 
