@@ -294,7 +294,7 @@ impl GenerationClient {
 
         let response = match response {
             Ok(response) if response.status().is_success() => response,
-            Ok(response) => return fold.fail(format!("HTTP {}", response.status())),
+            Ok(response) => return fold.fail(super::http_failure(response).await),
             Err(err) => return fold.fail(format!("request error: {err}")),
         };
 

@@ -70,13 +70,8 @@ impl GenerationClient {
             .send()
             .await
             .map_err(|err| anyhow!("request error: {err}"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "HTTP {status}: {}",
-                body.chars().take(200).collect::<String>()
-            ));
+        if !response.status().is_success() {
+            return Err(anyhow!("{}", super::http_failure(response).await));
         }
         let body = response
             .text()
