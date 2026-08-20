@@ -20,6 +20,23 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+PREFLIGHT_ID = "req-frontend-preflight"
+
+
+def workload_rows(log: Path) -> list[dict]:
+    """Server-side rows for the measured workload only.
+
+    A multimodal run is preceded by preflight probes -- one with media and one
+    without -- which the server logs like any other request. They are not the
+    workload and would otherwise be read as its first rows.
+    """
+    return [
+        row
+        for row in (json.loads(line) for line in log.read_text().splitlines())
+        if row.get("request_id") != PREFLIGHT_ID
+    ]
+
+
 
 @pytest.fixture(scope="module", autouse=True)
 def _built() -> None:
@@ -108,14 +125,14 @@ def test_item_style_turn_streams_audio_back(tmp_path: Path) -> None:
 
     result = json.loads(summary.read_text())["replay"]["common"]
     assert result["success_steps"] == 2 and result["failed_steps"] == 0
-    outcome = json.loads(requests.read_text().splitlines()[0])["outcome"]
+    outcome = workload_rows(requests)[0]["outcome"]
     assert outcome["output_chunk_count"] == 3
     assert outcome["output_bytes"] == 3 * 480
     # First-output latency is observed from the socket, not inferred.
     assert outcome["first_output_ms"] is not None
     assert outcome["real_time_factor"] is not None
 
-    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    rows = workload_rows(log)
     assert all(row["surface"] == "realtime" for row in rows)
     assert rows[0]["client_events"] == [
         "session.update",
@@ -141,7 +158,7 @@ def test_buffer_style_turn_streams_input_and_commits(tmp_path: Path) -> None:
         process.wait(timeout=10)
 
     assert json.loads(summary.read_text())["replay"]["common"]["success_steps"] == 2
-    row = json.loads(log.read_text().splitlines()[0])
+    row = workload_rows(log)[0]
     assert row["turn_style"] == "buffer"
     assert "conversation.item.create" not in row["client_events"]
     assert "response.create" not in row["client_events"]
@@ -163,7 +180,7 @@ def test_the_wrong_dialect_fails_instead_of_measuring_nothing(tmp_path: Path) ->
         process.wait(timeout=10)
 
     assert json.loads(summary.read_text())["replay"]["common"]["failed_steps"] == 2
-    error = json.loads(requests.read_text().splitlines()[0])["outcome"]["error"]
+    error = workload_rows(requests)[0]["outcome"]["error"]
     assert "realtime server error" in error
 
 
@@ -189,7 +206,7 @@ def test_openai_names_the_audio_event_differently(tmp_path: Path) -> None:
         process.wait(timeout=10)
     result = json.loads(summary.read_text())["replay"]["common"]
     assert result["failed_steps"] == 1, "a renamed event must not silently read as zero audio"
-    assert "no output" in json.loads(requests.read_text().splitlines()[0])["outcome"]["error"]
+    assert "no output" in workload_rows(requests)[0]["outcome"]["error"]
 
 
 def test_a_system_without_realtime_is_rejected_before_connecting(tmp_path: Path) -> None:
