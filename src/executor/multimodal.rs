@@ -21,6 +21,16 @@ pub(crate) struct MultimodalState {
     pub(crate) realtime_client: Option<Arc<RealtimeClient>>,
 }
 
+impl PreparedMultimodalRequest {
+    /// Whether this request sends any media, and so depends on the dialect's
+    /// encoding being one the server actually reads.
+    pub(crate) fn carries_media(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|part| matches!(part, PreparedInputPart::Media { .. }))
+    }
+}
+
 pub(crate) struct PreparedMultimodalRequest {
     source: RequestSpec,
     parts: Vec<PreparedInputPart>,

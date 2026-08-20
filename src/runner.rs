@@ -346,6 +346,18 @@ async fn run_multimodal(
             .max_concurrency
             .map(|_| Arc::new(AdmissionOrder::new(total_steps))),
     };
+    // Media encoding is the one thing every serving system spells differently,
+    // and a server that does not recognize the field answers the text alone.
+    // Verify it consumed an image before measuring a workload built on them.
+    if args.backend == crate::cli::BackendKind::OpenaiChat
+        && prepared.iter().any(|request| request.carries_media())
+    {
+        GenerationClient::new_chat(args)?
+            .preflight_media_registered()
+            .await
+            .context("media preflight failed")?;
+    }
+
     let state = Arc::new(MultimodalState {
         common,
         text_client: (args.backend == crate::cli::BackendKind::OpenaiChat)
