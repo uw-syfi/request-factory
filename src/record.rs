@@ -6,7 +6,7 @@ use crate::schema::{Modality, OutputSpec, RequestPriority, RequestSlo, RequestSp
 use crate::slo::SloMeasurement;
 use crate::util::prefix_hit_rate;
 
-const STEP_LOG_SCHEMA_VERSION: u32 = 14;
+const STEP_LOG_SCHEMA_VERSION: u32 = 15;
 
 /// One JSONL record: a typed source plus measurements shared by text generation.
 ///
@@ -123,6 +123,7 @@ pub(crate) struct MultimodalRequestSource {
     pub(crate) output_modalities: Vec<Modality>,
     pub(crate) input_parts: usize,
     pub(crate) assets: usize,
+    pub(crate) synthetic_inputs: usize,
     pub(crate) asset_bytes: usize,
     pub(crate) output_len_target: usize,
     pub(crate) output_spec: OutputSpec,
@@ -278,6 +279,7 @@ impl StepLog {
                 output_modalities: request.output_modalities().into_iter().collect(),
                 input_parts: request.inputs.len(),
                 assets: request.assets().count(),
+                synthetic_inputs: request.synthetic_inputs(),
                 asset_bytes,
                 output_len_target,
                 output_spec: request.outputs[0].clone(),
@@ -396,7 +398,7 @@ mod tests {
             serde_json::to_value(StepLog::session_round(&step, 12, 8, 4, 0, outcome())).unwrap();
 
         assert_eq!(value["source"]["type"], "session_round");
-        assert_eq!(value["schema_version"], 14);
+        assert_eq!(value["schema_version"], 15);
         // A trace that declared no `slo` tag leaves no trace of it in the record:
         // absent, not null, so a reader can tell "the file had no such column"
         // from "the row left it blank".
@@ -471,11 +473,11 @@ mod tests {
             arrival_time_ms: 4.5,
             inputs: vec![
                 crate::schema::InputPart::Image {
-                    asset: crate::schema::AssetRef {
+                    source: crate::schema::MediaSource::Asset(crate::schema::AssetRef {
                         path: "pizza.jpg".into(),
                         sha256: None,
                         media_type: Some("image/jpeg".into()),
-                    },
+                    }),
                 },
                 crate::schema::InputPart::Text {
                     text: "classify".into(),

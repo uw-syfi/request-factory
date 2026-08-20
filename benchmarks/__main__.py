@@ -13,6 +13,8 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
+from benchmarks import synthetic
+
 FOOD101_URL = "https://data.vision.ee.ethz.ch/cvl/food-101.tar.gz"
 FOOD101_ARCHIVE_BYTES = 4_996_278_331
 
@@ -35,6 +37,7 @@ def _parser() -> argparse.ArgumentParser:
         "--prompt",
         default="What food is shown in this image? Answer with the dish name only.",
     )
+    synthetic.add_parser(subparsers)
     return parser
 
 
@@ -231,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.benchmark == "food101":
             return _materialize_food101(arguments)
+        if arguments.benchmark == "synthetic":
+            return synthetic.materialize(arguments)
     except (EOFError, OSError, ValueError, tarfile.TarError) as error:
         print(f"benchmark error: {error}", file=sys.stderr)
         return 2

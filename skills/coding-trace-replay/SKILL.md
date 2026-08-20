@@ -67,6 +67,9 @@ Use the blocks in `configs/run.example.yaml` and `configs/sweep.example.yaml`:
   tag column bundles the file actually carries;
 - `corpus`: use a tokenizer matching the served model and a text corpus large
   enough not to fabricate repeated prompt content;
+- media inputs may declare `synthetic` (a shape) instead of `asset` (a file);
+  use it for capacity runs where content does not matter, pin `seed` for
+  byte-identical content across requests and omit it for unique content;
 - `server`: for multimodal formats the media surfaces are `openai-chat`,
   `openai-images`, `openai-image-edits`, `openai-videos`, `openai-speech`,
   `openai-transcriptions`, and `openai-translations`; a surface the chosen

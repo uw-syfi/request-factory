@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import threading
 import time
@@ -189,14 +190,20 @@ class Handler(BaseHTTPRequestHandler):
                     f"but received a {name!r} envelope"
                 )
 
-    def _collect_media(self, payload: dict[str, object]) -> tuple[int, int, int]:
-        """Count text/media parts, enforcing this dialect's input encoding."""
+    def _collect_media(self, payload: dict[str, object]) -> tuple[int, int, int, str]:
+        """Count text/media parts, enforcing this dialect's input encoding.
+
+        Also digests the media bytes, so a test can tell "every request carried
+        the same content" from "each carried its own" -- the distinction a
+        synthetic-content run is configured around.
+        """
         messages = payload["messages"]
         users = [message for message in messages if message.get("role") == "user"]
         if len(users) != 1:
             raise ValueError("mock requires exactly one user message")
         content = users[0]["content"]
         text_parts = media_parts = media_bytes = 0
+        digest = hashlib.sha256()
         encoding = self.state.encoding
 
         if encoding == "top_level_lists":
@@ -207,9 +214,11 @@ class Handler(BaseHTTPRequestHandler):
             text_parts = 1 if content else 0
             for key in ("images", "audios", "videos"):
                 for url in payload.get(key, []) or []:
+                    blob = _data_url_bytes(url)
                     media_parts += 1
-                    media_bytes += len(_data_url_bytes(url))
-            return text_parts, media_parts, media_bytes
+                    media_bytes += len(blob)
+                    digest.update(blob)
+            return text_parts, media_parts, media_bytes, digest.hexdigest()
 
         if not isinstance(content, list) or not content:
             raise ValueError("user message content must be a non-empty list")
@@ -219,24 +228,30 @@ class Handler(BaseHTTPRequestHandler):
                 text_parts += 1
                 continue
             if kind == "image_url":
+                blob = _data_url_bytes(part["image_url"]["url"])
                 media_parts += 1
-                media_bytes += len(_data_url_bytes(part["image_url"]["url"]))
+                media_bytes += len(blob)
+                digest.update(blob)
                 continue
             if encoding == "openai_parts":
                 if kind == "input_audio":
+                    blob = base64.b64decode(part["input_audio"]["data"])
                     media_parts += 1
-                    media_bytes += len(base64.b64decode(part["input_audio"]["data"]))
+                    media_bytes += len(blob)
+                    digest.update(blob)
                     continue
                 raise ValueError(
                     f"the openai dialect has no {kind!r} content part "
                     "(audio is input_audio; video is not supported)"
                 )
             if kind in ("audio_url", "video_url"):
+                blob = _data_url_bytes(part[kind]["url"])
                 media_parts += 1
-                media_bytes += len(_data_url_bytes(part[kind]["url"]))
+                media_bytes += len(blob)
+                digest.update(blob)
                 continue
             raise ValueError(f"unsupported content part {kind!r}")
-        return text_parts, media_parts, media_bytes
+        return text_parts, media_parts, media_bytes, digest.hexdigest()
 
     # ---- routing --------------------------------------------------------
 
@@ -275,7 +290,7 @@ class Handler(BaseHTTPRequestHandler):
         system_prompts = [m["content"] for m in messages if m.get("role") == "system"]
         if any(not isinstance(p, str) or not p for p in system_prompts):
             raise ValueError("system message content must be a non-empty string")
-        text_parts, media_parts, media_bytes = self._collect_media(payload)
+        text_parts, media_parts, media_bytes, media_sha256 = self._collect_media(payload)
 
         modalities = payload.get("modalities")
         output_modality = "text"
@@ -297,6 +312,7 @@ class Handler(BaseHTTPRequestHandler):
                 "text_parts": text_parts,
                 "media_parts": media_parts,
                 "media_bytes": media_bytes,
+                "media_sha256": media_sha256,
                 "max_tokens": max_tokens,
                 "max_output_tokens": self._knob(payload, "max_output_tokens"),
                 "temperature": payload.get("temperature"),
