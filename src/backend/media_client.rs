@@ -515,7 +515,7 @@ impl MediaClient {
         let response = request.send().await;
         let response = match response {
             Ok(response) if response.status().is_success() => response,
-            Ok(response) => return fold.fail(format!("HTTP {}", response.status())),
+            Ok(response) => return fold.fail(super::http_failure(response).await),
             Err(error) => return fold.fail(format!("request error: {error}")),
         };
         if self.backend == BackendKind::OpenaiSpeech {
