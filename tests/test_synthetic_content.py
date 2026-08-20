@@ -20,6 +20,23 @@ from benchmarks.__main__ import main as benchmark_main
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+PREFLIGHT_ID = "req-frontend-preflight"
+
+
+def workload_rows(log: Path) -> list[dict]:
+    """Server-side rows for the measured workload only.
+
+    A multimodal run is preceded by preflight probes -- one with media and one
+    without -- which the server logs like any other request. They are not the
+    workload and would otherwise be read as its first rows.
+    """
+    return [
+        row
+        for row in (json.loads(line) for line in log.read_text().splitlines())
+        if row.get("request_id") != PREFLIGHT_ID
+    ]
+
+
 
 def _materialize(tmp_path: Path, *extra: str) -> tuple[Path, dict]:
     out = tmp_path / "syn"
@@ -91,14 +108,14 @@ def test_the_trace_declares_shape_not_content(tmp_path: Path) -> None:
     per_request = manifest["generated"]["bytes_per_request"]
     assert per_request > 700_000, "512x512 RGB is most of a megabyte"
     assert trace.stat().st_size < 20_000, "the trace itself stays small"
-    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    rows = workload_rows(trace)
     assert len(rows) == 50
     assert rows[0]["inputs"][0]["synthetic"] == {"width": 512, "height": 512}
 
 
 def test_arrival_rate_sets_the_declared_spacing(tmp_path: Path) -> None:
     trace, manifest = _materialize(tmp_path, "--count", "5", "--arrival-rate", "20")
-    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    rows = workload_rows(trace)
     spacing = [
         round(b["arrival_time_ms"] - a["arrival_time_ms"], 3) for a, b in itertools.pairwise(rows)
     ]
@@ -134,7 +151,7 @@ def test_generated_size_is_exactly_what_the_manifest_promised(
         process.wait(timeout=10)
     assert result["success_steps"] == 2 and result["failed_steps"] == 0
 
-    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    rows = workload_rows(log)
     assert len(rows) == 2
     assert all(row["media_bytes"] == manifest["generated"]["bytes_per_request"] for row in rows)
 
@@ -153,7 +170,7 @@ def test_a_pinned_seed_sends_identical_content_and_omitting_it_does_not(
     finally:
         process.terminate()
         process.wait(timeout=10)
-    digests = {json.loads(line)["media_sha256"] for line in log.read_text().splitlines()}
+    digests = {row["media_sha256"] for row in workload_rows(log)}
     assert len(digests) == 1, "a pinned seed means non-unique content"
 
     unique = tmp_path / "unique"
@@ -165,7 +182,7 @@ def test_a_pinned_seed_sends_identical_content_and_omitting_it_does_not(
     finally:
         process.terminate()
         process.wait(timeout=10)
-    digests = {json.loads(line)["media_sha256"] for line in log.read_text().splitlines()}
+    digests = {row["media_sha256"] for row in workload_rows(log)}
     assert len(digests) == 3, "without a seed each request carries its own content"
 
 
@@ -185,7 +202,7 @@ def test_generated_media_is_a_real_container_the_server_can_parse(tmp_path: Path
     finally:
         process.terminate()
         process.wait(timeout=10)
-    row = json.loads(log.read_text().splitlines()[0])
+    row = workload_rows(log)[0]
     assert row["media_parts"] == 1
     assert row["text_parts"] == 1
 
