@@ -509,8 +509,9 @@ class Handler(BaseHTTPRequestHandler):
             output_modality = "audio" if "audio" in modalities else modalities[0]
         if output_modality == "text":
             max_tokens = int(payload.get("max_tokens") or payload.get("max_completion_tokens") or 0)
-            if media_parts == 0:
-                raise ValueError("text mock requires at least one media part")
+            # A text-only request is legal: it is what the media preflight sends
+            # as its baseline. Whether media arrived is asserted from the log
+            # rows, not by refusing the request.
             if max_tokens <= 0 or payload.get("stream") is not True:
                 raise ValueError("positive output-token cap and stream=true are required")
         else:
@@ -596,8 +597,17 @@ class Handler(BaseHTTPRequestHandler):
             )
             if self.state.chunk_delay_s:
                 time.sleep(self.state.chunk_delay_s)
+        # Prompt tokens grow with the media actually decoded, the way a real
+        # server's do. The media preflight reads exactly this to decide whether
+        # the encoding it used was one this dialect's server understands.
         self._stream_event(
-            {"choices": [], "usage": {"prompt_tokens": 8, "completion_tokens": max_tokens}}
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 8 + media_parts * 11,
+                    "completion_tokens": max_tokens,
+                },
+            }
         )
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
