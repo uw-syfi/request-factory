@@ -77,6 +77,7 @@ def test_food101_materializer_is_deterministic_and_launcher_needs_no_corpus(
                 },
                 "server": {
                     "backend": "openai-chat",
+                "dialect": "vllm-omni",
                     "model": "bagel",
                 },
                 "output": {"directory": "run"},
@@ -123,6 +124,8 @@ def test_cpu_mock_receives_assets_and_streams_concurrent_replay(tmp_path: Path) 
         [
             sys.executable,
             str(REPO_ROOT / "tools" / "mock_multimodal_server.py"),
+            "--dialect",
+            "vllm-omni",
             "--ready-file",
             str(ready),
             "--log-path",
@@ -153,6 +156,8 @@ def test_cpu_mock_receives_assets_and_streams_concurrent_replay(tmp_path: Path) 
                 f"http://127.0.0.1:{port}/v1",
                 "--backend",
                 "openai-chat",
+                "--dialect",
+                "vllm-omni",
                 "--model",
                 "bagel",
                 "--arrival-mode",
@@ -203,6 +208,8 @@ def test_cpu_mock_validates_generated_image_and_streaming_audio_outputs(
         [
             sys.executable,
             str(REPO_ROOT / "tools" / "mock_multimodal_server.py"),
+            "--dialect",
+            "vllm-omni",
             "--ready-file",
             str(ready),
             "--log-path",
@@ -249,7 +256,17 @@ def test_cpu_mock_validates_generated_image_and_streaming_audio_outputs(
                     {"type": "system", "text": "You are a speaking assistant."},
                     {"type": "text", "text": "say hello"},
                 ],
-                [{"type": "audio", "sample_rate_hz": 24000, "max_tokens": 256, "voice": "Ethan"}],
+                [
+                    {
+                        "type": "audio",
+                        "sample_rate_hz": 24000,
+                        "max_tokens": 256,
+                        "voice": "Ethan",
+                        # A vLLM-Omni-only knob, declared for that dialect alone
+                        # and nested into its `extra_body` envelope on the wire.
+                        "model_params": {"vllm-omni": {"thinker_temperature": 0.0}},
+                    }
+                ],
             ),
             (
                 "speech-audio",
@@ -283,6 +300,7 @@ def test_cpu_mock_validates_generated_image_and_streaming_audio_outputs(
                     "--input-file-format", "multimodal-independent-v1",
                     "--base-url", f"http://127.0.0.1:{port}/v1",
                     "--backend", backend,
+                    "--dialect", "vllm-omni",
                     "--model", "mock-model",
                     "--arrival-mode", "saturated",
                     "--max-concurrency", "2",
@@ -312,12 +330,201 @@ def test_cpu_mock_validates_generated_image_and_streaming_audio_outputs(
         speech = [row for row in received if row["output_modality"] == "audio" and not row["system_prompts"]]
         assert len(qwen) == 2
         assert all(row["max_tokens"] == 256 for row in qwen)
-        assert all(row["max_output_tokens"] == 256 for row in qwen)
         assert all(row["temperature"] == 0.0 for row in qwen)
+        # Declared per-dialect in the trace and delivered where vLLM-Omni reads
+        # it. `max_output_tokens` is deliberately absent: that is M*'s second
+        # name for the cap, and sending it here would be another server's knob.
         assert all(row["thinker_temperature"] == 0.0 for row in qwen)
+        assert all(row["max_output_tokens"] is None for row in qwen)
         assert len(speech) == 2
         assert all(row["max_tokens"] == 256 for row in speech)
         assert all(row["request_id"] for row in received)
     finally:
         server.terminate()
         server.wait(timeout=5)
+
+
+def _asset(path: Path, media_type: str) -> dict:
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "media_type": media_type,
+    }
+
+
+def _run_surface(
+    tmp_path: Path, port: int, name: str, backend: str, dialect: str, inputs, outputs
+) -> dict:
+    trace = tmp_path / f"{name}.jsonl"
+    trace.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "id": f"{name}-{index}",
+                    "arrival_time_ms": float(index),
+                    "inputs": inputs,
+                    "outputs": outputs,
+                }
+            )
+            for index in range(2)
+        )
+        + "\n"
+    )
+    summary = tmp_path / f"{name}-summary.json"
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "target" / "debug" / "session_runner"),
+            "--trace", str(trace),
+            "--input-file-format", "multimodal-independent-v1",
+            "--base-url", f"http://127.0.0.1:{port}/v1",
+            "--backend", backend,
+            "--dialect", dialect,
+            "--model", "mock-model",
+            "--arrival-mode", "saturated",
+            "--max-concurrency", "2",
+            "--timeline", "false",
+            "--output-artifact-dir", str(tmp_path / f"{name}-artifacts"),
+            "--log-path", str(tmp_path / f"{name}-requests.jsonl"),
+            "--summary-path", str(summary),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(summary.read_text())["replay"]["common"]
+
+
+def _serve(tmp_path: Path, dialect: str):
+    ready = tmp_path / f"ready-{dialect}"
+    log = tmp_path / f"server-{dialect}.jsonl"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(REPO_ROOT / "tools" / "mock_multimodal_server.py"),
+            "--dialect", dialect,
+            "--ready-file", str(ready),
+            "--log-path", str(log),
+        ],
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and not ready.exists():
+        if process.poll() is not None:
+            raise AssertionError(process.stderr.read())
+        time.sleep(0.05)
+    assert ready.exists(), "mock did not become ready"
+    return process, int(ready.read_text()), log
+
+
+def test_image_edit_and_video_surfaces_replay_against_mstar(tmp_path: Path) -> None:
+    subprocess.run(
+        ["cargo", "build", "--bin", "session_runner"], cwd=REPO_ROOT, check=True,
+        capture_output=True, text=True,
+    )
+    image = tmp_path / "source.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    process, port, log = _serve(tmp_path, "mstar")
+    try:
+        edits = _run_surface(
+            tmp_path, port, "edits", "openai-image-edits", "mstar",
+            [{"type": "text", "text": "make it blue"},
+             {"type": "image", "asset": _asset(image, "image/png")}],
+            [{"type": "image", "width": 64, "height": 64, "steps": 4, "count": 1,
+              "model_params": {"mstar": {"cfg_renorm_type": "text_channel"}}}],
+        )
+        assert edits["success_steps"] == 2 and edits["failed_steps"] == 0
+
+        videos = _run_surface(
+            tmp_path, port, "videos", "openai-videos", "mstar",
+            [{"type": "text", "text": "pan left"},
+             {"type": "image", "asset": _asset(image, "image/png")}],
+            [{"type": "video", "width": 64, "height": 64, "frames": 8, "steps": 4, "fps": 8.0}],
+        )
+        assert videos["success_steps"] == 2 and videos["failed_steps"] == 0
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    edit_rows = [row for row in rows if row["surface"] == "image_edits"]
+    video_rows = [row for row in rows if row["surface"] == "videos"]
+    assert len(edit_rows) == 2
+    # The upload arrived as real bytes, and the M*-only knob arrived flat.
+    assert all(row["upload_bytes"] == 40 for row in edit_rows)
+    assert all(row["cfg_renorm_type"] == "text_channel" for row in edit_rows)
+    assert len(video_rows) == 2
+    assert all(row["num_frames"] == 8 and row["conditioned_on_image"] for row in video_rows)
+
+
+def test_transcription_and_translation_surfaces_replay_against_sglang_omni(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        ["cargo", "build", "--bin", "session_runner"], cwd=REPO_ROOT, check=True,
+        capture_output=True, text=True,
+    )
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFF" + b"\x00" * 60)
+    process, port, log = _serve(tmp_path, "sglang-omni")
+    try:
+        for name, backend in (
+            ("asr", "openai-transcriptions"),
+            ("translate", "openai-translations"),
+        ):
+            result = _run_surface(
+                tmp_path, port, name, backend, "sglang-omni",
+                [{"type": "audio", "asset": _asset(audio, "audio/wav")}],
+                [{"type": "text", "max_tokens": 16}],
+            )
+            assert result["success_steps"] == 2, name
+            assert result["failed_steps"] == 0, name
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len([r for r in rows if r["surface"] == "audio_transcriptions"]) == 2
+    assert len([r for r in rows if r["surface"] == "audio_translations"]) == 2
+    assert all(row["upload_bytes"] == 64 for row in rows)
+
+
+def test_a_dialect_that_does_not_serve_a_surface_fails_before_running(tmp_path: Path) -> None:
+    """Coverage is declared, not discovered mid-run."""
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"RIFF" + b"\x00" * 60)
+    trace = tmp_path / "t.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "id": "x-0",
+                "arrival_time_ms": 0.0,
+                "inputs": [{"type": "audio", "asset": _asset(audio, "audio/wav")}],
+                "outputs": [{"type": "text", "max_tokens": 8}],
+            }
+        )
+        + "\n"
+    )
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "target" / "debug" / "session_runner"),
+            "--trace", str(trace),
+            "--input-file-format", "multimodal-independent-v1",
+            "--base-url", "http://127.0.0.1:9/v1",
+            # M* exposes no ASR surface at all.
+            "--backend", "openai-transcriptions",
+            "--dialect", "mstar",
+            "--model", "m",
+            "--arrival-mode", "saturated",
+            "--summary-path", str(tmp_path / "s.json"),
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert completed.returncode != 0
+    assert "does not serve transcription" in completed.stderr
+    assert not (tmp_path / "s.json").exists(), "nothing should have run"

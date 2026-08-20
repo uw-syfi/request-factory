@@ -67,7 +67,15 @@ Use the blocks in `configs/run.example.yaml` and `configs/sweep.example.yaml`:
   tag column bundles the file actually carries;
 - `corpus`: use a tokenizer matching the served model and a text corpus large
   enough not to fabricate repeated prompt content;
-- `server`: select backend, endpoint, model, and temperature;
+- `server`: for multimodal formats the media surfaces are `openai-chat`,
+  `openai-images`, `openai-image-edits`, `openai-videos`, `openai-speech`,
+  `openai-transcriptions`, and `openai-translations`; a surface the chosen
+  dialect does not serve is rejected at startup, not mid-run;
+- `server`: select backend, endpoint, model, and temperature; for multimodal
+  formats also set `dialect` (`openai`, `vllm`, `vllm-omni`, `sglang-omni`,
+  `mstar`, `dynamo`) — `backend` picks the endpoint, `dialect` picks the field
+  names and knob placement, and a mismatch fails silently because most
+  servers ignore unrecognized fields;
 - `replay`: select arrival timeline, capacity, context limit, and failure policy;
 - `measurement`: select timeline recording and optional metric-specific SLO;
 - `output`: select one artifact directory;
@@ -160,6 +168,7 @@ edge. Read `contamination_warning` before comparing cache results across points.
 | YAML duplicate/unknown/type error | Fix the named config path; never remove strict validation |
 | `prefix-cache preflight failed` | Server lacks cache behavior or cached-token telemetry; fix server launch |
 | HTTP route/model error | Confirm backend-specific base URL and served model from `/v1/models` or server config |
+| Generation knobs appear ignored | Wrong `server.dialect`: knob placement differs per server (flat vs `extra_body` vs `nvext`) and unknown fields are dropped without error |
 | cumulative streaming error | Enable incremental streaming output on SGLang |
 | echoed-prompt/token-count error | Treat the response as untrustworthy; inspect server output-ID support |
 | `rate` with `saturated` | Choose a timeline or saturation; use `max_concurrency` to bound saturation |

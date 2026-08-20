@@ -1,31 +1,39 @@
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-use super::super::{chat_messages, Backend, GenRequest, Prompt, StreamEvent, Usage};
+use super::super::{chat_inputs, Backend, Dialect, GenRequest, Prompt, StreamEvent, Usage};
 use super::{usage_cached_prompt_tokens, usage_usize};
 
 /// vLLM/OpenAI-compatible chat transport for mixed text and media inputs with
 /// streamed text output.
-pub(crate) struct OpenAiChatBackend;
+pub(crate) struct OpenAiChatBackend(pub(crate) &'static Dialect);
 
 impl Backend for OpenAiChatBackend {
     fn endpoint_suffix(&self) -> &str {
-        "/chat/completions"
+        self.0.chat_suffix
     }
 
     fn build_payload(&self, req: &GenRequest) -> Result<Value> {
         let Prompt::Parts(parts) = req.prompt else {
             bail!("openai-chat requires prepared multimodal input parts")
         };
-        Ok(serde_json::json!({
-            "model": req.model,
-            "messages": chat_messages(parts)?,
-            "max_tokens": req.max_tokens,
-            "temperature": req.temperature,
-            "stream": req.stream,
-            "stream_options": {"include_usage": true},
-            "ignore_eos": true
-        }))
+        let mut payload = Value::Object(chat_inputs(parts, self.0.media_input)?);
+        payload["model"] = req.model.into();
+        payload["temperature"] = req.temperature.into();
+        payload["stream"] = req.stream.into();
+        payload["stream_options"] = serde_json::json!({"include_usage": true});
+        // A vLLM/SGLang sampling extension, not OpenAI: without it a synthetic
+        // prompt emits EOS almost immediately and the declared decode length --
+        // the thing the trace exists to reproduce -- collapses.
+        if self.0.name != "openai" {
+            payload["ignore_eos"] = true.into();
+        }
+        // OpenAI deprecated `max_tokens` for `max_completion_tokens`, and M*
+        // needs its own second name or it ignores the cap entirely.
+        for key in self.0.knob_names.max_tokens {
+            payload[*key] = req.max_tokens.into();
+        }
+        Ok(payload)
     }
 
     fn parse_event(&self, value: &Value) -> StreamEvent {
@@ -78,7 +86,7 @@ mod tests {
                 data_url: "data:image/png;base64,AQ==".into(),
             },
         ];
-        let payload = OpenAiChatBackend
+        let payload = OpenAiChatBackend(crate::backend::dialect_for("vllm").unwrap())
             .build_payload(&GenRequest {
                 model: "bagel",
                 request_id: "r1",
@@ -105,7 +113,7 @@ mod tests {
             PreparedInputPart::System("be concise".into()),
             PreparedInputPart::Text("hello".into()),
         ];
-        let payload = OpenAiChatBackend
+        let payload = OpenAiChatBackend(crate::backend::dialect_for("vllm").unwrap())
             .build_payload(&GenRequest {
                 model: "omni",
                 request_id: "r1",
@@ -121,10 +129,12 @@ mod tests {
 
     #[test]
     fn parses_chat_delta_and_usage() {
-        let event = OpenAiChatBackend.parse_event(&serde_json::json!({
-            "choices": [{"delta": {"content": "pizza"}, "finish_reason": null}],
-            "usage": {"prompt_tokens": 300, "completion_tokens": 1, "total_tokens": 301}
-        }));
+        let event = OpenAiChatBackend(crate::backend::dialect_for("vllm").unwrap()).parse_event(
+            &serde_json::json!({
+                "choices": [{"delta": {"content": "pizza"}, "finish_reason": null}],
+                "usage": {"prompt_tokens": 300, "completion_tokens": 1, "total_tokens": 301}
+            }),
+        );
         assert_eq!(event.text_delta.as_deref(), Some("pizza"));
         assert_eq!(event.usage.unwrap().completion_tokens, Some(1));
     }

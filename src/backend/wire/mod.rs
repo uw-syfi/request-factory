@@ -8,6 +8,7 @@ mod vllm;
 
 use serde_json::Value;
 
+use crate::backend::Dialect;
 use crate::cli::BackendKind;
 
 use super::Backend;
@@ -17,13 +18,18 @@ pub(super) use sglang::SglangTokensBackend;
 pub(super) use vllm::VllmTokensBackend;
 
 /// Build the backend adapter selected on the command line.
-pub(crate) fn build_backend(kind: BackendKind) -> Box<dyn Backend> {
+pub(crate) fn build_backend(kind: BackendKind, dialect: &'static Dialect) -> Box<dyn Backend> {
     match kind {
         BackendKind::Openai => Box::new(OpenAiCompletionsBackend),
         BackendKind::VllmTokens => Box::new(VllmTokensBackend),
         BackendKind::SglangTokens => Box::new(SglangTokensBackend),
-        BackendKind::OpenaiChat => Box::new(OpenAiChatBackend),
-        BackendKind::OpenaiImages | BackendKind::OpenaiSpeech => {
+        BackendKind::OpenaiChat => Box::new(OpenAiChatBackend(dialect)),
+        BackendKind::OpenaiImages
+        | BackendKind::OpenaiSpeech
+        | BackendKind::OpenaiImageEdits
+        | BackendKind::OpenaiVideos
+        | BackendKind::OpenaiTranscriptions
+        | BackendKind::OpenaiTranslations => {
             unreachable!("generated-media backends use MediaClient")
         }
     }

@@ -332,7 +332,8 @@ async fn run_multimodal(
     // All reads, hashes, MIME inference, and base64 encoding happen before the
     // run clock starts, so request timing contains transport/server work rather
     // than benchmark setup.
-    let prepared = prepare_multimodal_requests(&args.trace, args.backend, requests)?;
+    let dialect = crate::backend::dialect_for(&args.dialect)?;
+    let prepared = prepare_multimodal_requests(&args.trace, args.backend, dialect, requests)?;
     let total_steps = prepared.len();
     let common = CommonState {
         policy: RunPolicy::from_args(args),
@@ -350,14 +351,11 @@ async fn run_multimodal(
         text_client: (args.backend == crate::cli::BackendKind::OpenaiChat)
             .then(|| GenerationClient::new_chat(args).map(Arc::new))
             .transpose()?,
-        media_client: matches!(
-            args.backend,
-            crate::cli::BackendKind::OpenaiChat
-                | crate::cli::BackendKind::OpenaiImages
-                | crate::cli::BackendKind::OpenaiSpeech
-        )
-        .then(|| MediaClient::new(args).map(Arc::new))
-        .transpose()?,
+        // Every media surface needs the media client; only chat additionally
+        // needs the token-streaming one for text output. Constructing it here is
+        // also what surfaces "this dialect does not serve X" at startup, since
+        // `MediaClient::new` resolves the endpoint from the dialect table.
+        media_client: Some(Arc::new(MediaClient::new(args)?)),
     });
 
     const TIMELINE_QUEUE_REQUESTS: usize = 4_096;
@@ -452,10 +450,14 @@ fn validate(args: &Args) -> Result<()> {
             args.backend,
             crate::cli::BackendKind::OpenaiChat
                 | crate::cli::BackendKind::OpenaiImages
+                | crate::cli::BackendKind::OpenaiImageEdits
+                | crate::cli::BackendKind::OpenaiVideos
                 | crate::cli::BackendKind::OpenaiSpeech
+                | crate::cli::BackendKind::OpenaiTranscriptions
+                | crate::cli::BackendKind::OpenaiTranslations
         ) {
             return Err(anyhow!(
-                "multimodal-independent-v1 requires --backend openai-chat, openai-images, or openai-speech"
+                "multimodal-independent-v1 requires a media --backend; the token transports replay text traces"
             ));
         }
         if args.max_model_len.is_some() || args.skip_when_reaching_limit {

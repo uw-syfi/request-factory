@@ -142,7 +142,11 @@ fn reset_endpoint(args: &Args) -> Option<String> {
         req_frontend::BackendKind::SglangTokens
         | req_frontend::BackendKind::OpenaiChat
         | req_frontend::BackendKind::OpenaiImages
-        | req_frontend::BackendKind::OpenaiSpeech => None,
+        | req_frontend::BackendKind::OpenaiSpeech
+        | req_frontend::BackendKind::OpenaiImageEdits
+        | req_frontend::BackendKind::OpenaiVideos
+        | req_frontend::BackendKind::OpenaiTranscriptions
+        | req_frontend::BackendKind::OpenaiTranslations => None,
     }
 }
 

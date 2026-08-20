@@ -231,7 +231,7 @@ output:
 """,
         "wrong-backend.yaml",
     )
-    with pytest.raises(ConfigError, match="requires server.backend: openai-chat"):
+    with pytest.raises(ConfigError, match="requires server.backend one of"):
         load_task_config("run", wrong_backend)
 
 
@@ -261,3 +261,61 @@ def test_terminal_filter_keeps_progress_but_hides_per_request_noise() -> None:
     assert not ui.should_echo_engine_line(
         "run", "prefix hit rate | request_id=session_0_round_0"
     )
+
+
+def test_dialect_defaults_to_openai_and_is_validated(tmp_path: Path) -> None:
+    good = write_config(
+        tmp_path,
+        """
+input:
+  trace: requests.jsonl
+  format: multimodal-independent-v1
+server:
+  backend: openai-chat
+  dialect: mstar
+  model: bagel
+output:
+  directory: out
+""",
+        "dialect-ok.yaml",
+    )
+    argv = list(load_task_config("run", good).arguments)
+    assert "--dialect" in argv
+    assert argv[argv.index("--dialect") + 1] == "mstar"
+
+    default = write_config(
+        tmp_path,
+        """
+input:
+  trace: requests.jsonl
+  format: multimodal-independent-v1
+server:
+  backend: openai-chat
+  model: bagel
+output:
+  directory: out
+""",
+        "dialect-default.yaml",
+    )
+    argv = list(load_task_config("run", default).arguments)
+    assert argv[argv.index("--dialect") + 1] == "openai"
+
+    # An unknown vocabulary must fail here rather than after a release build and
+    # a run against a server that silently ignores every unrecognized field.
+    bad = write_config(
+        tmp_path,
+        """
+input:
+  trace: requests.jsonl
+  format: multimodal-independent-v1
+server:
+  backend: openai-chat
+  dialect: gpt-9
+  model: bagel
+output:
+  directory: out
+""",
+        "dialect-bad.yaml",
+    )
+    with pytest.raises(ConfigError, match="server.dialect must be one of"):
+        load_task_config("run", bad)

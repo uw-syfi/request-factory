@@ -8,11 +8,14 @@
 //! parsing one. Nothing above this module sees a `serde_json::Value`.
 
 mod client;
+mod dialect;
 mod integrity;
 mod media_client;
 mod preflight;
 mod stream;
 mod wire;
+
+use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -23,6 +26,7 @@ use crate::timeline::TimelineEvent;
 use crate::util::unix_seconds_now;
 
 pub(crate) use client::GenerationClient;
+pub(crate) use dialect::{dialect_for, Dialect};
 pub(crate) use media_client::MediaClient;
 
 /// What one request sends as its input.
@@ -55,10 +59,21 @@ pub(crate) enum PreparedInputPart {
     },
 }
 
-/// Shape role-aware, interleaved input parts for OpenAI-compatible chat APIs.
-pub(crate) fn chat_messages(parts: &[PreparedInputPart]) -> Result<Vec<Value>> {
+/// Shape role-aware, interleaved input parts the way one dialect expects them.
+///
+/// Returns the whole input half of the request body, not just `messages`,
+/// because where media goes is itself a dialect decision: two of the three
+/// encodings put it in the message content and the third hangs it off the
+/// request root.
+pub(crate) fn chat_inputs(
+    parts: &[PreparedInputPart],
+    encoding: dialect::MediaInput,
+) -> Result<serde_json::Map<String, Value>> {
+    use dialect::MediaInput;
+
     let mut messages = Vec::new();
     let mut user_content = Vec::new();
+    let mut lists: BTreeMap<&'static str, Vec<Value>> = BTreeMap::new();
     let mut saw_user = false;
     for part in parts {
         match part {
@@ -72,28 +87,106 @@ pub(crate) fn chat_messages(parts: &[PreparedInputPart]) -> Result<Vec<Value>> {
             }
             PreparedInputPart::Media { modality, data_url } => {
                 saw_user = true;
-                user_content.push(match modality {
-                    Modality::Image => serde_json::json!({
-                        "type": "image_url", "image_url": {"url": data_url}
-                    }),
-                    Modality::Audio => serde_json::json!({
-                        "type": "audio_url", "audio_url": {"url": data_url}
-                    }),
-                    Modality::Video => serde_json::json!({
-                        "type": "video_url", "video_url": {"url": data_url}
-                    }),
-                    Modality::Text | Modality::Tensor => {
-                        bail!("unsupported prepared media modality {modality:?}")
+                match encoding {
+                    MediaInput::UrlParts => user_content.push(url_part(*modality, data_url)?),
+                    MediaInput::OpenAiParts => user_content.push(openai_part(*modality, data_url)?),
+                    MediaInput::TopLevelLists => {
+                        lists
+                            .entry(media_list_key(*modality)?)
+                            .or_default()
+                            .push(Value::String(data_url.clone()));
                     }
-                });
+                }
             }
         }
     }
-    if user_content.is_empty() {
+    if !saw_user {
         bail!("request has no user input")
     }
-    messages.push(serde_json::json!({"role": "user", "content": user_content}));
-    Ok(messages)
+    // A media-only request under `TopLevelLists` still needs a user turn, and
+    // that turn's content is a plain string there rather than an array.
+    let content = if matches!(encoding, MediaInput::TopLevelLists) {
+        Value::String(
+            user_content
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    } else {
+        if user_content.is_empty() {
+            bail!("request has no user input")
+        }
+        Value::Array(user_content)
+    };
+    messages.push(serde_json::json!({"role": "user", "content": content}));
+
+    let mut body = serde_json::Map::new();
+    body.insert("messages".into(), Value::Array(messages));
+    for (key, values) in lists {
+        body.insert(key.into(), Value::Array(values));
+    }
+    Ok(body)
+}
+
+/// vLLM's `_url` family, which is also the only spelling video has anywhere.
+fn url_part(modality: Modality, data_url: &str) -> Result<Value> {
+    let key = match modality {
+        Modality::Image => "image_url",
+        Modality::Audio => "audio_url",
+        Modality::Video => "video_url",
+        Modality::Text | Modality::Tensor => {
+            bail!("unsupported prepared media modality {modality:?}")
+        }
+    };
+    Ok(serde_json::json!({"type": key, key: {"url": data_url}}))
+}
+
+/// OpenAI proper: images by URL, audio as `input_audio`, and no video at all.
+fn openai_part(modality: Modality, data_url: &str) -> Result<Value> {
+    match modality {
+        Modality::Image => Ok(serde_json::json!({
+            "type": "image_url", "image_url": {"url": data_url}
+        })),
+        Modality::Audio => {
+            let (format, data) = split_data_url(data_url)?;
+            Ok(serde_json::json!({
+                "type": "input_audio", "input_audio": {"data": data, "format": format}
+            }))
+        }
+        Modality::Video => bail!("the openai dialect has no video input content part"),
+        Modality::Text | Modality::Tensor => {
+            bail!("unsupported prepared media modality {modality:?}")
+        }
+    }
+}
+
+fn media_list_key(modality: Modality) -> Result<&'static str> {
+    match modality {
+        Modality::Image => Ok("images"),
+        Modality::Audio => Ok("audios"),
+        Modality::Video => Ok("videos"),
+        Modality::Text | Modality::Tensor => {
+            bail!("unsupported prepared media modality {modality:?}")
+        }
+    }
+}
+
+/// `data:audio/wav;base64,AAAA` -> `("wav", "AAAA")`. `input_audio` wants the
+/// bare payload and a bare format name, not the URL wrapper.
+fn split_data_url(data_url: &str) -> Result<(String, String)> {
+    let rest = data_url
+        .strip_prefix("data:")
+        .ok_or_else(|| anyhow::anyhow!("input_audio requires a data URL, got {data_url:.32}"))?;
+    let (meta, payload) = rest
+        .split_once(',')
+        .ok_or_else(|| anyhow::anyhow!("malformed data URL"))?;
+    let mime = meta.split(';').next().unwrap_or_default();
+    let format = mime.rsplit('/').next().unwrap_or_default();
+    if format.is_empty() {
+        bail!("data URL carries no media subtype")
+    }
+    Ok((format.to_string(), payload.to_string()))
 }
 
 /// Normalized, backend-agnostic description of one generation request.
