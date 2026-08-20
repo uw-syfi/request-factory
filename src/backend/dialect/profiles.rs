@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 
 use super::{
     AudioDeltas, Dialect, KnobNames, KnobSlot, MediaInput, MediaRead, RealtimeShape, RealtimeTurn,
-    SpeechShape, VoiceSlot,
+    SpeechShape, VideoShape, VoiceSlot,
 };
 
 pub(crate) const ALL: &[&str] = &[
@@ -61,6 +61,10 @@ const OPENAI: Dialect = Dialect {
     audio_deltas: AudioDeltas::OpenAiDelta,
     image_reads: &[MediaRead::DataB64Json],
     video_reads: &[MediaRead::DataB64Json],
+    video: VideoShape {
+        multipart: false,
+        raw_response: false,
+    },
     knob_names: KnobNames {
         steps: None,
         guidance: None,
@@ -114,6 +118,10 @@ const VLLM: Dialect = Dialect {
     audio_deltas: AudioDeltas::OpenAiDelta,
     image_reads: &[],
     video_reads: &[MediaRead::DataB64Json],
+    video: VideoShape {
+        multipart: false,
+        raw_response: false,
+    },
     knob_names: KnobNames {
         steps: None,
         guidance: None,
@@ -155,10 +163,16 @@ const VLLM_OMNI: Dialect = Dialect {
     chat_suffix: "/chat/completions",
     images_suffix: "/images/generations",
     speech_suffix: "/audio/speech",
-    image_edits_suffix: None,
-    videos_suffix: None,
-    transcriptions_suffix: Some("/audio/transcriptions"),
-    translations_suffix: Some("/audio/translations"),
+    // Confirmed against a live server: `/v1/images/edits` and `/v1/videos`
+    // answer (400 for a TTS model, not 404), while `/v1/audio/transcriptions`
+    // is genuinely absent -- it 404s, and the term appears nowhere in the
+    // vllm-omni source. `/videos/sync` rather than `/videos` because the
+    // unsuffixed route is an async job to be polled, which is a different
+    // measurement than one request one response.
+    image_edits_suffix: Some("/images/edits"),
+    videos_suffix: Some("/videos/sync"),
+    transcriptions_suffix: None,
+    translations_suffix: None,
     media_input: MediaInput::UrlParts,
     knobs: KnobSlot::Nested("extra_body"),
     // Accepts audio-only, unlike OpenAI.
@@ -169,6 +183,10 @@ const VLLM_OMNI: Dialect = Dialect {
     audio_deltas: AudioDeltas::ModalityGated,
     image_reads: &[MediaRead::DataB64Json, MediaRead::ChatContentDataUrl],
     video_reads: &[MediaRead::DataB64Json],
+    video: VideoShape {
+        multipart: true,
+        raw_response: true,
+    },
     knob_names: KnobNames {
         steps: Some("num_inference_steps"),
         guidance: Some("guidance_scale"),
@@ -225,6 +243,10 @@ const SGLANG_OMNI: Dialect = Dialect {
     audio_deltas: AudioDeltas::OpenAiDelta,
     image_reads: &[MediaRead::DataB64Json],
     video_reads: &[MediaRead::DataB64Json],
+    video: VideoShape {
+        multipart: false,
+        raw_response: false,
+    },
     knob_names: KnobNames {
         steps: None,
         guidance: None,
@@ -283,6 +305,10 @@ const MSTAR: Dialect = Dialect {
         MediaRead::ChatDeltaDataUrl,
     ],
     video_reads: &[MediaRead::DataB64Json],
+    video: VideoShape {
+        multipart: false,
+        raw_response: false,
+    },
     knob_names: KnobNames {
         steps: Some("num_inference_steps"),
         // BAGEL's text-guidance knob is `cfg_text_scale` here, not the
@@ -344,6 +370,10 @@ const DYNAMO: Dialect = Dialect {
         MediaRead::ChatDeltaDataUrl,
     ],
     video_reads: &[MediaRead::DataB64Json],
+    video: VideoShape {
+        multipart: false,
+        raw_response: false,
+    },
     knob_names: KnobNames {
         steps: Some("num_inference_steps"),
         guidance: Some("guidance_scale"),
@@ -383,6 +413,38 @@ mod tests {
         assert_eq!(OPENAI.media_input, MediaInput::OpenAiParts);
         assert_eq!(VLLM.media_input, MediaInput::UrlParts);
         assert_eq!(OPENAI.audio_deltas, VLLM.audio_deltas);
+    }
+
+    #[test]
+    fn surface_coverage_matches_what_the_servers_actually_answer() {
+        // Probed against a live vLLM-Omni: images/edits and videos answer,
+        // transcriptions 404s and appears nowhere in its source.
+        assert_eq!(VLLM_OMNI.image_edits_suffix, Some("/images/edits"));
+        assert_eq!(VLLM_OMNI.transcriptions_suffix, None);
+        // The unsuffixed /v1/videos is an async job to poll; only the sync
+        // route is one request and one response.
+        assert_eq!(VLLM_OMNI.videos_suffix, Some("/videos/sync"));
+        assert_eq!(
+            VLLM_OMNI.video,
+            VideoShape {
+                multipart: true,
+                raw_response: true
+            }
+        );
+        // M* answers the same request as JSON carrying base64.
+        assert_eq!(MSTAR.videos_suffix, Some("/videos/generations"));
+        assert_eq!(
+            MSTAR.video,
+            VideoShape {
+                multipart: false,
+                raw_response: false
+            }
+        );
+        // SGLang-Omni does serve ASR; that is where transcription belongs.
+        assert_eq!(
+            SGLANG_OMNI.transcriptions_suffix,
+            Some("/audio/transcriptions")
+        );
     }
 
     #[test]

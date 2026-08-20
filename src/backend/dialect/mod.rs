@@ -92,6 +92,19 @@ pub(crate) enum MediaRead {
     ChatDeltaDataUrl,
 }
 
+/// How a video-generation surface is spoken and what it answers with.
+///
+/// The two systems that serve it do not agree on either: M* takes JSON and
+/// returns base64 in `data[]`, while vLLM-Omni takes `multipart/form-data` and
+/// its `/v1/videos/sync` writes the MP4 back as the response body. Same
+/// request, two transports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VideoShape {
+    pub(crate) multipart: bool,
+    /// The body *is* the video, rather than JSON carrying it.
+    pub(crate) raw_response: bool,
+}
+
 /// Semantic knob -> wire spelling. `None` means the dialect has no such knob and
 /// the value is dropped rather than guessed at.
 #[derive(Clone, Copy, Debug)]
@@ -177,6 +190,7 @@ pub(crate) struct Dialect {
     pub(crate) audio_deltas: AudioDeltas,
     pub(crate) image_reads: &'static [MediaRead],
     pub(crate) video_reads: &'static [MediaRead],
+    pub(crate) video: VideoShape,
     pub(crate) knob_names: KnobNames,
     pub(crate) speech: SpeechShape,
     pub(crate) realtime_suffix: Option<&'static str>,
