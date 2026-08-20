@@ -71,6 +71,11 @@ struct MediaFold {
     duration_ms: f64,
     timeline: Vec<TimelineEvent>,
     error: Option<String>,
+    /// The server answered in the shape this surface expects, whether or not
+    /// that answer carried any bytes. Transcribing silence yields
+    /// `{"text": ""}` -- a correct result, and one that must not be counted as
+    /// a failed request.
+    answered: bool,
 }
 
 impl MediaFold {
@@ -88,6 +93,7 @@ impl MediaFold {
                 Vec::new()
             },
             error: None,
+            answered: false,
         }
     }
 
@@ -179,11 +185,15 @@ impl MediaClient {
             .map(|duration| response_complete_ms_value / duration);
         let complete_timestamp = unix_seconds_now();
         let total_duration_ms = elapsed_ms(start);
-        let mut status = if fold.error.is_none() && !fold.bytes.is_empty() {
+        let mut status = if fold.error.is_none() && (fold.answered || !fold.bytes.is_empty()) {
             "SUCCESS".to_string()
         } else {
             if fold.error.is_none() {
-                fold.fail("backend returned no generated media");
+                let what = match fold.modality {
+                    Modality::Text => "transcript".to_string(),
+                    other => format!("{other:?}").to_lowercase(),
+                };
+                fold.fail(format!("server returned no {what} in its response"));
             }
             "FAILED".to_string()
         };
@@ -744,7 +754,12 @@ impl MediaClient {
                 // Transcription and translation both answer `{"text": ...}`;
                 // `verbose_json` nests the same field alongside segments.
                 match value.get("text").and_then(Value::as_str) {
-                    Some(text) => fold.absorb(text.as_bytes(), at_ms, None),
+                    Some(text) => {
+                        // Present-but-empty is a real answer: a live SGLang-Omni
+                        // transcribing noise returns `{"text": ""}` with 200.
+                        fold.answered = true;
+                        fold.absorb(text.as_bytes(), at_ms, None);
+                    }
                     None => fold.fail("transcription response contained no text field"),
                 }
             }
@@ -1173,6 +1188,41 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot generate images over chat"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_but_present_transcript_is_a_successful_answer() {
+        // A live SGLang-Omni transcribing noise returns {"text": ""} with HTTP
+        // 200. Counting that as a failure would report a healthy ASR server as
+        // 100% failed whenever the audio contains no words.
+        let client = MediaClient::for_test("sglang-omni", BackendKind::OpenaiTranscriptions);
+        let mut fold = MediaFold::new(Modality::Text, false);
+        client.absorb_json_media(
+            &serde_json::json!({"text": "", "usage": {"type": "duration", "seconds": 1}}),
+            &OutputSpec::Text { max_tokens: 8 },
+            1.0,
+            &mut fold,
+        );
+        assert!(fold.error.is_none());
+        assert!(
+            fold.answered,
+            "a present field is an answer even when empty"
+        );
+        assert!(fold.bytes.is_empty());
+    }
+
+    #[test]
+    fn a_missing_transcript_field_is_still_a_failure() {
+        let client = MediaClient::for_test("sglang-omni", BackendKind::OpenaiTranscriptions);
+        let mut fold = MediaFold::new(Modality::Text, false);
+        client.absorb_json_media(
+            &serde_json::json!({"usage": {"seconds": 1}}),
+            &OutputSpec::Text { max_tokens: 8 },
+            1.0,
+            &mut fold,
+        );
+        assert!(!fold.answered);
+        assert!(fold.error.unwrap().contains("no text field"));
     }
 
     #[test]
