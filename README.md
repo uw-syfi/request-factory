@@ -208,6 +208,11 @@ them, and only that dialect's namespace is ever sent:
                   "vllm-omni": {"cfg_img_scale": 2.0}}}
 ```
 
+The rows below were probed against live servers, not inferred: vLLM-Omni
+answers `/v1/images/edits` and `/v1/videos` but has no transcription route at
+all, and its `/v1/videos/sync` takes `multipart/form-data` and returns the MP4
+as the response body, where M* takes JSON and returns base64.
+
 Not every system serves every surface, and the table says so — an unsupported
 surface is rejected at startup rather than discovered as a 404 mid-run:
 
@@ -215,11 +220,11 @@ surface is rejected at startup rather than discovered as a 404 mid-run:
 |---|---|---|---|---|---|---|
 | `/chat/completions` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `/images/generations` | ✅ | — | ✅ | — | ✅ | ✅ |
-| `/images/edits` | ✅ | — | — | — | ✅ | — |
-| `/videos/generations` | ✅ | — | — | — | ✅ | — |
+| `/images/edits` | ✅ | — | ✅ | — | ✅ | — |
+| `/videos` | ✅ | — | ✅ | — | ✅ | — |
 | `/audio/speech` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `/audio/transcriptions` | ✅ | ✅ | ✅ | ✅ | — | — |
-| `/audio/translations` | ✅ | ✅ | ✅ | ✅ | — | — |
+| `/audio/transcriptions` | ✅ | ✅ | — | ✅ | — | — |
+| `/audio/translations` | ✅ | ✅ | — | ✅ | — | — |
 
 Adding a serving system is a `const` in `src/backend/dialect/profiles.rs` plus a
 name in `KNOWN_DIALECTS`; no new backend, executor, or match arm.
