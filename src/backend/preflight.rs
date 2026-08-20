@@ -11,6 +11,10 @@ use super::client::GenerationClient;
 use super::{Backend, GenRequest, PreparedInputPart, Prompt, Usage};
 use crate::schema::Modality;
 
+/// Marks every preflight request, in the body and in `x-request-id`, so it is
+/// distinguishable from the workload in the server's logs as well as ours.
+const PREFLIGHT_REQUEST_ID: &str = "req-frontend-preflight";
+
 /// A small valid PNG, used only to ask a server whether it saw an image.
 const PROBE_PNG_BASE64: &str = concat!(
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAB20lEQVR42tXOhzoQAACF0T9KWtqlpb0XKpXQ0NaS",
@@ -119,7 +123,7 @@ impl GenerationClient {
             model: &self.model,
             // Not a trace request: named so it is obvious in a server log that
             // this row belongs to the prefix-cache preflight, not the workload.
-            request_id: "req-frontend-prefix-cache-preflight",
+            request_id: PREFLIGHT_REQUEST_ID,
             prompt: probe,
             max_tokens: 1,
             temperature: 0.0,
@@ -128,6 +132,10 @@ impl GenerationClient {
         let response = self
             .client
             .post(&self.endpoint)
+            // Named in the header too, not only the body: a preflight shows up
+            // in the server's own logs and metrics, and an operator reading
+            // them should be able to tell it apart from the workload.
+            .header("x-request-id", PREFLIGHT_REQUEST_ID)
             // vLLM DP ranks own independent prefix caches. Pin both preflight
             // requests to one rank so the second request tests the feature
             // instead of accidentally probing a different cache shard.
