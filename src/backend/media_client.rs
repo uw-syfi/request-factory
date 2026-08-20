@@ -689,6 +689,13 @@ impl MediaClient {
         at_ms: f64,
         fold: &mut MediaFold,
     ) {
+        // A 2xx is not the same as a success: vLLM answers an unsupported
+        // request with HTTP 200 and an error envelope in the body. Reporting
+        // "no media in the response" there would hide the one sentence that
+        // says why, so the server's own message wins.
+        if let Some(message) = server_error(value) {
+            return fold.fail(message);
+        }
         match output {
             OutputSpec::Image { .. } => {
                 let encoded = read_images(self.dialect.image_reads, value);
@@ -777,6 +784,26 @@ impl MediaClient {
             .with_context(|| format!("failed to write generated artifact {}", path.display()))?;
         Ok(Some(path.to_string_lossy().into_owned()))
     }
+}
+
+/// The server's own error message, when the body carries one despite the status.
+///
+/// Both envelopes are in use: OpenAI nests `{"error": {"message": ...}}`, and
+/// some servers return a bare `{"message": ...}`.
+fn server_error(value: &Value) -> Option<String> {
+    let detail = value
+        .pointer("/error/message")
+        .or_else(|| value.get("error").filter(|error| error.is_string()))
+        .or_else(|| value.get("message"))?;
+    let text = detail.as_str()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let code = value
+        .pointer("/error/code")
+        .map(|code| format!(" (code {code})"))
+        .unwrap_or_default();
+    Some(format!("server reported: {text}{code}"))
 }
 
 /// Locate a streamed audio payload according to how this dialect frames one.
@@ -1146,6 +1173,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot generate images over chat"), "{err}");
+    }
+
+    #[test]
+    fn a_two_hundred_carrying_an_error_envelope_reports_the_server_message() {
+        // Observed against vLLM 0.11: an unsupported surface answers HTTP 200
+        // with a 400-coded error in the body. Without this the operator sees
+        // "response contained no text field" and has to go find the real reason.
+        let client = MediaClient::for_test("vllm", BackendKind::OpenaiTranscriptions);
+        let mut fold = MediaFold::new(Modality::Text, false);
+        client.absorb_json_media(
+            &serde_json::json!({
+                "error": {
+                    "message": "The model does not support Transcriptions API",
+                    "type": "BadRequestError",
+                    "code": 400
+                }
+            }),
+            &OutputSpec::Text { max_tokens: 8 },
+            1.0,
+            &mut fold,
+        );
+        let error = fold.error.expect("an error envelope must fail the request");
+        assert!(
+            error.contains("does not support Transcriptions API"),
+            "{error}"
+        );
+        assert!(error.contains("400"), "{error}");
+    }
+
+    #[test]
+    fn a_normal_response_is_not_mistaken_for_an_error() {
+        let client = MediaClient::for_test("vllm", BackendKind::OpenaiTranscriptions);
+        let mut fold = MediaFold::new(Modality::Text, false);
+        client.absorb_json_media(
+            &serde_json::json!({"text": "hello", "error": null}),
+            &OutputSpec::Text { max_tokens: 8 },
+            1.0,
+            &mut fold,
+        );
+        assert!(fold.error.is_none());
+        assert_eq!(fold.bytes, b"hello");
     }
 
     #[test]
