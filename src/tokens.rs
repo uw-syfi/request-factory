@@ -1,7 +1,9 @@
-use anyhow::{anyhow, Context, Result};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use anyhow::{anyhow, bail, Context, Result};
 use tokenizers::Tokenizer;
 
 use crate::schema::format::text_generation::session::SessionRound;
@@ -118,19 +120,74 @@ pub(crate) fn load_tokenizer(path: &str) -> Result<Tokenizer> {
             )
         })?
     } else {
-        let api = hf_hub::api::sync::Api::new()
-            .map_err(|err| anyhow!("failed to create Hugging Face API client: {err}"))?;
-        let repo = api.model(path.to_string_lossy().to_string());
-        let tokenizer_path = repo.get("tokenizer.json").map_err(|err| {
-            anyhow!(
-                "failed to download tokenizer.json for {}: {err}",
-                path.display()
-            )
+        let repo = path.to_string_lossy().to_string();
+        let tokenizer_path = fetch_hub_tokenizer(&repo).with_context(|| {
+            format!("failed to download tokenizer.json for {repo}; pass a local tokenizer.json or model directory instead")
         })?;
-        Tokenizer::from_file(tokenizer_path)
+        Tokenizer::from_file(&tokenizer_path)
             .map_err(|err| anyhow!("failed to load downloaded tokenizer: {err}"))?
     };
     Ok(tokenizer)
+}
+
+/// Fetch `tokenizer.json` for a Hub repo id, caching it under `HF_HOME`.
+///
+/// The Hub answers `/resolve/main/...` with a *relative* `Location`, so the
+/// client has to resolve it against the request URL rather than parse it on its
+/// own. That is the one requirement here; everything else is a plain GET.
+fn fetch_hub_tokenizer(repo: &str) -> Result<PathBuf> {
+    if repo.is_empty() || repo.starts_with('/') || repo.contains("..") {
+        bail!("{repo:?} is neither a local path nor a Hub repo id");
+    }
+    let cache = hub_cache_dir()?.join(repo.replace('/', "--"));
+    let cached = cache.join("tokenizer.json");
+    if cached.is_file() {
+        return Ok(cached);
+    }
+    let endpoint =
+        std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
+    let url = format!(
+        "{}/{repo}/resolve/main/tokenizer.json",
+        endpoint.trim_end_matches('/')
+    );
+    let mut request = ureq::get(&url);
+    // Gated repos need a token; public ones ignore it.
+    if let Ok(token) =
+        std::env::var("HF_TOKEN").or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+    {
+        if !token.trim().is_empty() {
+            request = request.set("authorization", &format!("Bearer {}", token.trim()));
+        }
+    }
+    let response = request
+        .call()
+        .map_err(|err| anyhow!("request to {url} failed: {err}"))?;
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut body)
+        .map_err(|err| anyhow!("reading {url} failed: {err}"))?;
+    if body.is_empty() {
+        bail!("{url} returned an empty tokenizer.json");
+    }
+    std::fs::create_dir_all(&cache)
+        .with_context(|| format!("create tokenizer cache {}", cache.display()))?;
+    // Write-then-rename so a killed download cannot leave a half file that the
+    // next run would happily load as a cache hit.
+    let staging = cache.join("tokenizer.json.partial");
+    std::fs::write(&staging, &body).with_context(|| format!("write {}", staging.display()))?;
+    std::fs::rename(&staging, &cached).with_context(|| format!("finalize {}", cached.display()))?;
+    Ok(cached)
+}
+
+fn hub_cache_dir() -> Result<PathBuf> {
+    if let Ok(home) = std::env::var("HF_HOME") {
+        if !home.trim().is_empty() {
+            return Ok(PathBuf::from(home).join("req-frontend-tokenizers"));
+        }
+    }
+    let home = std::env::var("HOME").map_err(|_| anyhow!("neither HF_HOME nor HOME is set"))?;
+    Ok(PathBuf::from(home).join(".cache/req-frontend/tokenizers"))
 }
 
 /// Tokenize the text corpus into a bounded pool of token ids used as synthetic
@@ -192,6 +249,36 @@ pub(crate) fn build_token_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repo_id_that_is_really_a_path_is_rejected_before_any_request() {
+        // These reach the Hub branch only because they do not exist on disk;
+        // sending them as repo ids would build a URL that escapes the repo.
+        for bad in ["", "/etc/passwd", "../../secrets"] {
+            let err = fetch_hub_tokenizer(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("neither a local path nor a Hub repo id"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cache_path_follows_hf_home_when_it_is_set() {
+        // Serialized with the other env-reading test by running in one test.
+        let previous = std::env::var("HF_HOME").ok();
+        std::env::set_var("HF_HOME", "/tmp/hf-home-probe");
+        let with_home = hub_cache_dir().unwrap();
+        assert!(with_home.starts_with("/tmp/hf-home-probe"), "{with_home:?}");
+        // An empty value is not a location; fall back rather than write to "/".
+        std::env::set_var("HF_HOME", "  ");
+        let blank = hub_cache_dir().unwrap();
+        assert!(!blank.starts_with("  "), "{blank:?}");
+        match previous {
+            Some(value) => std::env::set_var("HF_HOME", value),
+            None => std::env::remove_var("HF_HOME"),
+        }
+    }
 
     fn step(prefix_len: usize, input_len: usize, output_len: usize) -> SessionRound {
         SessionRound {
