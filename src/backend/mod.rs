@@ -59,6 +59,40 @@ pub(crate) enum PreparedInputPart {
     },
 }
 
+/// A failed response's status *and* what the server said about it.
+///
+/// The status alone is rarely the answer: vLLM's 404 body carries "The model
+/// `x` does not exist", which is the whole diagnosis.
+pub(crate) async fn http_failure(response: reqwest::Response) -> String {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    match error_detail(&body) {
+        Some(detail) => format!("HTTP {status}: {detail}"),
+        None => format!("HTTP {status}"),
+    }
+}
+
+/// The human-readable part of an error body, unwrapped from whichever envelope
+/// carries it. Truncated because an error body can be an HTML page, and one
+/// line per failed request is enough to act on.
+fn error_detail(body: &str) -> Option<String> {
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string());
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    Some(detail.chars().take(300).collect())
+}
+
 /// Shape role-aware, interleaved input parts the way one dialect expects them.
 ///
 /// Returns the whole input half of the request body, not just `messages`,
@@ -345,5 +379,45 @@ pub(crate) fn request_build_failure_result(
         },
         output_ids: Vec::new(),
         timeline: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod error_body_tests {
+    use super::error_detail;
+
+    #[test]
+    fn an_error_envelope_is_unwrapped_to_its_message() {
+        // Shape observed from a live vLLM on an unknown model. Reporting only
+        // "HTTP 404" hands the operator nothing they can act on.
+        let detail = error_detail(
+            r#"{"error":{"message":"The model `x` does not exist.","type":"NotFoundError","code":404}}"#,
+        )
+        .unwrap();
+        assert_eq!(detail, "The model `x` does not exist.");
+    }
+
+    #[test]
+    fn a_bare_message_and_a_plain_body_both_survive() {
+        assert_eq!(
+            error_detail(r#"{"message":"overloaded"}"#).unwrap(),
+            "overloaded"
+        );
+        assert_eq!(
+            error_detail("upstream connect error").unwrap(),
+            "upstream connect error"
+        );
+    }
+
+    #[test]
+    fn an_empty_body_adds_nothing_to_the_status() {
+        assert!(error_detail("").is_none());
+        assert!(error_detail("   \n ").is_none());
+    }
+
+    #[test]
+    fn a_page_sized_body_is_truncated() {
+        let detail = error_detail(&"x".repeat(5_000)).unwrap();
+        assert_eq!(detail.chars().count(), 300);
     }
 }
