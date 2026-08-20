@@ -134,7 +134,7 @@ impl RealtimeClient {
         let real_time_factor = measured_duration_ms
             .filter(|duration| *duration > 0.0)
             .map(|duration| response_complete_ms_value / duration);
-        let status = if fold.error.is_none() && !fold.bytes.is_empty() {
+        let status = if fold.error.is_none() && (fold.answered || !fold.bytes.is_empty()) {
             "SUCCESS".to_string()
         } else {
             if fold.error.is_none() {
