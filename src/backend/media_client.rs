@@ -405,6 +405,14 @@ impl MediaClient {
                     dialect.put_knob(&mut payload, key, (*value).into());
                 }
                 self.put_model_params(&mut payload, model_params);
+                if dialect.video.multipart {
+                    // vLLM-Omni's video routes take multipart/form-data, so the
+                    // same declared shape goes out as form fields instead.
+                    return Ok(Rendered {
+                        body: payload,
+                        file: upload_from(parts, Modality::Image, "input_reference_image").ok(),
+                    });
+                }
                 Ok(Rendered::json(payload))
             }
             (
@@ -544,6 +552,17 @@ impl MediaClient {
         {
             self.fold_chat_audio(response, output, send_instant, fold)
                 .await;
+        } else if self.backend == BackendKind::OpenaiVideos && self.dialect.video.raw_response {
+            // `/v1/videos/sync` writes the MP4 back as the response body; there
+            // is no envelope to parse and nothing to base64-decode.
+            match response.bytes().await {
+                Ok(bytes) if bytes.is_empty() => fold.fail("video response body was empty"),
+                Ok(bytes) => {
+                    fold.answered = true;
+                    fold.absorb(&bytes, elapsed_ms(send_instant), None);
+                }
+                Err(error) => fold.fail(format!("response read error: {error}")),
+            }
         } else {
             match response.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
