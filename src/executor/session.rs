@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::backend::{context_limit_skip_result, GenerationResult, Prompt};
-use crate::executor::AppState;
+use crate::executor::TextGenerationState;
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
 use crate::schema::format::text_generation::session::SessionRound;
@@ -12,9 +12,9 @@ use crate::tokens::{PromptBuild, PromptBuilder, TokenProvider};
 
 /// Replay one session as an ordered, closed-loop chain of rounds.
 pub(crate) async fn run_session(
-    state: Arc<AppState>,
+    state: Arc<TextGenerationState>,
     log_tx: mpsc::Sender<StepLog>,
-    // Travels with the task rather than living on `AppState`, for the same
+    // Travels with the task rather than living in shared state, for the same
     // reason `log_tx` does: the run closes the writer's channel by dropping
     // every sender, and a sender parked inside shared state is one nobody can
     // drop on time.
@@ -27,7 +27,7 @@ pub(crate) async fn run_session(
     // Bound to this scope on purpose: the session owns its slot for every round
     // and every tool wait below, and gives it up only when the whole
     // conversation ends. That is the contract VibeSim's session ledger mirrors.
-    let _concurrency_permit = state.acquire_capacity_slot(session_ordinal).await;
+    let _concurrency_permit = state.common.acquire_capacity_slot(session_ordinal).await;
 
     let token_provider = match TokenProvider::new(
         state.token_pool.clone(),
@@ -36,7 +36,7 @@ pub(crate) async fn run_session(
         Ok(provider) => provider,
         Err(err) => {
             eprintln!("session {session_id}: {err}");
-            state.stats.record_unit_done();
+            state.common.stats.record_unit_done();
             return;
         }
     };
@@ -51,8 +51,9 @@ pub(crate) async fn run_session(
         } = prompt_builder.build_prompt(&step);
         let prompt = Prompt::Tokens(&prompt_ids);
         let request_id = step.request_id.clone();
-        state.stats.record_submit();
+        state.common.stats.record_submit();
         let context_limit_skipped = state
+            .common
             .policy
             .skips_at_context_limit(prompt.token_len(), step.output_len);
         let result = if context_limit_skipped {
@@ -60,7 +61,7 @@ pub(crate) async fn run_session(
                 request_id,
                 prompt.token_len(),
                 step.output_len,
-                state.policy.max_model_len(),
+                state.common.policy.max_model_len(),
             )
         } else {
             state
@@ -90,8 +91,8 @@ pub(crate) async fn run_session(
         let success = log.outcome.is_success();
         let _ = log_tx.send(log).await;
 
-        state.stats.record_result(success);
-        if context_limit_skipped || (!success && state.policy.stop_session_on_error) {
+        state.common.stats.record_result(success);
+        if context_limit_skipped || (!success && state.common.policy.stop_session_on_error) {
             break;
         }
 
@@ -104,11 +105,11 @@ pub(crate) async fn run_session(
         }
     }
 
-    state.stats.record_unit_done();
+    state.common.stats.record_unit_done();
 }
 
-async fn wait_for_session_arrival(state: &AppState, steps: &[SessionRound]) {
-    if state.policy.arrival_mode == ArrivalMode::Saturated {
+async fn wait_for_session_arrival(state: &TextGenerationState, steps: &[SessionRound]) {
+    if state.common.policy.arrival_mode == ArrivalMode::Saturated {
         return;
     }
     let arrival_ms = steps
@@ -119,7 +120,7 @@ async fn wait_for_session_arrival(state: &AppState, steps: &[SessionRound]) {
         return;
     }
 
-    let target = state.run_start + Duration::from_secs_f64(arrival_ms / 1000.0);
+    let target = state.common.run_start + Duration::from_secs_f64(arrival_ms / 1000.0);
     let now = Instant::now();
     if target > now {
         tokio::time::sleep_until(tokio::time::Instant::from_std(target)).await;

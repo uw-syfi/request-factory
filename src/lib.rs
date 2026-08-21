@@ -25,6 +25,8 @@ pub mod schema;
 // simulator replaying the same bytes -- can take the schemas without building an
 // HTTP client, a tokenizer and an async runtime to get at them.
 #[cfg(feature = "runtime")]
+pub mod assets;
+#[cfg(feature = "runtime")]
 mod backend;
 #[cfg(feature = "runtime")]
 mod cli;

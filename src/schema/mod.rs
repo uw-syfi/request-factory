@@ -7,6 +7,7 @@
 pub mod family;
 pub mod format;
 mod input_file_schema;
+mod request;
 pub mod tag;
 
 pub use family::{
@@ -14,6 +15,7 @@ pub use family::{
 };
 pub use format::InputFileFormat;
 pub use input_file_schema::InputFileSchema;
+pub use request::{AssetRef, CapabilityProfile, InputPart, Modality, OutputSpec, RequestSpec};
 pub use tag::{
     DecodingStrategy, RequestPriority, RequestSession, RequestSlo, RequestSpeculative, TraceTag,
 };

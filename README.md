@@ -9,6 +9,7 @@ Session chains · Independent requests · Exact token-ID prompts · Prefix-cache
 [Quickstart](#quickstart) ·
 [Launcher](#launcher-yaml-interface) ·
 [Architecture](ARCHITECTURE.md) ·
+[Adding benchmarks](docs/ADDING_BENCHMARKS.md) ·
 [中文架构](ARCHITECTURE.zh-CN.md) ·
 [Engine setup](#engine-side-setup-guide) ·
 [Configuration axes](#configuration-axes) ·
@@ -35,6 +36,14 @@ traces are usually derived from lives in [TraceLab][tracelab], which exports raw
 session rounds; `tracegen` here turns those into the canonical execution trace
 `session_runner` replays. This repository was extracted from TraceLab's
 `replay/` directory and carries that history.
+
+The schema library also defines a modality-compositional benchmark boundary:
+ordered text/image/audio/video/tensor inputs and typed outputs in the same five
+modalities. Backends advertise compositional capabilities rather than
+implementing every input/output pair. See
+[Adding modality-compositional benchmarks](docs/ADDING_BENCHMARKS.md). The live
+runner continues to execute the text formats listed below until a concrete
+backend adapter opts into additional combinations.
 
 [tracelab]: https://github.com/uw-syfi/TraceLab
 

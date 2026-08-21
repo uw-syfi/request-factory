@@ -126,6 +126,32 @@ The concepts relate as follows:
 - `InputFileSchema` is the exact header contract after combining the base
   format with its legal tags.
 
+### The benchmark boundary is modality-compositional
+
+`RequestFamily` and the existing CSV formats remain exact descriptions of
+trace artifacts. New asset-backed benchmark adapters additionally lower their
+source data into `RequestSpec`, whose inputs and outputs are independent typed
+lists:
+
+```text
+RequestSpec
+  inputs:  [Text, Image, Audio, Video, Tensor] (ordered, repeatable)
+  outputs: [Text, Image, Audio, Video, Tensor]
+```
+
+`CapabilityProfile` validates those lists against a backend as sets plus two
+composition flags. The runtime therefore grows by input encoder, output
+observer, and protocol adapter—not by a matrix of modality pairs. Concrete
+pair-specific validation is still allowed when a model has coupled semantics.
+
+Asset-backed executors compose the common scheduling state with their own
+client and `AssetStore`; text executors compose it with the tokenizer-backed
+token pool. This prevents every modality from inheriting text-only startup,
+prefix-cache preflight, or corpus requirements.
+
+See [Adding modality-compositional benchmarks](docs/ADDING_BENCHMARKS.md) for
+the stable request contract and extension checklist.
+
 For example, `text-generation-session-execution-v2` already expresses both the
 text-generation family and the session-execution layout. There is no partial
 `SessionExecutionV2 + ImageToText` state and no family inference from headers.
