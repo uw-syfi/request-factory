@@ -122,6 +122,36 @@ pub(crate) struct KnobNames {
     pub(crate) max_tokens: &'static [&'static str],
 }
 
+/// How one turn is driven over the realtime socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RealtimeTurn {
+    /// OpenAI and SGLang-Omni: describe the user item, then ask for a response.
+    /// `session.update` -> `conversation.item.create` -> `response.create`.
+    ItemThenResponse,
+    /// vLLM-Omni: there is no item and no explicit response request. Audio is
+    /// appended to an input buffer and a final commit closes the turn.
+    AudioBufferCommit,
+}
+
+/// The realtime socket's event vocabulary.
+///
+/// Three systems serve `/v1/realtime` and all three name the audio delta
+/// differently -- OpenAI renamed the event, vLLM-Omni kept the old name but
+/// moved the payload out of `delta` and into `audio`. Reading the wrong field
+/// yields zero bytes and a successful-looking run, so the pair is declared.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RealtimeShape {
+    pub(crate) turn: RealtimeTurn,
+    pub(crate) audio_delta_type: &'static str,
+    pub(crate) audio_delta_field: &'static str,
+    pub(crate) text_delta_type: &'static str,
+    pub(crate) text_delta_field: &'static str,
+    /// Any of these ends the turn.
+    pub(crate) done_types: &'static [&'static str],
+    /// Session modalities. OpenAI and SGLang-Omni both reject audio-only.
+    pub(crate) modalities: &'static [&'static str],
+}
+
 /// The `/audio/speech` surface, which drifted further from OpenAI than chat did.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SpeechShape {
@@ -163,6 +193,8 @@ pub(crate) struct Dialect {
     pub(crate) video: VideoShape,
     pub(crate) knob_names: KnobNames,
     pub(crate) speech: SpeechShape,
+    pub(crate) realtime_suffix: Option<&'static str>,
+    pub(crate) realtime: RealtimeShape,
 }
 
 impl Dialect {
@@ -218,6 +250,7 @@ impl Dialect {
             B::OpenaiVideos => (self.videos_suffix, "video generation"),
             B::OpenaiTranscriptions => (self.transcriptions_suffix, "transcription"),
             B::OpenaiTranslations => (self.translations_suffix, "translation"),
+            B::OpenaiRealtime => (self.realtime_suffix, "realtime sessions"),
             other => bail!("backend {other:?} is not a media surface"),
         };
         suffix.ok_or_else(|| anyhow::anyhow!("dialect {} does not serve {what}", self.name))

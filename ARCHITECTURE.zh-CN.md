@@ -454,6 +454,7 @@ timings，并不是 schema loader 或 executor 的 owner。
 | `backend/wire/` | protocol-specific JSON shaping/parsing |
 | `backend/dialect/` | 各服务系统的线上词汇：字段名、旋钮位置、媒体分帧 |
 | `synthetic.rs` | 按声明的形状生成图像/音频/视频字节（媒体侧的 `tokens.rs`）|
+| `backend/realtime_client.rs` | `/realtime` WebSocket：每个请求一个会话，与 HTTP 媒体面共用同一套测量 |
 | `backend/client.rs` | shared token/text HTTP streaming engine 与 integrity measurements |
 | `backend/media_client.rs` | generated image/audio transport 与 modality-neutral measurements |
 | `record.rs` | per-step source + outcome JSONL contract |

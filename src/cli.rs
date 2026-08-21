@@ -26,6 +26,8 @@ pub enum BackendKind {
     OpenaiTranscriptions,
     /// Multipart `/audio/translations`: as transcription, translated to English.
     OpenaiTranslations,
+    /// The `/realtime` WebSocket: one session per request, streamed audio out.
+    OpenaiRealtime,
 }
 
 #[derive(Parser, Debug, Clone)]

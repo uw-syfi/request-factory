@@ -9,7 +9,11 @@ a shape no real server serves. These tests hold the mock to its own contract.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -74,6 +78,75 @@ class Mock:
                 return response.status, json.loads(response.read())
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
+
+
+class RealtimeSocket:
+    """A minimal RFC 6455 client, so the mock's WebSocket is tested on its own.
+
+    The Rust client exercises this surface too, but only for the pairings it
+    implements. Driving it directly is what lets a test assert the mock rejects
+    a turn driven the wrong way.
+    """
+
+    def __init__(self, port: int) -> None:
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        self.sock.sendall(
+            (
+                "GET /v1/realtime?model=m HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ).encode()
+        )
+        self.buffer = b""
+        while b"\r\n\r\n" not in self.buffer:
+            self.buffer += self.sock.recv(4096)
+        head, _, rest = self.buffer.partition(b"\r\n\r\n")
+        self.buffer = rest
+        assert b"101" in head.split(b"\r\n")[0], head
+        expected = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+        ).decode()
+        assert expected.encode() in head, "handshake accept key must match the client key"
+
+    def send(self, value: dict) -> None:
+        payload = json.dumps(value).encode()
+        mask = os.urandom(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        header = bytearray([0x81])
+        if len(payload) < 126:
+            header.append(0x80 | len(payload))
+        else:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", len(payload))
+        self.sock.sendall(bytes(header) + mask + masked)
+
+    def _read(self, count: int) -> bytes:
+        while len(self.buffer) < count:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise AssertionError("socket closed early")
+            self.buffer += chunk
+        out, self.buffer = self.buffer[:count], self.buffer[count:]
+        return out
+
+    def recv(self) -> dict | None:
+        try:
+            header = self._read(2)
+        except AssertionError:
+            return None
+        if header[0] & 0x0F == 0x8:
+            return None
+        length = header[1] & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", self._read(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", self._read(8))[0]
+        return json.loads(self._read(length))
+
+    def close(self) -> None:
+        self.sock.close()
 
 
 def start_mock(tmp_path: Path, dialect: str) -> Mock:
@@ -284,3 +357,100 @@ def test_speech_streams_sse_deltas_with_usage(mock: Mock) -> None:
 def test_unknown_endpoint_is_a_404(mock: Mock) -> None:
     status, _ = mock.post_json("/nope", {})
     assert status == 404
+
+
+# --- the realtime socket ---------------------------------------------------
+
+
+@pytest.mark.parametrize("mock", ["sglang-omni"], indirect=True)
+def test_realtime_handshake_and_item_turn(mock: Mock) -> None:
+    socket_ = RealtimeSocket(mock.port)
+    try:
+        socket_.send({"type": "session.update", "session": {"modalities": ["text", "audio"]}})
+        assert socket_.recv()["type"] == "session.updated"
+        socket_.send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            }
+        )
+        assert socket_.recv()["type"] == "conversation.item.created"
+        socket_.send({"type": "response.create", "response": {"modalities": ["text", "audio"]}})
+        assert socket_.recv()["type"] == "response.created"
+        deltas = []
+        while (event := socket_.recv()) is not None:
+            if event["type"] == "response.done":
+                break
+            deltas.append(event)
+        assert len(deltas) == 3
+        # This dialect keeps the pre-GA event name and the `delta` field.
+        assert all(d["type"] == "response.audio.delta" for d in deltas)
+        assert all(base64.b64decode(d["delta"]) for d in deltas)
+    finally:
+        socket_.close()
+
+
+@pytest.mark.parametrize("mock", ["vllm-omni"], indirect=True)
+def test_realtime_buffer_dialect_rejects_an_item_turn(mock: Mock) -> None:
+    socket_ = RealtimeSocket(mock.port)
+    try:
+        socket_.send({"type": "session.update", "session": {}})
+        assert socket_.recv()["type"] == "session.updated"
+        socket_.send(
+            {
+                "type": "conversation.item.create",
+                "item": {"type": "message", "role": "user", "content": []},
+            }
+        )
+        event = socket_.recv()
+        assert event["type"] == "error"
+        assert "input buffer" in event["error"]["message"]
+    finally:
+        socket_.close()
+
+
+@pytest.mark.parametrize("mock", ["vllm-omni"], indirect=True)
+def test_realtime_buffer_turn_emits_audio_in_its_own_field(mock: Mock) -> None:
+    socket_ = RealtimeSocket(mock.port)
+    try:
+        socket_.send({"type": "session.update", "model": "m"})
+        assert socket_.recv()["type"] == "session.updated"
+        socket_.send({"type": "input_audio_buffer.commit", "final": False})
+        socket_.send(
+            {"type": "input_audio_buffer.append", "audio": base64.b64encode(b"\x00" * 64).decode()}
+        )
+        socket_.send({"type": "input_audio_buffer.commit", "final": True})
+        assert socket_.recv()["type"] == "response.created"
+        event = socket_.recv()
+        # Same event name as SGLang-Omni, different payload field.
+        assert event["type"] == "response.audio.delta"
+        assert "audio" in event and "delta" not in event
+    finally:
+        socket_.close()
+
+
+@pytest.mark.parametrize("mock", ["sglang-omni"], indirect=True)
+def test_realtime_rejects_audio_only_modalities(mock: Mock) -> None:
+    socket_ = RealtimeSocket(mock.port)
+    try:
+        socket_.send({"type": "session.update", "session": {"modalities": ["audio"]}})
+        event = socket_.recv()
+        assert event["type"] == "error"
+        assert "modalities" in event["error"]["message"]
+    finally:
+        socket_.close()
+
+
+@pytest.mark.parametrize("mock", ["sglang-omni"], indirect=True)
+def test_a_plain_get_on_realtime_is_not_an_upgrade(mock: Mock) -> None:
+    request = urllib.request.Request(f"http://127.0.0.1:{mock.port}/v1/realtime")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            raise AssertionError(f"expected 400, got {response.status}")
+    except urllib.error.HTTPError as error:
+        assert error.code == 400
+        assert "websocket upgrade" in json.loads(error.read())["error"]

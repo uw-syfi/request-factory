@@ -170,6 +170,36 @@ workload shape.
 | `openai-videos` | `POST {base_url}/videos/generations` | Video out, optionally conditioned on an image or video |
 | `openai-transcriptions` | `POST {base_url}/audio/transcriptions` | Multipart: uploaded audio, text out |
 | `openai-translations` | `POST {base_url}/audio/translations` | As transcription, translated to English |
+| `openai-realtime` | `WS {base_url}/realtime` | One session per request; streamed audio or text out |
+
+### The `/realtime` socket
+
+Every other surface is one HTTP request. `openai-realtime` is a WebSocket: the
+client configures a session, describes a turn, and reads server events until the
+turn ends. **One request is one session** — a realtime connection can host many
+turns, but a replay unit has to be something that can be timed and compared.
+
+Three systems serve it and all three disagree, on two axes at once:
+
+| | endpoint | turn driven by | audio event | payload field |
+|---|---|---|---|---|
+| `openai` | `/realtime` | `conversation.item.create` + `response.create` | `response.output_audio.delta` | `delta` |
+| `sglang-omni` | `/realtime` | `conversation.item.create` + `response.create` | `response.audio.delta` | `delta` |
+| `vllm-omni` | `/realtime` | `input_audio_buffer.append` + `commit` | `response.audio.delta` | **`audio`** |
+
+OpenAI renamed the event and kept `delta`; vLLM-Omni kept the name and moved the
+payload. Matching one without the other reads **zero bytes from a stream that is
+working** — a run that looks successful and measured nothing. The pair is
+declared per dialect, and a test asserts a mismatched pairing fails loudly.
+
+vLLM-Omni also has no conversation item at all: generation starts on an opening
+commit and the turn closes on the final one, with audio appended in chunks in
+between (input is chunked because a realtime server's first-output latency
+depends on when it saw enough input).
+
+Measurement matches the other media surfaces — `first_output_ms` is the first
+delta off the socket, and the response clock starts once every client event is
+on the wire, so the connect handshake is not charged to the turn.
 
 ### Synthetic media inputs
 
@@ -261,6 +291,13 @@ answers `/v1/images/edits` and `/v1/videos` but has no transcription route at
 all, and its `/v1/videos/sync` takes `multipart/form-data` and returns the MP4
 as the response body, where M* takes JSON and returns base64.
 
+¹ Realtime is model-dependent on the omni stacks: a vLLM-Omni serving a
+TTS-only model answers `/v1/realtime` with 404, and an SGLang-Omni serving
+Qwen3-ASR does not register the route at all. Both document it for full omni
+models. A missing route is reported as an HTTP 404 per request rather than
+refused at startup, because the surface exists in the system even when the
+loaded model does not serve it.
+
 Not every system serves every surface, and the table says so — an unsupported
 surface is rejected at startup rather than discovered as a 404 mid-run:
 
@@ -273,6 +310,7 @@ surface is rejected at startup rather than discovered as a 404 mid-run:
 | `/audio/speech` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `/audio/transcriptions` | ✅ | ✅ | — | ✅ | — | — |
 | `/audio/translations` | ✅ | ✅ | — | ✅ | — | — |
+| `/realtime` (WebSocket) | ✅ | — | ✅¹ | ✅¹ | — | — |
 
 Adding a serving system is a `const` in `src/backend/dialect/profiles.rs` plus a
 name in `KNOWN_DIALECTS`; no new backend, executor, or match arm.

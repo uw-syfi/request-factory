@@ -19,6 +19,7 @@ import argparse
 import base64
 import hashlib
 import json
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +49,40 @@ KNOB_ENVELOPE = {
     "dynamo": "nvext",
 }
 
+# Realtime event vocabulary per dialect. Three systems serve /v1/realtime and
+# all three name the audio delta differently, so the mock answers in the name
+# the configured dialect expects -- and refuses a turn driven the wrong way.
+REALTIME = {
+    "openai": {
+        "turn": "item",
+        "audio_type": "response.output_audio.delta",
+        "audio_field": "delta",
+        "done": "response.done",
+    },
+    "vllm": {
+        "turn": "item",
+        "audio_type": "response.output_audio.delta",
+        "audio_field": "delta",
+        "done": "response.done",
+    },
+    "vllm-omni": {
+        "turn": "buffer",
+        "audio_type": "response.audio.delta",
+        "audio_field": "audio",
+        "done": "response.done",
+    },
+    "sglang-omni": {
+        "turn": "item",
+        "audio_type": "response.audio.delta",
+        "audio_field": "delta",
+        "done": "response.done",
+    },
+    "mstar": {"turn": "item", "audio_type": "response.audio.delta", "audio_field": "delta", "done": "response.done"},
+    "dynamo": {"turn": "item", "audio_type": "response.audio.delta", "audio_field": "delta", "done": "response.done"},
+}
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
 _PNG = base64.b64decode(
     b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
@@ -61,6 +96,7 @@ class KnobPlacementError(ValueError):
 class State:
     def __init__(self, log_path: Path | None, chunk_delay_ms: float, dialect: str) -> None:
         self.dialect = dialect
+        self.realtime = REALTIME[dialect]
         self.encoding = ENCODING[dialect]
         self.knob_envelope = KNOB_ENVELOPE[dialect]
         self.log_path = log_path
@@ -252,6 +288,181 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             raise ValueError(f"unsupported content part {kind!r}")
         return text_parts, media_parts, media_bytes, digest.hexdigest()
+
+    # ---- websocket ------------------------------------------------------
+
+    def _ws_accept(self) -> bool:
+        """Complete the RFC 6455 handshake, or answer 400 and give up."""
+        key = self.headers.get("sec-websocket-key")
+        upgrade = (self.headers.get("upgrade") or "").lower()
+        if upgrade != "websocket" or not key:
+            self._json_error(400, "expected a websocket upgrade")
+            return False
+        accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+        self.send_response(101)
+        self.send_header("upgrade", "websocket")
+        self.send_header("connection", "Upgrade")
+        self.send_header("sec-websocket-accept", accept)
+        self.end_headers()
+        return True
+
+    def _ws_recv(self) -> tuple[int, bytes] | None:
+        """One frame as (opcode, payload). Client frames are always masked."""
+        header = self.rfile.read(2)
+        if len(header) < 2:
+            return None
+        opcode = header[0] & 0x0F
+        masked = bool(header[1] & 0x80)
+        length = header[1] & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", self.rfile.read(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", self.rfile.read(8))[0]
+        mask = self.rfile.read(4) if masked else b""
+        payload = self.rfile.read(length)
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        return opcode, payload
+
+    def _ws_send(self, payload: bytes, opcode: int = 0x1) -> None:
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(length)
+        elif length < 1 << 16:
+            header.append(126)
+            header += struct.pack(">H", length)
+        else:
+            header.append(127)
+            header += struct.pack(">Q", length)
+        self.wfile.write(bytes(header) + payload)
+        self.wfile.flush()
+
+    def _ws_event(self, value: dict[str, object]) -> None:
+        self._ws_send(json.dumps(value).encode())
+
+    def _serve_realtime(self) -> None:
+        if not self._ws_accept():
+            return
+        shape = self.state.realtime
+        seen: list[str] = []
+        text_inputs = 0
+        audio_input_bytes = 0
+        voice = None
+        try:
+            while True:
+                frame = self._ws_recv()
+                if frame is None:
+                    return
+                opcode, payload = frame
+                if opcode == 0x8:  # close
+                    return
+                if opcode in (0x9, 0xA):  # ping/pong
+                    continue
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    self._ws_event({"type": "error", "error": {"message": "invalid JSON"}})
+                    return
+                kind = event.get("type")
+                seen.append(kind)
+
+                # Hold the client to this dialect's turn style. A server that
+                # accepted either would let a wrong-dialect client look correct.
+                if shape["turn"] == "buffer" and kind in (
+                    "conversation.item.create",
+                    "response.create",
+                ):
+                    self._ws_event(
+                        {
+                            "type": "error",
+                            "error": {
+                                "message": f"{self.state.dialect} drives a turn from the input "
+                                f"buffer; {kind} is not accepted"
+                            },
+                        }
+                    )
+                    return
+                if shape["turn"] == "item" and kind == "input_audio_buffer.append":
+                    self._ws_event(
+                        {
+                            "type": "error",
+                            "error": {
+                                "message": f"{self.state.dialect} expects conversation.item.create,"
+                                " not an input buffer"
+                            },
+                        }
+                    )
+                    return
+
+                if kind == "session.update":
+                    session = event.get("session") or {}
+                    voice = session.get("voice")
+                    modalities = session.get("modalities")
+                    if modalities is not None and set(modalities) not in (
+                        {"text"},
+                        {"text", "audio"},
+                    ):
+                        self._ws_event(
+                            {
+                                "type": "error",
+                                "error": {"message": "modalities must be text or text+audio"},
+                            }
+                        )
+                        return
+                    self._ws_event({"type": "session.updated", "session": session})
+                    continue
+                if kind == "conversation.item.create":
+                    for part in event["item"]["content"]:
+                        if part["type"] == "input_text":
+                            text_inputs += 1
+                        elif part["type"] == "input_audio":
+                            audio_input_bytes += len(base64.b64decode(part["audio"]))
+                    self._ws_event({"type": "conversation.item.created"})
+                    continue
+                if kind == "input_audio_buffer.append":
+                    audio_input_bytes += len(base64.b64decode(event["audio"]))
+                    continue
+                if kind == "input_audio_buffer.commit" and not event.get("final"):
+                    continue
+                if kind in ("response.create", "input_audio_buffer.commit"):
+                    self.state.begin(
+                        {
+                            "request_id": None,
+                            "surface": "realtime",
+                            "output_modality": "audio",
+                            "turn_style": shape["turn"],
+                            "client_events": seen,
+                            "text_inputs": text_inputs,
+                            "audio_input_bytes": audio_input_bytes,
+                            "voice": voice,
+                            "system_prompts": [],
+                        }
+                    )
+                    self._ws_event({"type": "response.created"})
+                    for _ in range(3):
+                        self._ws_event(
+                            {
+                                "type": shape["audio_type"],
+                                shape["audio_field"]: base64.b64encode(
+                                    b"\x01\x00" * 240
+                                ).decode(),
+                            }
+                        )
+                        if self.state.chunk_delay_s:
+                            time.sleep(self.state.chunk_delay_s)
+                    self._ws_event({"type": shape["done"]})
+                    self.state.finish()
+                    return
+        except (OSError, KeyError, TypeError, ValueError):
+            return
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path.removeprefix("/v1")
+        if path == "/realtime":
+            self._serve_realtime()
+            return
+        self._json_error(404, "unsupported mock endpoint")
 
     # ---- routing --------------------------------------------------------
 

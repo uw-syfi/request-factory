@@ -55,6 +55,7 @@ runtime = [
     "dep:sha2",
     "dep:tokenizers",
     "dep:tokio",
+    "dep:tokio-tungstenite",
 ]
 
 [dependencies]
@@ -87,6 +88,8 @@ reqwest = { version = "0.11", features = ["json", "multipart", "stream"], option
 sha2 = { version = "0.10", optional = true }
 tokenizers = { version = "0.21", optional = true }
 tokio = { version = "1.36", features = ["full"], optional = true }
+# The realtime surface is a WebSocket, which reqwest does not speak.
+tokio-tungstenite = { version = "0.21", optional = true }
 
 # This crate is also vendored as a submodule below larger Rust workspaces. Keep
 # it an independent workspace so Cargo never inherits the host repository's

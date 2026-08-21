@@ -31,6 +31,7 @@ MULTIMODAL_BACKENDS = frozenset(
         "openai-speech",
         "openai-transcriptions",
         "openai-translations",
+        "openai-realtime",
     }
 )
 
