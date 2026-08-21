@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow_array::builder::{
-    ArrayBuilder, Float32Builder, StringBuilder, UInt16Builder, UInt32Builder,
+    ArrayBuilder, Float32Builder, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
@@ -47,6 +47,8 @@ fn schema() -> Arc<Schema> {
         Field::new("kind", DataType::Utf8, false),
         Field::new("tokens", DataType::UInt16, false),
         Field::new("cumulative_tokens", DataType::UInt32, false),
+        Field::new("bytes", DataType::UInt32, false),
+        Field::new("cumulative_bytes", DataType::UInt64, false),
     ]))
 }
 
@@ -58,6 +60,8 @@ struct Columns {
     kind: StringBuilder,
     tokens: UInt16Builder,
     cumulative_tokens: UInt32Builder,
+    bytes: UInt32Builder,
+    cumulative_bytes: UInt64Builder,
 }
 
 impl Columns {
@@ -69,6 +73,8 @@ impl Columns {
             self.kind.append_value(event.kind.name());
             self.tokens.append_value(event.tokens);
             self.cumulative_tokens.append_value(event.cumulative_tokens);
+            self.bytes.append_value(event.bytes);
+            self.cumulative_bytes.append_value(event.cumulative_bytes);
         }
     }
 
@@ -86,6 +92,8 @@ impl Columns {
                 Arc::new(self.kind.finish()),
                 Arc::new(self.tokens.finish()),
                 Arc::new(self.cumulative_tokens.finish()),
+                Arc::new(self.bytes.finish()),
+                Arc::new(self.cumulative_bytes.finish()),
             ],
         )
         .context("failed to assemble a timeline row group")
@@ -190,6 +198,8 @@ mod tests {
             kind,
             tokens,
             cumulative_tokens: cumulative,
+            bytes: 0,
+            cumulative_bytes: 0,
         }
     }
 

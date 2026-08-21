@@ -191,6 +191,10 @@ impl GenerationClient {
                 output_token_ids.len()
             }
         });
+        let first_output_ms = first_token_id_ms.or(first_text_ms);
+        let last_output_ms = last_token_id_ms.or(first_text_ms);
+        let output_bytes = output_text.len();
+        let output_chunk_count = token_event_count.max(usize::from(first_text_ms.is_some()));
         // Prefer the server's exact generated token ids (return_token_ids) for carry-forward, but
         // trust them only when their count matches the server's completion_tokens. Otherwise (an
         // older server that ignored the flag, or a shape mismatch) fall back to the re-encoded ids.
@@ -231,6 +235,7 @@ impl GenerationClient {
         GenerationResult {
             outcome: GenerationOutcome {
                 request_id,
+                output_modality: crate::schema::Modality::Text,
                 output_len_actual,
                 output_len_text_tokens,
                 echoed_prompt_tokens,
@@ -239,6 +244,13 @@ impl GenerationClient {
                 submit_timestamp,
                 post_timestamp,
                 complete_timestamp: unix_seconds_now(),
+                first_output_ms,
+                last_output_ms,
+                output_bytes,
+                output_chunk_count,
+                output_duration_ms: None,
+                real_time_factor: None,
+                artifact_path: None,
                 first_token_ms: first_text_ms,
                 first_token_id_ms,
                 last_token_id_ms,

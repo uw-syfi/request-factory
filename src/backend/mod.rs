@@ -9,11 +9,12 @@
 
 mod client;
 mod integrity;
+mod media_client;
 mod preflight;
 mod stream;
 mod wire;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::Value;
 
 use crate::record::GenerationOutcome;
@@ -22,6 +23,7 @@ use crate::timeline::TimelineEvent;
 use crate::util::unix_seconds_now;
 
 pub(crate) use client::GenerationClient;
+pub(crate) use media_client::MediaClient;
 
 /// What one request sends as its input.
 ///
@@ -45,11 +47,53 @@ pub(crate) enum Prompt<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) enum PreparedInputPart {
+    System(String),
     Text(String),
     Media {
         modality: Modality,
         data_url: String,
     },
+}
+
+/// Shape role-aware, interleaved input parts for OpenAI-compatible chat APIs.
+pub(crate) fn chat_messages(parts: &[PreparedInputPart]) -> Result<Vec<Value>> {
+    let mut messages = Vec::new();
+    let mut user_content = Vec::new();
+    let mut saw_user = false;
+    for part in parts {
+        match part {
+            PreparedInputPart::System(text) if !saw_user => {
+                messages.push(serde_json::json!({"role": "system", "content": text}));
+            }
+            PreparedInputPart::System(_) => bail!("system inputs must precede user inputs"),
+            PreparedInputPart::Text(text) => {
+                saw_user = true;
+                user_content.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            PreparedInputPart::Media { modality, data_url } => {
+                saw_user = true;
+                user_content.push(match modality {
+                    Modality::Image => serde_json::json!({
+                        "type": "image_url", "image_url": {"url": data_url}
+                    }),
+                    Modality::Audio => serde_json::json!({
+                        "type": "audio_url", "audio_url": {"url": data_url}
+                    }),
+                    Modality::Video => serde_json::json!({
+                        "type": "video_url", "video_url": {"url": data_url}
+                    }),
+                    Modality::Text | Modality::Tensor => {
+                        bail!("unsupported prepared media modality {modality:?}")
+                    }
+                });
+            }
+        }
+    }
+    if user_content.is_empty() {
+        bail!("request has no user input")
+    }
+    messages.push(serde_json::json!({"role": "user", "content": user_content}));
+    Ok(messages)
 }
 
 /// Normalized, backend-agnostic description of one generation request.
@@ -117,6 +161,7 @@ pub(crate) fn context_limit_skip_result(
     GenerationResult {
         outcome: GenerationOutcome {
             request_id,
+            output_modality: Modality::Text,
             output_len_actual: 0,
             output_len_text_tokens: 0,
             echoed_prompt_tokens: 0,
@@ -125,6 +170,13 @@ pub(crate) fn context_limit_skip_result(
             submit_timestamp: unix_seconds_now(),
             post_timestamp: None,
             complete_timestamp: unix_seconds_now(),
+            first_output_ms: None,
+            last_output_ms: None,
+            output_bytes: 0,
+            output_chunk_count: 0,
+            output_duration_ms: None,
+            real_time_factor: None,
+            artifact_path: None,
             first_token_ms: None,
             first_token_id_ms: None,
             last_token_id_ms: None,
@@ -159,6 +211,7 @@ pub(crate) fn request_build_failure_result(
     GenerationResult {
         outcome: GenerationOutcome {
             request_id,
+            output_modality: Modality::Text,
             output_len_actual: 0,
             output_len_text_tokens: 0,
             echoed_prompt_tokens: 0,
@@ -167,6 +220,13 @@ pub(crate) fn request_build_failure_result(
             submit_timestamp: now,
             post_timestamp: None,
             complete_timestamp: now,
+            first_output_ms: None,
+            last_output_ms: None,
+            output_bytes: 0,
+            output_chunk_count: 0,
+            output_duration_ms: None,
+            real_time_factor: None,
+            artifact_path: None,
             first_token_ms: None,
             first_token_id_ms: None,
             last_token_id_ms: None,

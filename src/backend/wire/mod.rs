@@ -23,6 +23,9 @@ pub(crate) fn build_backend(kind: BackendKind) -> Box<dyn Backend> {
         BackendKind::VllmTokens => Box::new(VllmTokensBackend),
         BackendKind::SglangTokens => Box::new(SglangTokensBackend),
         BackendKind::OpenaiChat => Box::new(OpenAiChatBackend),
+        BackendKind::OpenaiImages | BackendKind::OpenaiSpeech => {
+            unreachable!("generated-media backends use MediaClient")
+        }
     }
 }
 

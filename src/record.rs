@@ -2,11 +2,11 @@ use serde::Serialize;
 
 use crate::schema::format::text_generation::independent::IndependentRequest;
 use crate::schema::format::text_generation::session::SessionRound;
-use crate::schema::{Modality, RequestPriority, RequestSlo, RequestSpec};
+use crate::schema::{Modality, OutputSpec, RequestPriority, RequestSlo, RequestSpec};
 use crate::slo::SloMeasurement;
 use crate::util::prefix_hit_rate;
 
-const STEP_LOG_SCHEMA_VERSION: u32 = 12;
+const STEP_LOG_SCHEMA_VERSION: u32 = 13;
 
 /// One JSONL record: a typed source plus measurements shared by text generation.
 ///
@@ -125,6 +125,7 @@ pub(crate) struct MultimodalRequestSource {
     pub(crate) assets: usize,
     pub(crate) asset_bytes: usize,
     pub(crate) output_len_target: usize,
+    pub(crate) output_spec: OutputSpec,
     pub(crate) arrival_time_ms: f64,
     pub(crate) arrival_release_lag_ms: f64,
     #[serde(flatten)]
@@ -135,6 +136,8 @@ pub(crate) struct MultimodalRequestSource {
 #[derive(Debug, Serialize)]
 pub(crate) struct GenerationOutcome {
     pub(crate) request_id: String,
+    /// Modality actually requested from the backend.
+    pub(crate) output_modality: Modality,
     pub(crate) output_len_actual: usize,
     pub(crate) output_len_text_tokens: usize,
     /// Leading generated ids that repeated the prompt tail and were dropped
@@ -151,6 +154,20 @@ pub(crate) struct GenerationOutcome {
     pub(crate) post_timestamp: Option<f64>,
     /// Wall-clock seconds when the response completed or the request was skipped.
     pub(crate) complete_timestamp: f64,
+    /// Time from HTTP send to the first non-empty output event, regardless of modality.
+    pub(crate) first_output_ms: Option<f64>,
+    /// Time from HTTP send to the last non-empty output event.
+    pub(crate) last_output_ms: Option<f64>,
+    /// Decoded output payload bytes. Text uses UTF-8 bytes; generated media uses binary bytes.
+    pub(crate) output_bytes: usize,
+    /// Non-empty output arrivals observed on the wire.
+    pub(crate) output_chunk_count: usize,
+    /// Playable media duration when derivable from the response encoding.
+    pub(crate) output_duration_ms: Option<f64>,
+    /// Wall-clock generation time divided by media duration. Primarily used for audio.
+    pub(crate) real_time_factor: Option<f64>,
+    /// Persisted generated-media artifact, when artifact output was requested.
+    pub(crate) artifact_path: Option<String>,
     /// Legacy TTFT measured from HTTP send to the first non-empty text event.
     pub(crate) first_token_ms: Option<f64>,
     /// Time from HTTP send to the first event carrying generated token ids.
@@ -263,6 +280,7 @@ impl StepLog {
                 assets: request.assets().count(),
                 asset_bytes,
                 output_len_target,
+                output_spec: request.outputs[0].clone(),
                 arrival_time_ms: request.arrival_time_ms,
                 arrival_release_lag_ms,
                 slo: DeclaredSlo::default(),
@@ -297,7 +315,8 @@ impl StepLog {
             ttft_ms: self
                 .outcome
                 .first_token_id_ms
-                .or(self.outcome.first_token_ms),
+                .or(self.outcome.first_token_ms)
+                .or(self.outcome.first_output_ms),
             tpot_ms: self.outcome.token_delivery_tpot_ms,
             e2e_ms: Some(self.outcome.total_duration_ms),
             declared: RequestSlo {
@@ -326,6 +345,7 @@ mod tests {
     fn outcome() -> GenerationOutcome {
         GenerationOutcome {
             request_id: "request-1".to_string(),
+            output_modality: Modality::Text,
             output_len_actual: 4,
             output_len_text_tokens: 4,
             echoed_prompt_tokens: 0,
@@ -334,6 +354,13 @@ mod tests {
             submit_timestamp: 1.0,
             post_timestamp: Some(1.1),
             complete_timestamp: 1.2,
+            first_output_ms: Some(10.0),
+            last_output_ms: Some(19.0),
+            output_bytes: 4,
+            output_chunk_count: 4,
+            output_duration_ms: None,
+            real_time_factor: None,
+            artifact_path: None,
             first_token_ms: Some(10.0),
             first_token_id_ms: Some(10.0),
             last_token_id_ms: Some(19.0),
@@ -370,7 +397,7 @@ mod tests {
             serde_json::to_value(StepLog::session_round(&step, 12, 8, 4, 0, outcome())).unwrap();
 
         assert_eq!(value["source"]["type"], "session_round");
-        assert_eq!(value["schema_version"], 12);
+        assert_eq!(value["schema_version"], 13);
         // A trace that declared no `slo` tag leaves no trace of it in the record:
         // absent, not null, so a reader can tell "the file had no such column"
         // from "the row left it blank".

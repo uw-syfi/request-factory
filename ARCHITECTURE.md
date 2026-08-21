@@ -53,7 +53,7 @@ Each layer answers one question:
 | format loader | Does the whole file satisfy that claim? | typed rows or grouped sessions |
 | workload | How will this run use the validated contents? | `ReplayWorkload` |
 | executor | When and under which dependencies does each unit run? | a concrete generation attempt |
-| backend | How is a request sent and its stream normalized? | `GenerationResult` |
+| backend | How is a request sent and its text or media stream normalized? | `GenerationResult` |
 | output | What actually happened? | `StepLog`, timeline, `RunSummary` |
 
 ## 2. The user interface is task plus structured YAML
@@ -389,7 +389,7 @@ GenRequest {
 }
 ```
 
-`backend/wire/` owns JSON differences among OpenAI, vLLM native-token, and
+`backend/wire/` owns token/text JSON differences among OpenAI, vLLM native-token, and
 SGLang native-token endpoints. `GenerationClient` owns the shared async
 lifecycle:
 
@@ -398,7 +398,9 @@ lifecycle:
 3. normalize wire objects into `StreamEvent`;
 4. fold text, token ids, usage, finish reason, and failures;
 5. check prompt echo and token accounting;
-6. return a backend-neutral result.
+6. return a backend-neutral result. Generated media uses `media_client.rs`,
+   which normalizes JSON-carried images, base64 chat-audio deltas, and raw PCM
+   streams into first-output, byte, duration, RTF, artifact, and timeline fields.
 
 ```rust
 GenerationResult {
@@ -494,7 +496,8 @@ execution policy.
 | `executor/` | arrival release, session dependency, admission, request lifecycle |
 | `tokens.rs` | concrete token ids and session-context carry-forward |
 | `backend/wire/` | protocol-specific JSON shaping and parsing |
-| `backend/client.rs` | shared HTTP streaming engine and integrity measurements |
+| `backend/client.rs` | shared token/text HTTP streaming engine and integrity measurements |
+| `backend/media_client.rs` | generated image/audio transport and modality-neutral measurements |
 | `record.rs` | per-step source-plus-outcome JSONL contract |
 | `timeline.rs` | optional per-event recording |
 | `summary.rs` | replay, runtime, timeline, and run-level aggregation |

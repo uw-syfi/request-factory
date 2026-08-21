@@ -5,7 +5,8 @@ use anyhow::{bail, Context, Result};
 use tokio::sync::mpsc;
 
 use crate::assets::AssetStore;
-use crate::backend::{GenerationClient, PreparedInputPart, Prompt};
+use crate::backend::{GenerationClient, MediaClient, PreparedInputPart, Prompt};
+use crate::cli::BackendKind;
 use crate::executor::independent::wait_for_common_arrival;
 use crate::executor::CommonState;
 use crate::record::StepLog;
@@ -14,30 +15,49 @@ use crate::timeline::{RequestTimeline, TimelineSink};
 
 pub(crate) struct MultimodalState {
     pub(crate) common: CommonState,
-    pub(crate) client: Arc<GenerationClient>,
+    pub(crate) text_client: Option<Arc<GenerationClient>>,
+    pub(crate) media_client: Option<Arc<MediaClient>>,
 }
 
 pub(crate) struct PreparedMultimodalRequest {
     source: RequestSpec,
     parts: Vec<PreparedInputPart>,
-    max_tokens: usize,
+    output: OutputSpec,
     asset_bytes: usize,
 }
 
 pub(crate) fn prepare_multimodal_requests(
     artifact_path: &str,
+    backend: BackendKind,
     requests: Vec<RequestSpec>,
 ) -> Result<Vec<PreparedMultimodalRequest>> {
+    let (accepted_inputs, produced_outputs) = match backend {
+        BackendKind::OpenaiChat => (
+            [
+                Modality::Text,
+                Modality::Image,
+                Modality::Audio,
+                Modality::Video,
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+            [Modality::Text, Modality::Image, Modality::Audio]
+                .into_iter()
+                .collect(),
+        ),
+        BackendKind::OpenaiImages => (
+            [Modality::Text].into_iter().collect(),
+            [Modality::Image].into_iter().collect(),
+        ),
+        BackendKind::OpenaiSpeech => (
+            [Modality::Text].into_iter().collect(),
+            [Modality::Audio].into_iter().collect(),
+        ),
+        _ => bail!("backend {backend:?} does not support multimodal-independent-v1"),
+    };
     let capabilities = CapabilityProfile {
-        accepted_inputs: [
-            Modality::Text,
-            Modality::Image,
-            Modality::Audio,
-            Modality::Video,
-        ]
-        .into_iter()
-        .collect::<BTreeSet<_>>(),
-        produced_outputs: [Modality::Text].into_iter().collect(),
+        accepted_inputs,
+        produced_outputs,
         supports_mixed_inputs: true,
         supports_multiple_outputs: false,
     };
@@ -46,18 +66,19 @@ pub(crate) fn prepare_multimodal_requests(
     for request in requests {
         capabilities
             .validate(&request)
-            .with_context(|| format!("request {:?} is not supported by openai-chat", request.id))?;
-        let max_tokens = match request.outputs.as_slice() {
-            [OutputSpec::Text { max_tokens }] => *max_tokens,
-            _ => bail!(
-                "request {:?}: openai-chat requires one text output",
+            .with_context(|| format!("request {:?} is not supported by {backend:?}", request.id))?;
+        let [output] = request.outputs.as_slice() else {
+            bail!(
+                "request {:?}: backend requires exactly one output",
                 request.id
-            ),
+            )
         };
+        let output = output.clone();
         let mut asset_bytes = 0usize;
         let mut parts = Vec::with_capacity(request.inputs.len());
         for input in &request.inputs {
             match input {
+                InputPart::System { text } => parts.push(PreparedInputPart::System(text.clone())),
                 InputPart::Text { text } => parts.push(PreparedInputPart::Text(text.clone())),
                 InputPart::Image { asset }
                 | InputPart::Audio { asset }
@@ -87,7 +108,7 @@ pub(crate) fn prepare_multimodal_requests(
         prepared.push(PreparedMultimodalRequest {
             source: request,
             parts,
-            max_tokens,
+            output,
             asset_bytes,
         });
     }
@@ -105,14 +126,31 @@ pub(crate) async fn run_multimodal_request(
         wait_for_common_arrival(&state.common, request.source.arrival_time_ms).await;
     let _concurrency_permit = state.common.acquire_capacity_slot(request_ordinal).await;
     state.common.stats.record_submit();
-    let result = state
-        .client
-        .run_step(
-            request.source.id.clone(),
-            Prompt::Parts(&request.parts),
-            request.max_tokens,
-        )
-        .await;
+    let result = match &request.output {
+        OutputSpec::Text { max_tokens } => {
+            state
+                .text_client
+                .as_ref()
+                .expect("validated text request has a text client")
+                .run_step(
+                    request.source.id.clone(),
+                    Prompt::Parts(&request.parts),
+                    *max_tokens,
+                )
+                .await
+        }
+        OutputSpec::Image { .. } | OutputSpec::Audio { .. } => {
+            state
+                .media_client
+                .as_ref()
+                .expect("validated media request has a media client")
+                .run_step(request.source.id.clone(), &request.parts, &request.output)
+                .await
+        }
+        OutputSpec::Video { .. } | OutputSpec::Tensor { .. } => {
+            unreachable!("capability validation rejects unsupported generated media")
+        }
+    };
     if let Some(sink) = &timeline_sink {
         sink.offer(RequestTimeline {
             request_id: result.outcome.request_id.clone(),
@@ -122,7 +160,10 @@ pub(crate) async fn run_multimodal_request(
     let log = StepLog::multimodal_request(
         &request.source,
         request.asset_bytes,
-        request.max_tokens,
+        match request.output {
+            OutputSpec::Text { max_tokens } => max_tokens,
+            _ => 0,
+        },
         arrival_release_lag_ms,
         result.outcome,
     );

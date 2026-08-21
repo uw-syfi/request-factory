@@ -54,6 +54,8 @@ pub(crate) use writer::write_timeline;
 pub(crate) enum EventKind {
     /// Generated token ids. `tokens` says how many arrived in this one event.
     Tokens,
+    /// Generated image/audio/video bytes. `bytes` says how much this arrival carried.
+    Media,
     /// A server usage report and no tokens.
     Usage,
     /// A finish reason and no tokens.
@@ -72,6 +74,7 @@ impl EventKind {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Tokens => "tokens",
+            Self::Media => "media",
             Self::Usage => "usage",
             Self::Finish => "finish",
             Self::Other => "other",
@@ -113,6 +116,10 @@ pub(crate) struct TimelineEvent {
     /// Tokens delivered by this arrival and every earlier one, so a reader can
     /// plot progress without a running fold.
     pub(crate) cumulative_tokens: u32,
+    /// Decoded generated-media bytes delivered by this arrival.
+    pub(crate) bytes: u32,
+    /// Generated-media bytes delivered by this and all earlier arrivals.
+    pub(crate) cumulative_bytes: u64,
 }
 
 /// One request's stream, start to finish.
@@ -223,6 +230,8 @@ mod tests {
                 kind: EventKind::Tokens,
                 tokens: 1,
                 cumulative_tokens: 1,
+                bytes: 0,
+                cumulative_bytes: 0,
             }],
         };
 

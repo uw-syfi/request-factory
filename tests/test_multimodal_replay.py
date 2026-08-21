@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import subprocess
@@ -181,6 +182,142 @@ def test_cpu_mock_receives_assets_and_streams_concurrent_replay(tmp_path: Path) 
         assert all(record["media_bytes"] > 100 for record in records)
         assert all(record["max_tokens"] == 4 for record in records)
         assert max(record["active_at_receive"] for record in records) >= 2
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+
+def test_cpu_mock_validates_generated_image_and_streaming_audio_outputs(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        ["cargo", "build", "--bin", "session_runner"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    ready = tmp_path / "ready-media"
+    server_log = tmp_path / "server-media.jsonl"
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            str(REPO_ROOT / "tools" / "mock_multimodal_server.py"),
+            "--ready-file",
+            str(ready),
+            "--log-path",
+            str(server_log),
+            "--chunk-delay-ms",
+            "1",
+        ],
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists(), server.stderr.read() if server.poll() is not None else ""
+        port = int(ready.read_text())
+        image = tmp_path / "source.png"
+        image.write_bytes(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        image_hash = hashlib.sha256(image.read_bytes()).hexdigest()
+        cases = [
+            (
+                "t2i",
+                "openai-images",
+                [{"type": "text", "text": "a red cube"}],
+                [{"type": "image", "width": 64, "height": 64, "steps": 2, "count": 1}],
+            ),
+            (
+                "i2i",
+                "openai-chat",
+                [
+                    {"type": "text", "text": "make it blue"},
+                    {"type": "image", "asset": {"path": str(image), "sha256": image_hash, "media_type": "image/png"}},
+                ],
+                [{"type": "image", "width": 64, "height": 64, "steps": 2, "count": 1}],
+            ),
+            (
+                "qwen-audio",
+                "openai-chat",
+                [
+                    {"type": "system", "text": "You are a speaking assistant."},
+                    {"type": "text", "text": "say hello"},
+                ],
+                [{"type": "audio", "sample_rate_hz": 24000, "max_tokens": 256, "voice": "Ethan"}],
+            ),
+            (
+                "speech-audio",
+                "openai-speech",
+                [{"type": "text", "text": "say hello"}],
+                [{"type": "audio", "sample_rate_hz": 24000, "max_tokens": 256, "voice": "tara"}],
+            ),
+        ]
+        for case_name, backend, inputs, outputs in cases:
+            trace = tmp_path / f"{case_name}.jsonl"
+            trace.write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "id": f"{case_name}-{index}",
+                            "arrival_time_ms": 0,
+                            "inputs": inputs,
+                            "outputs": outputs,
+                        }
+                    )
+                    for index in range(2)
+                )
+                + "\n"
+            )
+            summary = tmp_path / f"{case_name}-summary.json"
+            artifacts = tmp_path / f"{case_name}-artifacts"
+            completed = subprocess.run(
+                [
+                    str(REPO_ROOT / "target" / "debug" / "session_runner"),
+                    "--trace", str(trace),
+                    "--input-file-format", "multimodal-independent-v1",
+                    "--base-url", f"http://127.0.0.1:{port}/v1",
+                    "--backend", backend,
+                    "--model", "mock-model",
+                    "--arrival-mode", "saturated",
+                    "--max-concurrency", "2",
+                    "--timeline", "false",
+                    "--output-artifact-dir", str(artifacts),
+                    "--log-path", str(tmp_path / f"{case_name}-requests.jsonl"),
+                    "--summary-path", str(summary),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            assert completed.returncode == 0, completed.stderr
+            result = json.loads(summary.read_text())["replay"]["common"]
+            assert result["success_steps"] == 2
+            assert result["failed_steps"] == 0
+            assert result["output_bytes"] > 0
+            assert result["first_output_ms_p50"] is not None
+            if "audio" in case_name:
+                assert result["real_time_factor_measured_steps"] == 2
+                assert result["audio_duration_s"] > 0
+            assert len(list(artifacts.iterdir())) == 2
+        received = [json.loads(line) for line in server_log.read_text().splitlines()]
+        qwen = [row for row in received if row["output_modality"] == "audio" and row["system_prompts"]]
+        speech = [row for row in received if row["output_modality"] == "audio" and not row["system_prompts"]]
+        assert len(qwen) == 2
+        assert all(row["max_tokens"] == 256 for row in qwen)
+        assert all(row["max_output_tokens"] == 256 for row in qwen)
+        assert all(row["temperature"] == 0.0 for row in qwen)
+        assert all(row["thinker_temperature"] == 0.0 for row in qwen)
+        assert len(speech) == 2
+        assert all(row["max_tokens"] == 256 for row in speech)
+        assert all(row["request_id"] for row in received)
     finally:
         server.terminate()
         server.wait(timeout=5)

@@ -100,7 +100,7 @@ per axis.
 |---|---|---|---|
 | 1 | **Input-file format** — request family, row schema, and topology | `input.format` | Complete names such as `text-generation-session-execution-v2` |
 | 2 | **Arrival and load control** — when top-level units are released, how many run at once | `replay.*`, CSV `arrival_time` | `trace-timed` (default) or `saturated`, each with an optional cap |
-| 3 | **Wire backend** — endpoint and output representation | `server.backend` | `openai` (default), `openai-chat`, `vllm-tokens`, `sglang-tokens` |
+| 3 | **Wire backend** — endpoint and output representation | `server.backend` | `openai` (default), `openai-chat`, `openai-images`, `openai-speech`, `vllm-tokens`, `sglang-tokens` |
 
 The prefix/append split a session round replays is **not** an axis of a run. It
 is resolved once, when the canonical trace is generated, and recorded in that
@@ -117,7 +117,7 @@ never flattened into a standalone one.
 |---|---|---|
 | `text-generation-session-execution-v2` | One **already-materialized** text-generation round | Rounds are closed-loop: submit round `i`, await its response, wait `tool_wait_after_ms`, then submit round `i + 1` |
 | `text-generation-independent` | One standalone text-generation request | Each row releases independently |
-| `multimodal-independent-v1` | One canonical JSON object with ordered text/media inputs and typed outputs | Each request releases independently; currently executed by `openai-chat` when the output is text |
+| `multimodal-independent-v1` | One canonical JSON object with ordered text/media inputs and typed outputs | Each request releases independently; text, generated-image, and generated-audio outputs use modality-capable backends |
 
 `text-generation-session-execution-v2` reads a canonical file whose `prefix_len` is
 guaranteed to exist by the time the round runs, so the runtime has nothing left
@@ -163,10 +163,12 @@ workload shape.
 | `openai` | `POST {base_url}/completions` | Text plus vLLM's optional `return_token_ids` extension |
 | `vllm-tokens` | `POST {base_url}/inference/v1/generate` | Native token-ID deltas; server must run with `--tokens-only` |
 | `sglang-tokens` | `POST {base_url}/generate` | Native `output_ids` deltas; server must run with `--skip-tokenizer-init` and `--stream-output` |
-| `openai-chat` | `POST {base_url}/chat/completions` | Interleaved text/image/audio/video input and streamed text output |
+| `openai-chat` | `POST {base_url}/chat/completions` | Interleaved inputs; streamed text/audio or generated-image output |
+| `openai-images` | `POST {base_url}/images/generations` | Text-to-image JSON output |
+| `openai-speech` | `POST {base_url}/audio/speech` | Text-to-audio raw PCM streaming output |
 
-The first three are exact token-ID text-replay transports. `openai-chat` is the
-asset-backed multimodal transport and intentionally delegates media
+The token transports preserve exact text IDs. The OpenAI-compatible multimodal
+backends intentionally delegate media
 preprocessing/tokenization to the system under test. See
 [Request backends](#request-backends) for the comparison.
 
@@ -360,14 +362,17 @@ never used to guess which schema a file is.
 ### Canonical multimodal JSONL — `multimodal-independent-v1`
 
 One non-empty line is one `RequestSpec`: ordered, repeatable text/image/audio/
-video/tensor inputs and typed outputs. IDs must be unique and arrivals
+video/tensor inputs and typed outputs. Optional `system` text inputs must come
+before user content and preserve the chat role on compatible backends. IDs must be unique and arrivals
 nondecreasing. The format is JSON Lines because nested modality data should not
 be escaped into CSV cells. See
 [Adding modality-compositional benchmarks](docs/ADDING_BENCHMARKS.md) for its
 schema and extension contract.
 
-The live `openai-chat` adapter currently accepts text, image, audio, and video
-inputs in any order and produces one text output. Unsupported modalities or
+The live `openai-chat` adapter accepts text, image, audio, and video
+user inputs in any order and produces text, image, or audio. `openai-images`
+produces image output from text, and `openai-speech` streams raw PCM audio from
+user text while ignoring chat-only system instructions. Unsupported modalities or
 output combinations fail during preparation, before any request is sent.
 
 ### Food101/BAGEL image-to-text benchmark
@@ -704,7 +709,9 @@ three — but whether the server performs detokenization at all.
 | `openai` | `POST {base_url}/completions` | Token-ID array | Text, plus echoed IDs via `return_token_ids` | **Yes** (output side) |
 | `vllm-tokens` | `POST {base_url}/inference/v1/generate` | `token_ids` | Token-ID deltas | No |
 | `sglang-tokens` | `POST {base_url}/generate` | `input_ids` | `output_ids` deltas | No |
-| `openai-chat` | `POST {base_url}/chat/completions` | Ordered text and verified media data URLs | Text deltas plus usage | Model-specific media preprocessing |
+| `openai-chat` | `POST {base_url}/chat/completions` | Ordered text and verified media data URLs | Text deltas, PCM16 audio deltas, or an image data URL | Model-specific media preprocessing |
+| `openai-images` | `POST {base_url}/images/generations` | Text prompt | Base64 image JSON | None |
+| `openai-speech` | `POST {base_url}/audio/speech` | Text prompt | Raw mono PCM16 chunks | None |
 
 So `openai` is **token-in, but not token-out**: the server still decodes, and
 the echoed IDs ride alongside the text rather than replacing it. In vLLM only
@@ -717,7 +724,7 @@ Pick accordingly: `vllm-tokens` and `sglang-tokens` are the two comparable
 high-fidelity paths, and `openai` is the portable fallback whose TTFT/TPOT
 include decode cost.
 
-`openai-chat` is selected only with `multimodal-independent-v1`. It preserves
+The three multimodal backends are selected only with `multimodal-independent-v1`. They preserve
 input order, supports repeated media, and sends original asset bytes after
 SHA-256 verification. Asset reads, hashing, MIME inference, and base64 encoding
 finish before `run_start`; measured latency begins when the request enters the
@@ -1056,7 +1063,8 @@ average them as four measurements. `tokens` says how many that one arrival
 carried — the same reasoning that keeps `first_token_event_tokens` out of TPOT's
 denominator.
 
-`kind` is what lets this generalize. A multimodal pipeline reporting per-stage
+`kind` is what lets this generalize. `media` rows carry `bytes` and
+`cumulative_bytes`; token rows retain their token counts. A pipeline reporting per-stage
 progress adds kinds here rather than a second file format.
 
 Measured at 4.7 bytes/row after dictionary encoding and zstd, so the full
@@ -1513,7 +1521,7 @@ binary. The axis columns map back to [Configuration axes](#configuration-axes).
 |---|---|---|
 | `--input-file-format` | `text-generation-session-execution-v2` | Complete family-specific format. The client executes the two `text-generation-*` formats plus `multimodal-independent-v1` |
 | `--trace-tags` | none | Comma-separated. `slo` adds TTFT/TPOT/E2E bounds; `priority` adds scheduling priority |
-| `--backend` | `openai` | `openai`, `openai-chat`, `vllm-tokens`, `sglang-tokens` — axis 3 |
+| `--backend` | `openai` | `openai`, `openai-chat`, `openai-images`, `openai-speech`, `vllm-tokens`, `sglang-tokens` — axis 3 |
 | `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for OpenAI-compatible backends, omit it for native token endpoints |
 
 ### Load control (axis 2)
@@ -1557,6 +1565,7 @@ A context-limit skip always ends its session, independently of this flag.
 | `--token-pool-limit N` | see [Synthetic token corpus](#synthetic-token-corpus) | Cap on synthetic pool size |
 | `--timeline` | `true` | Per-event Parquet timeline. Takes an explicit value: `--timeline false` |
 | `--timeline-path` | `session_runner_timeline.parquet` | Where that timeline is written |
+| `--output-artifact-dir` | unset | Optional directory for generated image/audio files; writes happen after measured response completion |
 | `--slo` | trace sidecar, else none | `ttft_ms=500,tpot_ms=50`. Overrides a `<trace>.slo.json` sidecar. See [Service-level objectives](#service-level-objectives) |
 
 </details>
@@ -1664,7 +1673,7 @@ metrics described above.
 
 Not currently provided:
 
-- multimodal generated outputs on a concrete server backend (the schema already represents them);
+- generated video/tensor outputs and backend adapters beyond the documented image/audio protocols;
 - Food101 accuracy scoring (the materializer emits labels, while replay reports performance);
 - raw private prompt/tool-result reconstruction;
 - per-token timestamp dumps;
