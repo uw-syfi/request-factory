@@ -427,6 +427,34 @@ M*'s BAGEL controls: 50 steps, `cfg_img_scale=2`,
 [VBench replay](docs/VBENCH.md) for acquisition, provenance, and the documented
 paper/source discrepancy around I2I dimensions.
 
+### Seed-TTS audio-generation benchmark
+
+Download the official Seed-TTS evaluation archive and materialize the 160
+English text-to-audio requests used by M*:
+
+```bash
+uv run --with gdown python -m benchmarks seed-tts \
+  --dataset-dir data/seedtts_testset \
+  --output-dir out/seed-tts-en \
+  --download --set en --limit 160 \
+  --arrival-rate 10 --sample-rate-hz 24000 --max-tokens 256
+```
+
+The artifact carries M*'s exact Qwen system role and target text while retaining
+the reference voice transcript and WAV hash in `labels.jsonl`. It can be
+replayed unchanged against Qwen3-Omni's streaming chat API or an
+OpenAI-compatible raw-PCM speech service:
+
+```bash
+uv run python -m launcher run configs/seed-tts-qwen3-omni.example.yaml
+uv run python -m launcher run configs/seed-tts-orpheus.example.yaml
+```
+
+The Orpheus example expects M*'s `/v1/audio/speech` service or another
+conforming wrapper; upstream Orpheus does not provide that endpoint directly.
+See [Seed-TTS replay](docs/SEED_TTS.md) for voice selection, dataset provenance,
+runtime metrics, and the load-scheduling difference from M*'s offline harness.
+
 ### Canonical execution CSV — `session-execution-v2`
 
 The only session input, selected by `--input-file-format text-generation-session-execution-v2`. Every column is
