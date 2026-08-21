@@ -23,7 +23,7 @@ use crate::timeline::{EventKind, TimelineEvent};
 use crate::util::{elapsed_ms, unix_seconds_now};
 
 use super::dialect::{AudioDeltas, MediaRead, VoiceSlot};
-use super::{chat_inputs, dialect_for, Dialect, GenerationResult, PreparedInputPart};
+use super::{dialect_for, ChatInputs, Dialect, GenerationResult, PreparedInputPart};
 
 pub(crate) struct MediaClient {
     endpoint: String,
@@ -285,7 +285,8 @@ impl MediaClient {
             }
             (BackendKind::OpenaiChat, OutputSpec::Image { .. }) => {
                 dialect.check_chat_image_generation()?;
-                let mut payload = Value::Object(chat_inputs(parts, dialect.media_input)?);
+                let mut payload =
+                    Value::Object(ChatInputs::plan(parts, dialect.media_input)?.to_object()?);
                 payload["model"] = self.model.clone().into();
                 payload["stream"] = false.into();
                 if let Some(modalities) = dialect.image_modalities {
@@ -303,7 +304,8 @@ impl MediaClient {
                     ..
                 },
             ) => {
-                let mut payload = Value::Object(chat_inputs(parts, dialect.media_input)?);
+                let mut payload =
+                    Value::Object(ChatInputs::plan(parts, dialect.media_input)?.to_object()?);
                 payload["model"] = self.model.clone().into();
                 payload["modalities"] = serde_json::json!(dialect.audio_modalities);
                 payload["stream"] = true.into();

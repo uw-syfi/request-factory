@@ -19,6 +19,8 @@ mod wire;
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
+use serde::ser::{SerializeMap, SerializeSeq, Serializer};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::record::GenerationOutcome;
@@ -30,6 +32,54 @@ pub(crate) use client::GenerationClient;
 pub(crate) use dialect::{dialect_for, Dialect};
 pub(crate) use media_client::MediaClient;
 pub(crate) use realtime_client::RealtimeClient;
+
+#[cfg(feature = "bench-internals")]
+pub(crate) fn bench_serialize_vllm_request(prompt_ids: &[u32]) -> Vec<u8> {
+    wire::VllmTokensBackend
+        .serialize_payload(&GenRequest {
+            model: "bench-model",
+            request_id: "bench-request",
+            prompt: Prompt::Tokens(prompt_ids),
+            max_tokens: 32,
+            temperature: 0.0,
+            stream: true,
+        })
+        .expect("benchmark request must serialize")
+}
+
+/// Chat-path serialization for the benchmark that guards this body against
+/// drifting back to a DOM. Takes the shape rather than the parts because
+/// `PreparedInputPart` does not leave the crate.
+#[cfg(feature = "bench-internals")]
+pub(crate) fn bench_serialize_chat_request(dialect: &str, text: &str, images: usize) -> Vec<u8> {
+    let mut parts = vec![PreparedInputPart::Text(text.to_string())];
+    for _ in 0..images {
+        parts.push(PreparedInputPart::Media {
+            modality: Modality::Image,
+            data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+        });
+    }
+    wire::OpenAiChatBackend(dialect_for(dialect).expect("known dialect"))
+        .serialize_payload(&GenRequest {
+            model: "bench-model",
+            request_id: "bench-request",
+            prompt: Prompt::Parts(&parts),
+            max_tokens: 32,
+            temperature: 0.0,
+            stream: true,
+        })
+        .expect("benchmark request must serialize")
+}
+
+#[cfg(feature = "bench-internals")]
+pub(crate) fn bench_parse_vllm_event(data: &[u8]) -> usize {
+    let event = wire::VllmTokensBackend
+        .parse_event(data)
+        .expect("benchmark event must parse");
+    event.token_ids.as_ref().map_or(0, Vec::len)
+        + usize::from(event.finish_reason.is_some())
+        + usize::from(event.usage.is_some())
+}
 
 /// What one request sends as its input.
 ///
@@ -97,103 +147,278 @@ fn error_detail(body: &str) -> Option<String> {
 
 /// Shape role-aware, interleaved input parts the way one dialect expects them.
 ///
-/// Returns the whole input half of the request body, not just `messages`,
+/// Covers the whole input half of the request body, not just `messages`,
 /// because where media goes is itself a dialect decision: two of the three
 /// encodings put it in the message content and the third hangs it off the
 /// request root.
-pub(crate) fn chat_inputs(
-    parts: &[PreparedInputPart],
+///
+/// Borrowed and `Serialize` rather than a `Value` builder because two callers
+/// want different renderings of the same shaping. Generation serializes it
+/// straight into body bytes, where a DOM would allocate a tree only for the
+/// HTTP client to walk it again; the media surfaces need a real `Value`, since
+/// an operator's `model_params` is arbitrary JSON that has to be merged in.
+/// Writing it once and rendering twice is what keeps those two from drifting.
+pub(crate) struct ChatInputs<'a> {
     encoding: dialect::MediaInput,
-) -> Result<serde_json::Map<String, Value>> {
-    use dialect::MediaInput;
+    /// System turns, in trace order. Each is one message.
+    system: Vec<&'a str>,
+    /// The user turn's parts, in trace order.
+    user: Vec<UserPart<'a>>,
+}
 
-    let mut messages = Vec::new();
-    let mut user_content = Vec::new();
-    let mut lists: BTreeMap<&'static str, Vec<Value>> = BTreeMap::new();
-    let mut saw_user = false;
-    for part in parts {
-        match part {
-            PreparedInputPart::System(text) if !saw_user => {
-                messages.push(serde_json::json!({"role": "system", "content": text}));
-            }
-            PreparedInputPart::System(_) => bail!("system inputs must precede user inputs"),
-            PreparedInputPart::Text(text) => {
-                saw_user = true;
-                user_content.push(serde_json::json!({"type": "text", "text": text}));
-            }
-            PreparedInputPart::Media { modality, data_url } => {
-                saw_user = true;
-                match encoding {
-                    MediaInput::UrlParts => user_content.push(url_part(*modality, data_url)?),
-                    MediaInput::OpenAiParts => user_content.push(openai_part(*modality, data_url)?),
-                    MediaInput::TopLevelLists => {
-                        lists
-                            .entry(media_list_key(*modality)?)
-                            .or_default()
-                            .push(Value::String(data_url.clone()));
-                    }
+enum UserPart<'a> {
+    Text(&'a str),
+    Media {
+        modality: Modality,
+        data_url: &'a str,
+    },
+}
+
+impl<'a> ChatInputs<'a> {
+    /// Validate the parts against the encoding *before* any serializing.
+    ///
+    /// Serialization is infallible by the time it runs: a `Serializer` can only
+    /// report failure as a serde error, which would surface a dialect mistake
+    /// as if the JSON writer had broken. An unsupported modality is an operator
+    /// error and reads like one here.
+    pub(crate) fn plan(
+        parts: &'a [PreparedInputPart],
+        encoding: dialect::MediaInput,
+    ) -> Result<Self> {
+        let mut system = Vec::new();
+        let mut user = Vec::new();
+        let mut saw_user = false;
+        for part in parts {
+            match part {
+                PreparedInputPart::System(text) if !saw_user => system.push(text.as_str()),
+                PreparedInputPart::System(_) => bail!("system inputs must precede user inputs"),
+                PreparedInputPart::Text(text) => {
+                    saw_user = true;
+                    user.push(UserPart::Text(text));
+                }
+                PreparedInputPart::Media { modality, data_url } => {
+                    saw_user = true;
+                    // Reject here, where the dialect is in hand, rather than
+                    // letting an unnamed modality reach the wire as a field the
+                    // server will quietly ignore.
+                    media_key(*modality, encoding)?;
+                    user.push(UserPart::Media {
+                        modality: *modality,
+                        data_url,
+                    });
                 }
             }
         }
-    }
-    if !saw_user {
-        bail!("request has no user input")
-    }
-    // A media-only request under `TopLevelLists` still needs a user turn, and
-    // that turn's content is a plain string there rather than an array.
-    let content = if matches!(encoding, MediaInput::TopLevelLists) {
-        Value::String(
-            user_content
-                .iter()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    } else {
-        if user_content.is_empty() {
+        if !saw_user {
             bail!("request has no user input")
         }
-        Value::Array(user_content)
-    };
-    messages.push(serde_json::json!({"role": "user", "content": content}));
-
-    let mut body = serde_json::Map::new();
-    body.insert("messages".into(), Value::Array(messages));
-    for (key, values) in lists {
-        body.insert(key.into(), Value::Array(values));
+        // Under `TopLevelLists` the user turn is a plain string, so a
+        // media-only request still has a turn; the other two encodings build a
+        // content array and would emit an empty one.
+        if !matches!(encoding, dialect::MediaInput::TopLevelLists)
+            && !user.iter().any(|part| matches!(part, UserPart::Text(_)))
+            && user.is_empty()
+        {
+            bail!("request has no user input")
+        }
+        Ok(Self {
+            encoding,
+            system,
+            user,
+        })
     }
-    Ok(body)
+
+    /// The same shaping as a `Value` object, for the media surfaces that must
+    /// merge arbitrary operator JSON into it.
+    pub(crate) fn to_object(&self) -> Result<serde_json::Map<String, Value>> {
+        match serde_json::to_value(self)? {
+            Value::Object(map) => Ok(map),
+            other => bail!("chat inputs rendered as {other} rather than an object"),
+        }
+    }
 }
 
-/// vLLM's `_url` family, which is also the only spelling video has anywhere.
-fn url_part(modality: Modality, data_url: &str) -> Result<Value> {
-    let key = match modality {
-        Modality::Image => "image_url",
-        Modality::Audio => "audio_url",
-        Modality::Video => "video_url",
-        Modality::Text | Modality::Tensor => {
-            bail!("unsupported prepared media modality {modality:?}")
+impl ChatInputs<'_> {
+    /// Write the input half of a chat body into a map the caller already opened.
+    ///
+    /// Taking an open map rather than returning one is what lets a backend
+    /// flatten these entries in beside `model` and the decode cap: under one
+    /// encoding the input half is more than `messages`, so it cannot be a
+    /// single nested field.
+    pub(crate) fn serialize_entries<M: SerializeMap>(
+        &self,
+        map: &mut M,
+    ) -> std::result::Result<(), M::Error> {
+        map.serialize_entry("messages", &Messages(self))?;
+        if matches!(self.encoding, dialect::MediaInput::TopLevelLists) {
+            // Grouped by key so `images` / `audios` / `videos` each arrive as
+            // one array, whatever order the trace interleaved them in.
+            let mut lists: BTreeMap<&'static str, Vec<&str>> = BTreeMap::new();
+            for part in &self.user {
+                if let UserPart::Media { modality, data_url } = part {
+                    // `plan` already proved every modality has a key here.
+                    if let Ok(key) = media_list_key(*modality) {
+                        lists.entry(key).or_default().push(data_url);
+                    }
+                }
+            }
+            for (key, urls) in lists {
+                map.serialize_entry(key, &urls)?;
+            }
         }
-    };
-    Ok(serde_json::json!({"type": key, key: {"url": data_url}}))
+        Ok(())
+    }
 }
 
-/// OpenAI proper: images by URL, audio as `input_audio`, and no video at all.
-fn openai_part(modality: Modality, data_url: &str) -> Result<Value> {
-    match modality {
-        Modality::Image => Ok(serde_json::json!({
-            "type": "image_url", "image_url": {"url": data_url}
-        })),
-        Modality::Audio => {
-            let (format, data) = split_data_url(data_url)?;
-            Ok(serde_json::json!({
-                "type": "input_audio", "input_audio": {"data": data, "format": format}
-            }))
+impl Serialize for ChatInputs<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        self.serialize_entries(&mut map)?;
+        map.end()
+    }
+}
+
+/// The `messages` array: every system turn, then one user turn.
+struct Messages<'a>(&'a ChatInputs<'a>);
+
+impl Serialize for Messages<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let inputs = self.0;
+        let mut seq = serializer.serialize_seq(Some(inputs.system.len() + 1))?;
+        for text in &inputs.system {
+            seq.serialize_element(&Message {
+                role: "system",
+                content: MessageContent::Text(text),
+            })?;
         }
-        Modality::Video => bail!("the openai dialect has no video input content part"),
-        Modality::Text | Modality::Tensor => {
-            bail!("unsupported prepared media modality {modality:?}")
+        seq.serialize_element(&Message {
+            role: "user",
+            content: MessageContent::User(inputs),
+        })?;
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+struct Message<'a> {
+    role: &'static str,
+    content: MessageContent<'a>,
+}
+
+enum MessageContent<'a> {
+    Text(&'a str),
+    User(&'a ChatInputs<'a>),
+}
+
+impl Serialize for MessageContent<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let inputs = match self {
+            Self::Text(text) => return serializer.serialize_str(text),
+            Self::User(inputs) => inputs,
+        };
+        if matches!(inputs.encoding, dialect::MediaInput::TopLevelLists) {
+            // Media left the turn for the request root, so what remains is
+            // text; joined rather than arrayed because this encoding's
+            // `content` is a string.
+            let joined = inputs
+                .user
+                .iter()
+                .filter_map(|part| match part {
+                    UserPart::Text(text) => Some(*text),
+                    UserPart::Media { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return serializer.serialize_str(&joined);
         }
+        let mut seq = serializer.serialize_seq(Some(inputs.user.len()))?;
+        for part in &inputs.user {
+            match part {
+                UserPart::Text(text) => seq.serialize_element(&TextPart { text })?,
+                UserPart::Media { modality, data_url } => {
+                    seq.serialize_element(&MediaPart {
+                        modality: *modality,
+                        data_url,
+                        encoding: inputs.encoding,
+                    })?;
+                }
+            }
+        }
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "text")]
+struct TextPart<'a> {
+    text: &'a str,
+}
+
+/// One media content part, spelled the way the encoding spells it.
+struct MediaPart<'a> {
+    modality: Modality,
+    data_url: &'a str,
+    encoding: dialect::MediaInput,
+}
+
+impl Serialize for MediaPart<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // `plan` rejected any modality this encoding cannot name, so the key is
+        // known to exist by the time a part is written.
+        let key = media_key(self.modality, self.encoding).map_err(serde::ser::Error::custom)?;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("type", key)?;
+        if key == "input_audio" {
+            // OpenAI proper wants the bare payload and a bare format name
+            // rather than the data-URL wrapper the `_url` family carries.
+            let (format, data) =
+                split_data_url(self.data_url).map_err(serde::ser::Error::custom)?;
+            map.serialize_entry(key, &InputAudio { data, format })?;
+        } else {
+            map.serialize_entry(key, &MediaUrl { url: self.data_url })?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+struct MediaUrl<'a> {
+    url: &'a str,
+}
+
+#[derive(Serialize)]
+struct InputAudio<'a> {
+    data: &'a str,
+    format: &'a str,
+}
+
+/// The content-part key one encoding uses for one modality, or an error naming
+/// what that dialect cannot carry.
+///
+/// `TopLevelLists` has no content-part key at all; it answers for whether the
+/// modality is carryable, which is what `plan` asks.
+fn media_key(modality: Modality, encoding: dialect::MediaInput) -> Result<&'static str> {
+    use dialect::MediaInput;
+    match encoding {
+        // vLLM's `_url` family, which is also the only spelling video has anywhere.
+        MediaInput::UrlParts => match modality {
+            Modality::Image => Ok("image_url"),
+            Modality::Audio => Ok("audio_url"),
+            Modality::Video => Ok("video_url"),
+            Modality::Text | Modality::Tensor => {
+                bail!("unsupported prepared media modality {modality:?}")
+            }
+        },
+        // OpenAI proper: images by URL, audio as `input_audio`, and no video at all.
+        MediaInput::OpenAiParts => match modality {
+            Modality::Image => Ok("image_url"),
+            Modality::Audio => Ok("input_audio"),
+            Modality::Video => bail!("the openai dialect has no video input content part"),
+            Modality::Text | Modality::Tensor => {
+                bail!("unsupported prepared media modality {modality:?}")
+            }
+        },
+        MediaInput::TopLevelLists => media_list_key(modality),
     }
 }
 
@@ -208,9 +433,11 @@ fn media_list_key(modality: Modality) -> Result<&'static str> {
     }
 }
 
-/// `data:audio/wav;base64,AAAA` -> `("wav", "AAAA")`. `input_audio` wants the
-/// bare payload and a bare format name, not the URL wrapper.
-fn split_data_url(data_url: &str) -> Result<(String, String)> {
+/// `data:audio/wav;base64,AAAA` -> `("wav", "AAAA")`. Borrowed from the input:
+/// `input_audio` wants the bare payload and a bare format name, and copying a
+/// base64 audio blob to strip four characters is the kind of allocation this
+/// path exists to avoid.
+fn split_data_url(data_url: &str) -> Result<(&str, &str)> {
     let rest = data_url
         .strip_prefix("data:")
         .ok_or_else(|| anyhow::anyhow!("input_audio requires a data URL, got {data_url:.32}"))?;
@@ -222,7 +449,7 @@ fn split_data_url(data_url: &str) -> Result<(String, String)> {
     if format.is_empty() {
         bail!("data URL carries no media subtype")
     }
-    Ok((format.to_string(), payload.to_string()))
+    Ok((format, payload))
 }
 
 /// Normalized, backend-agnostic description of one generation request.
@@ -270,10 +497,13 @@ pub(crate) trait Backend: Send + Sync {
         "Launch the server with prompt-token details and prefix caching enabled \
          (vLLM: --enable-prompt-tokens-details / ENABLE_PROMPT_TOKENS_DETAILS=1); see README.md."
     }
-    /// Shape one generation request into this backend's request body.
-    fn build_payload(&self, req: &GenRequest) -> Result<Value>;
-    /// Normalize one response JSON object (a stream chunk or a full body).
-    fn parse_event(&self, value: &Value) -> StreamEvent;
+    /// Serialize one generation request directly into this backend's JSON wire
+    /// representation. Keeping the DOM out of this hot path avoids allocating
+    /// a tree only for reqwest to immediately walk it again.
+    fn serialize_payload(&self, req: &GenRequest) -> Result<Vec<u8>>;
+    /// Deserialize and normalize one response JSON object directly from its
+    /// SSE bytes.
+    fn parse_event(&self, data: &[u8]) -> serde_json::Result<StreamEvent>;
 }
 
 /// Backend result shared by every text-generation source. Source identity stays

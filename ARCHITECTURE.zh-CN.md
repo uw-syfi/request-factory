@@ -264,7 +264,7 @@ WorkloadSummary / dry-run early return
   ↓
 construct GenerationClient and protocol adapter
   ↓
-create AppState, concurrency gate, log channel, optional timeline channel
+create AppState, bounded dispatcher, log channel, optional timeline channel
 ```
 
 `--dry-run` 在 token corpus 和网络访问前返回，因此它验证的是输入与 workload shaping，
@@ -276,14 +276,14 @@ multimodal replay 没有 corpus/cache preflight；它在 arrival clock 前准备
 
 ## 7. `executor/` 负责 release、dependency 与 admission
 
-runner 对每个 top-level workload unit 启动一个 task，然后按 `ReplayWorkload` variant
+runner 的 central `JoinSet` dispatcher 最多只启动 concurrency window 内的 top-level
+workload tasks，不会为 trace 中每一行预先停放 task。之后按 `ReplayWorkload` variant
 进入三条执行路径（text independent、text session、multimodal independent）。
 
 ### Independent request
 
 ```text
 wait for request arrival
-  → acquire concurrency slot
   → draw input_len synthetic tokens
   → context-limit check
   → GenerationClient::run_step
@@ -296,7 +296,7 @@ wait for request arrival
 
 ```text
 wait for session arrival
-  → acquire one concurrency slot for the whole session
+  → hold one dispatcher slot for the whole session
   → for each round in order:
        build prompt from carried context
        context-limit check
@@ -310,9 +310,10 @@ wait for session arrival
 predecessor 完成及 tool wait。session 在所有 rounds 和 tool waits 期间持有同一个 capacity
 slot，这是当前 concurrency contract。
 
-`arrival_mode=trace` 尊重记录的 arrival offset；`arrival_mode=saturated` 忽略该 timeline，
-让 units 尽快进入 admission。`--max-concurrency` 只限制 active units，并用 deterministic
-admission order 处理竞争。
+`arrival_mode=trace-timed` 尊重记录的 arrival offset；`arrival_mode=saturated` 忽略该 timeline，
+让 units 尽快进入 admission。`--max-concurrency` 决定 dispatch window；unit 完成后严格
+启动 canonical order 中的下一个 unit，因此内存随 active concurrency 而非 trace 长度增长。
+饱和 scale-out 按 top-level ordinal 分片，session 不会跨 process 拆分。
 
 ## 8. `tokens.rs` 把长度声明变成实际 prompt
 
@@ -352,7 +353,8 @@ GenRequest {
 丢弃而不是猜测。`dialect/` 不接触时间、并发或测量，只做重命名与重新嵌套。
 
 `backend/wire/` 负责 OpenAI、vLLM native token endpoint 和 SGLang native token endpoint
-之间的 JSON 差异。`GenerationClient` 负责共享 async lifecycle：
+之间的 typed wire 差异。它直接序列化 borrowed request structs，并从 SSE bytes 解析，
+不构造中间 JSON DOM。`GenerationClient` 负责共享 async lifecycle：
 
 1. 构造并发送 payload；
 2. 持续读取 stream；
@@ -389,8 +391,8 @@ GenerationOutcome
 
 之后有两条互不阻塞主执行的输出路径：
 
-- log channel：`summary::write_logs` 写 per-step JSONL，同时折叠 replay metrics、prefix-cache
-  metrics 和可选 SLO attainment；
+- log channel：`summary::write_logs` 折叠 replay metrics、prefix-cache metrics 和可选 SLO
+  attainment，并按配置写 per-step JSONL；
 - timeline channel：可选地在独立 blocking writer 中编码 per-event Parquet。channel 满时丢
   timeline sample，而不让磁盘或 Arrow encoding 对被测 submission 施加 backpressure。
 

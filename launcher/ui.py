@@ -96,6 +96,23 @@ def _format_number(value: Any, decimals: int = 2) -> str:
 
 def _render_run(specification: LaunchSpec) -> None:
     report = _read_json(specification.result_file)
+    if report.get("kind") == "sharded_run":
+        aggregate = report.get("aggregate", {})
+        row("status", "complete")
+        row("processes", str(report.get("processes", "n/a")))
+        row(
+            "success",
+            f"{aggregate.get('success_steps', 'n/a')} / "
+            f"{aggregate.get('attempted_steps', 'n/a')} steps",
+        )
+        row(
+            "throughput",
+            f"{_format_number(aggregate.get('request_throughput_per_s'))} requests/s  |  "
+            f"{_format_number(aggregate.get('output_token_throughput_per_s'))} output tokens/s",
+        )
+        row("wall time", f"{_format_number(report.get('wall_duration_s'))} s")
+        row("latency", "reported in each shard summary")
+        return
     workload = report.get("workload", {})
     replay = report.get("replay", {})
     common = replay.get("common", {}) if isinstance(replay, dict) else {}

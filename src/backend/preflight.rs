@@ -5,7 +5,6 @@
 //! server whose cache never hit.
 
 use anyhow::{anyhow, Context, Result};
-use serde_json::Value;
 
 use super::client::GenerationClient;
 use super::{Backend, GenRequest, PreparedInputPart, Prompt, Usage};
@@ -119,7 +118,7 @@ impl GenerationClient {
     /// chunk. Keeping preflight on that same wire path also avoids depending on a
     /// backend's optional non-streaming response schema.
     async fn post_probe(&self, probe: Prompt<'_>) -> Result<Option<Usage>> {
-        let payload = self.backend.build_payload(&GenRequest {
+        let payload = self.backend.serialize_payload(&GenRequest {
             model: &self.model,
             // Not a trace request: named so it is obvious in a server log that
             // this row belongs to the prefix-cache preflight, not the workload.
@@ -141,7 +140,8 @@ impl GenerationClient {
             // instead of accidentally probing a different cache shard.
             // Servers that do not implement this vLLM routing header ignore it.
             .header("X-data-parallel-rank", "0")
-            .json(&payload)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload)
             .send()
             .await
             .map_err(|err| anyhow!("request error: {err}"))?;
@@ -165,10 +165,10 @@ fn final_usage_from_sse(backend: &dyn Backend, body: &str) -> Option<Usage> {
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(data) else {
+        let Ok(event) = backend.parse_event(data.as_bytes()) else {
             continue;
         };
-        if let Some(usage) = backend.parse_event(&value).usage {
+        if let Some(usage) = event.usage {
             final_usage = Some(usage);
         }
     }

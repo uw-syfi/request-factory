@@ -1,10 +1,7 @@
 use anyhow::{bail, Result};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 
 use super::super::{Backend, GenRequest, Prompt, StreamEvent, Usage};
-// Only `usage_usize`: SGLang's `meta_info` schema is fixed, so it reads exact
-// keys rather than searching the provider alias list.
-use super::usage_usize;
 
 /// SGLang native token-in/token-out `/generate` protocol.
 ///
@@ -22,89 +19,109 @@ use super::usage_usize;
 /// `cached_tokens`, `finish_reason` is an object, and no `text` field is sent.
 pub(crate) struct SglangTokensBackend;
 
+/// No `model` field: an SGLang server hosts exactly one model. No
+/// `return_logprob` either -- `output_ids` is a native top-level response
+/// field, so recovering ids out of per-token logprobs would only add compute
+/// and serialization to the path we are timing.
+#[derive(Serialize)]
+struct Request<'a> {
+    rid: &'a str,
+    input_ids: &'a [u32],
+    sampling_params: SamplingParams,
+    stream: bool,
+}
+
+#[derive(Serialize)]
+struct SamplingParams {
+    max_new_tokens: usize,
+    temperature: f64,
+    /// Always decode to the trace's target length; synthetic prompts otherwise
+    /// emit EOS immediately and collapse the workload.
+    ignore_eos: bool,
+}
+
+#[derive(Deserialize)]
+struct Event {
+    output_ids: Option<Vec<u32>>,
+    meta_info: Option<MetaInfo>,
+}
+
+/// SGLang carries token accounting here, not in an OpenAI `usage` object, and
+/// its schema is fixed -- so these are exact keys rather than the provider alias
+/// list the OpenAI-shaped backends have to search.
+///
+/// `meta_info` rides on every streamed chunk with running counts. The shared
+/// engine keeps the newest value for each field, so the final chunk's totals win.
+#[derive(Deserialize)]
+struct MetaInfo {
+    prompt_tokens: Option<usize>,
+    completion_tokens: Option<usize>,
+    output_tokens: Option<usize>,
+    cached_tokens: Option<usize>,
+    finish_reason: Option<FinishReason>,
+}
+
+/// SGLang reports `finish_reason` as an object (`{"type": "length"}`) rather
+/// than the bare string the OpenAI schema uses. Accept both.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FinishReason {
+    Plain(String),
+    Object { r#type: String },
+}
+
 impl Backend for SglangTokensBackend {
     fn endpoint_suffix(&self) -> &str {
         "/generate"
     }
 
-    fn build_payload(&self, req: &GenRequest) -> Result<Value> {
-        let Prompt::Tokens(prompt_ids) = req.prompt else {
+    fn serialize_payload(&self, req: &GenRequest) -> Result<Vec<u8>> {
+        let Prompt::Tokens(input_ids) = req.prompt else {
             bail!("sglang-tokens requires token-id prompts")
         };
-        // No `model` field: an SGLang server hosts exactly one model. No
-        // `return_logprob` either — `output_ids` is a native top-level response
-        // field, so recovering ids out of per-token logprobs would only add
-        // compute and serialization to the path we are timing.
-        Ok(serde_json::json!({
-            "rid": req.request_id,
-            "input_ids": prompt_ids,
-            "sampling_params": {
-                "max_new_tokens": req.max_tokens,
-                "temperature": req.temperature,
-                // Always decode to the trace's target length; synthetic prompts
-                // otherwise emit EOS immediately and collapse the workload.
-                "ignore_eos": true,
+        Ok(serde_json::to_vec(&Request {
+            rid: req.request_id,
+            input_ids,
+            sampling_params: SamplingParams {
+                max_new_tokens: req.max_tokens,
+                temperature: req.temperature,
+                ignore_eos: true,
             },
-            "stream": req.stream,
-        }))
+            stream: req.stream,
+        })?)
     }
 
-    fn parse_event(&self, value: &Value) -> StreamEvent {
-        let token_ids = value
-            .get("output_ids")
-            .and_then(Value::as_array)
-            .map(|output_ids| {
-                output_ids
-                    .iter()
-                    .filter_map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
-                    .collect::<Vec<u32>>()
+    fn parse_event(&self, data: &[u8]) -> serde_json::Result<StreamEvent> {
+        let wire: Event = serde_json::from_slice(data)?;
+        let (finish_reason, usage) = wire.meta_info.map_or((None, None), |meta| {
+            let completion_tokens = meta.completion_tokens.or(meta.output_tokens);
+            let finish_reason = meta.finish_reason.map(|reason| match reason {
+                FinishReason::Plain(reason) => reason,
+                FinishReason::Object { r#type } => r#type,
             });
-        let meta_info = value.get("meta_info");
-        StreamEvent {
-            // Under --skip-tokenizer-init the server never produces text.
+            let usage_present = meta.prompt_tokens.is_some()
+                || completion_tokens.is_some()
+                || meta.cached_tokens.is_some();
+            let usage = usage_present.then_some(Usage {
+                prompt_tokens: meta.prompt_tokens,
+                completion_tokens,
+                // SGLang does not report a combined total; derive it only when
+                // both halves are present rather than reporting a partial sum.
+                total_tokens: match (meta.prompt_tokens, completion_tokens) {
+                    (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
+                    _ => None,
+                },
+                cached_prompt_tokens: meta.cached_tokens,
+            });
+            (finish_reason, usage)
+        });
+        Ok(StreamEvent {
             text_delta: None,
-            token_ids,
-            finish_reason: meta_info.and_then(sglang_finish_reason),
-            usage: meta_info.and_then(sglang_usage),
-        }
+            token_ids: wire.output_ids,
+            finish_reason,
+            usage,
+        })
     }
-}
-
-/// SGLang reports `finish_reason` as an object (`{"type": "length"}`) rather
-/// than the bare string the OpenAI schema uses. Accept both.
-fn sglang_finish_reason(meta_info: &Value) -> Option<String> {
-    let reason = meta_info.get("finish_reason")?;
-    if let Some(reason) = reason.as_str() {
-        return Some(reason.to_string());
-    }
-    reason.get("type")?.as_str().map(str::to_string)
-}
-
-/// SGLang carries token accounting in `meta_info`, not in an OpenAI `usage`
-/// object. Its schema is fixed, so read the exact keys instead of searching the
-/// provider alias list [`usage_cached_prompt_tokens`] needs.
-///
-/// `meta_info` rides on every streamed chunk with running counts. The shared
-/// engine keeps the newest value for each field, so the final chunk's totals win.
-fn sglang_usage(meta_info: &Value) -> Option<Usage> {
-    let prompt_tokens = usage_usize(meta_info, "prompt_tokens");
-    let completion_tokens = usage_usize(meta_info, "completion_tokens")
-        .or_else(|| usage_usize(meta_info, "output_tokens"));
-    let cached_prompt_tokens = usage_usize(meta_info, "cached_tokens");
-    if prompt_tokens.is_none() && completion_tokens.is_none() && cached_prompt_tokens.is_none() {
-        return None;
-    }
-    Some(Usage {
-        prompt_tokens,
-        completion_tokens,
-        // SGLang does not report a combined total; derive it only when both
-        // halves are present rather than reporting a partial sum.
-        total_tokens: match (prompt_tokens, completion_tokens) {
-            (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
-            _ => None,
-        },
-        cached_prompt_tokens,
-    })
 }
 
 #[cfg(test)]
@@ -115,7 +132,7 @@ mod tests {
     fn sglang_backend_sends_input_ids_without_model_or_logprobs() {
         let backend = SglangTokensBackend;
         let payload = backend
-            .build_payload(&GenRequest {
+            .serialize_payload(&GenRequest {
                 model: "ignored-by-sglang",
                 request_id: "req-1",
                 prompt: Prompt::Tokens(&[7, 8, 9]),
@@ -124,15 +141,13 @@ mod tests {
                 stream: true,
             })
             .unwrap();
-
+        let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(backend.endpoint_suffix(), "/generate");
         assert_eq!(payload["input_ids"], serde_json::json!([7, 8, 9]));
         assert_eq!(payload["sampling_params"]["max_new_tokens"], 16);
         assert_eq!(payload["sampling_params"]["temperature"], 0.0);
         assert_eq!(payload["sampling_params"]["ignore_eos"], true);
         assert_eq!(payload["stream"], true);
-        // An SGLang server hosts one model, and output_ids is native: neither a
-        // model field nor the logprob recovery path belongs in this payload.
         assert!(payload.get("model").is_none());
         assert!(payload.get("return_logprob").is_none());
         assert!(payload.get("prompt").is_none());
@@ -140,22 +155,17 @@ mod tests {
 
     #[test]
     fn sglang_backend_normalizes_meta_info_into_usage() {
-        let backend = SglangTokensBackend;
-        let event = backend.parse_event(&serde_json::json!({
-            "output_ids": [101, 102],
-            "meta_info": {
-                "prompt_tokens": 512,
-                "completion_tokens": 2,
-                "cached_tokens": 496,
-                "finish_reason": {"type": "length"}
-            }
-        }));
-
+        let event = SglangTokensBackend
+            .parse_event(
+                br#"{"output_ids":[101,102],"meta_info":{
+            "prompt_tokens":512,"completion_tokens":2,"cached_tokens":496,
+            "finish_reason":{"type":"length"}}}"#,
+            )
+            .unwrap();
         assert_eq!(event.token_ids, Some(vec![101, 102]));
-        // Under --skip-tokenizer-init there is no text to carry.
         assert!(event.text_delta.is_none());
         assert_eq!(event.finish_reason.as_deref(), Some("length"));
-        let usage = event.usage.expect("meta_info must normalize into usage");
+        let usage = event.usage.expect("usage");
         assert_eq!(usage.prompt_tokens, Some(512));
         assert_eq!(usage.completion_tokens, Some(2));
         assert_eq!(usage.cached_prompt_tokens, Some(496));
@@ -164,12 +174,12 @@ mod tests {
 
     #[test]
     fn sglang_usage_falls_back_to_output_tokens_and_plain_finish_reason() {
-        let backend = SglangTokensBackend;
-        let event = backend.parse_event(&serde_json::json!({
-            "output_ids": [5],
-            "meta_info": {"prompt_tokens": 4, "output_tokens": 1, "finish_reason": "stop"}
-        }));
-
+        let event = SglangTokensBackend
+            .parse_event(
+                br#"{"output_ids":[5],"meta_info":{
+            "prompt_tokens":4,"output_tokens":1,"finish_reason":"stop"}}"#,
+            )
+            .unwrap();
         let usage = event.usage.expect("usage");
         assert_eq!(usage.completion_tokens, Some(1));
         assert_eq!(usage.cached_prompt_tokens, None);
@@ -178,9 +188,9 @@ mod tests {
 
     #[test]
     fn sglang_chunk_without_meta_info_reports_no_usage() {
-        let backend = SglangTokensBackend;
-        let event = backend.parse_event(&serde_json::json!({"output_ids": [1, 2]}));
-
+        let event = SglangTokensBackend
+            .parse_event(br#"{"output_ids":[1,2]}"#)
+            .unwrap();
         assert_eq!(event.token_ids, Some(vec![1, 2]));
         assert!(event.usage.is_none());
         assert!(event.finish_reason.is_none());

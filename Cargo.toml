@@ -32,8 +32,15 @@ name = "selfcheck"
 path = "src/bin/selfcheck/main.rs"
 required-features = ["runtime"]
 
+[[bin]]
+name = "loadgen_transport_bench"
+path = "src/bin/loadgen_transport_bench.rs"
+required-features = ["transport-bench"]
+
 [features]
 default = ["runtime"]
+bench-internals = ["runtime"]
+transport-bench = ["runtime", "dep:hyper"]
 
 # The replay runtime: the HTTP client, the tokenizer, the CLI, the executors.
 #
@@ -85,13 +92,32 @@ futures = { version = "0.3", optional = true }
 # which is the whole of what was needed.
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"], optional = true }
 reqwest = { version = "0.11", features = ["json", "multipart", "stream"], optional = true }
+hyper = { version = "0.14", features = ["client", "http1", "tcp"], optional = true }
 sha2 = { version = "0.10", optional = true }
 tokenizers = { version = "0.21", optional = true }
 tokio = { version = "1.36", features = ["full"], optional = true }
 # The realtime surface is a WebSocket, which reqwest does not speak.
 tokio-tungstenite = { version = "0.21", optional = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "dispatch"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "vllm_wire"
+harness = false
+required-features = ["bench-internals"]
+
 # This crate is also vendored as a submodule below larger Rust workspaces. Keep
 # it an independent workspace so Cargo never inherits the host repository's
 # members, target directory, or dependency policy.
 [workspace]
+
+[[bench]]
+name = "chat_wire"
+harness = false
+required-features = ["bench-internals"]

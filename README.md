@@ -9,6 +9,7 @@ Session chains · Asset-backed benchmarks · Exact token-ID prompts · Prefix-ca
 [Quickstart](#quickstart) ·
 [Launcher](#launcher-yaml-interface) ·
 [Architecture](ARCHITECTURE.md) ·
+[Performance](docs/LOADGEN_PERFORMANCE.md) ·
 [Adding benchmarks](docs/ADDING_BENCHMARKS.md) ·
 [Food101](docs/FOOD101.md) ·
 [中文架构](ARCHITECTURE.zh-CN.md) ·
@@ -76,8 +77,8 @@ Common `run`/`sweep` blocks are:
 | `input` | trace path, complete input-file format, declared tags |
 | `corpus` | synthetic text corpus, matching tokenizer, token-pool bound; text replay only |
 | `server` | backend, endpoint, served model, temperature |
-| `replay` | arrival mode/rate, item and concurrency caps, context/error policy |
-| `measurement` | timeline recording and optional TTFT/TPOT/E2E objective |
+| `replay` | arrival mode/rate, item/concurrency caps, runtime workers/processes, context/error policy |
+| `measurement` | request-log/timeline recording and optional TTFT/TPOT/E2E objective |
 | `output` | one artifact directory and optional stable filenames |
 | `search` | sweep-only mode, range, metric, and stopping criteria |
 
@@ -140,6 +141,8 @@ This axis has two sub-axes that compose freely — *when* a unit may start, and
 | `replay.rate: N` | Rescale all arrivals to `N` units/s, preserving relative gaps and simultaneous-arrival bursts. Needs at least two distinct arrival times |
 | `replay.max_concurrency: N` | Bound concurrently active units under either arrival mode. One session holds its slot across all rounds **and tool waits** |
 | `replay.max_items: N` | Keep the first `N` units in trace order after the complete file has been validated |
+| `replay.runtime_worker_threads: N` | Override the profiled default cap of eight Tokio workers per process |
+| `replay.processes: N` | Partition whole top-level units across `N` processes for saturated capacity tests |
 
 `--max-concurrency` bounds *workload units*, not HTTP requests in flight. There
 is deliberately no separate in-flight cap: a session is the unit a coding agent
@@ -883,6 +886,11 @@ The cap counts *top-level units*, not requests:
 
 Permits are handed out in trace order, so which unit takes a freed slot is a
 property of the trace rather than of the async runtime's scheduling that run.
+
+For saturated capacity tests beyond one process, set `replay.processes` in the
+YAML launcher. It partitions whole top-level units and keeps every shard's
+artifacts separate. See [Load-generator performance](docs/LOADGEN_PERFORMANCE.md)
+for the profiling method, scale-out contract, and request-log tradeoff.
 
 ### Rescaling the timeline: `--rate`
 

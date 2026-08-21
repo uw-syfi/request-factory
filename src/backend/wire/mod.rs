@@ -6,12 +6,12 @@ mod openai_chat;
 mod sglang;
 mod vllm;
 
-use serde_json::Value;
+use serde::Deserialize;
 
 use crate::backend::Dialect;
 use crate::cli::BackendKind;
 
-use super::Backend;
+use super::{Backend, StreamEvent, Usage};
 pub(super) use openai::OpenAiCompletionsBackend;
 pub(super) use openai_chat::OpenAiChatBackend;
 pub(super) use sglang::SglangTokensBackend;
@@ -36,30 +36,85 @@ pub(crate) fn build_backend(kind: BackendKind, dialect: &'static Dialect) -> Box
     }
 }
 
-fn usage_usize(usage: &Value, key: &str) -> Option<usize> {
-    usage
-        .get(key)?
-        .as_u64()
-        .and_then(|value| value.try_into().ok())
+#[derive(Default, Deserialize)]
+struct OpenAiEvent {
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+    usage: Option<OpenAiUsage>,
 }
 
-fn usage_cached_prompt_tokens(usage: &Value) -> Option<usize> {
-    [
-        &["prompt_tokens_details", "cached_tokens"][..],
-        &["cached_tokens"][..],
-        &["cached_input_tokens"][..],
-        &["cache_read_input_tokens"][..],
-        &["prompt_cached_tokens"][..],
-        &["num_cached_tokens"][..],
-    ]
-    .into_iter()
-    .find_map(|path| value_at_path(usage, path)?.as_u64()?.try_into().ok())
+#[derive(Default, Deserialize)]
+struct OpenAiChoice {
+    text: Option<String>,
+    token_ids: Option<Vec<u32>>,
+    finish_reason: Option<String>,
+    delta: Option<OpenAiDelta>,
 }
 
-fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
-    let mut cursor = value;
-    for key in path {
-        cursor = cursor.get(*key)?;
+#[derive(Default, Deserialize)]
+struct OpenAiDelta {
+    content: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct OpenAiUsage {
+    prompt_tokens: Option<usize>,
+    completion_tokens: Option<usize>,
+    total_tokens: Option<usize>,
+    prompt_tokens_details: Option<PromptTokenDetails>,
+    cached_tokens: Option<usize>,
+    cached_input_tokens: Option<usize>,
+    cache_read_input_tokens: Option<usize>,
+    prompt_cached_tokens: Option<usize>,
+    num_cached_tokens: Option<usize>,
+}
+
+#[derive(Default, Deserialize)]
+struct PromptTokenDetails {
+    cached_tokens: Option<usize>,
+}
+
+impl OpenAiUsage {
+    fn normalize(self) -> Usage {
+        Usage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            cached_prompt_tokens: self
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens)
+                .or(self.cached_tokens)
+                .or(self.cached_input_tokens)
+                .or(self.cache_read_input_tokens)
+                .or(self.prompt_cached_tokens)
+                .or(self.num_cached_tokens),
+        }
     }
-    Some(cursor)
+}
+
+fn parse_openai_event(
+    data: &[u8],
+    chat: bool,
+    include_text: bool,
+) -> serde_json::Result<StreamEvent> {
+    let wire: OpenAiEvent = serde_json::from_slice(data)?;
+    // OpenAI-compatible schemas can carry several choices, but this client
+    // requests one and has always normalized the first if a server sends more.
+    let choice = wire.choices.into_iter().next();
+    let (text_delta, token_ids, finish_reason) = choice.map_or((None, None, None), |choice| {
+        let text_delta = if chat {
+            choice.delta.and_then(|delta| delta.content)
+        } else if include_text {
+            choice.text
+        } else {
+            None
+        };
+        (text_delta, choice.token_ids, choice.finish_reason)
+    });
+    Ok(StreamEvent {
+        text_delta,
+        token_ids,
+        finish_reason,
+        usage: wire.usage.map(OpenAiUsage::normalize),
+    })
 }

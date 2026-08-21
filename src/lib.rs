@@ -21,6 +21,10 @@
 pub mod release;
 pub mod schema;
 
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_support;
+
 // The runtime is feature-gated so a consumer that only reads trace files -- a
 // simulator replaying the same bytes -- can take the schemas without building an
 // HTTP client, a tokenizer and an async runtime to get at them.

@@ -10,14 +10,13 @@
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 
 use crate::backend::{GenerationClient, MediaClient, RealtimeClient};
 use crate::cli::Args;
 use crate::executor::{
-    prepare_multimodal_requests, run_independent_request, run_multimodal_request, run_session,
-    status_task, AdmissionOrder, CommonState, MultimodalState, RunPolicy, Stats,
-    TextGenerationState,
+    drive_bounded, prepare_multimodal_requests, run_independent_request, run_multimodal_request,
+    run_session, status_task, CommonState, MultimodalState, RunPolicy, Stats, TextGenerationState,
 };
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
@@ -120,6 +119,9 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
     let mut workload = load_workload(&args.trace, &declaration, args.max_items)?;
     let unit_label = workload.unit_label();
     report_arrival_rate(&args, &mut workload, unit_label)?;
+    // Rescale before partitioning so --rate remains the aggregate offered rate,
+    // rather than being independently applied by every shard.
+    workload.shard(args.shard_count, args.shard_index);
 
     let replay_summary = ReplaySummary::empty_for(&workload);
     // A run reports attainment when it was given an objective *or* when the
@@ -242,24 +244,15 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
             policy: RunPolicy::from_args(&args),
             stats: Arc::new(Stats::default()),
             run_start: Instant::now(),
-            concurrency_semaphore: args
-                .max_concurrency
-                .map(|limit| Arc::new(Semaphore::new(limit))),
-            // Only under a cap, because it exists to order contention and there is
-            // none without one.
-            admission_order: args
-                .max_concurrency
-                .map(|_| Arc::new(AdmissionOrder::new(workload.unit_count()))),
         },
     });
 
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
-    let log_task = tokio::spawn(write_logs(
-        args.log_path.clone(),
-        log_rx,
-        replay_summary,
-        slo_summary,
-    ));
+    let log_path = args.log_path.clone();
+    let request_log = args.request_log;
+    let log_task = tokio::task::spawn_blocking(move || {
+        write_logs(log_path, request_log, log_rx, replay_summary, slo_summary)
+    });
     let status_handle = tokio::spawn(status_task(
         state.common.stats.clone(),
         workload.unit_count(),
@@ -268,42 +261,55 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
         state.common.run_start,
     ));
 
-    let mut join_set = tokio::task::JoinSet::new();
     match workload {
         ReplayWorkload::Sessions(sessions) => {
-            for (session_ordinal, (session_id, steps)) in sessions.into_iter().enumerate() {
-                let state_ref = state.clone();
-                let log_tx_ref = log_tx.clone();
-                let timeline_ref = timeline_sink.clone();
-                join_set.spawn(async move {
-                    run_session(
-                        state_ref,
-                        log_tx_ref,
-                        timeline_ref,
-                        session_ordinal,
-                        session_id,
-                        steps,
-                    )
-                    .await;
-                });
-            }
+            drive_bounded(
+                sessions,
+                args.max_concurrency,
+                |session_ordinal, (session_id, steps)| {
+                    let session_ordinal =
+                        global_shard_ordinal(session_ordinal, args.shard_count, args.shard_index);
+                    let state_ref = state.clone();
+                    let log_tx_ref = log_tx.clone();
+                    let timeline_ref = timeline_sink.clone();
+                    async move {
+                        run_session(
+                            state_ref,
+                            log_tx_ref,
+                            timeline_ref,
+                            session_ordinal,
+                            session_id,
+                            steps,
+                        )
+                        .await;
+                    }
+                },
+            )
+            .await;
         }
         ReplayWorkload::IndependentRequests(requests) => {
-            for (request_ordinal, request) in requests.into_iter().enumerate() {
-                let state_ref = state.clone();
-                let log_tx_ref = log_tx.clone();
-                let timeline_ref = timeline_sink.clone();
-                join_set.spawn(async move {
-                    run_independent_request(
-                        state_ref,
-                        log_tx_ref,
-                        timeline_ref,
-                        request_ordinal,
-                        request,
-                    )
-                    .await;
-                });
-            }
+            drive_bounded(
+                requests,
+                args.max_concurrency,
+                |request_ordinal, request| {
+                    let request_ordinal =
+                        global_shard_ordinal(request_ordinal, args.shard_count, args.shard_index);
+                    let state_ref = state.clone();
+                    let log_tx_ref = log_tx.clone();
+                    let timeline_ref = timeline_sink.clone();
+                    async move {
+                        run_independent_request(
+                            state_ref,
+                            log_tx_ref,
+                            timeline_ref,
+                            request_ordinal,
+                            request,
+                        )
+                        .await;
+                    }
+                },
+            )
+            .await;
         }
         ReplayWorkload::MultimodalRequests(_) => {
             unreachable!("multimodal workloads return through their own runtime branch")
@@ -312,12 +318,6 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
     // Both writers finish when their last sender is gone.
     drop(log_tx);
     drop(timeline_sink);
-
-    while let Some(result) = join_set.join_next().await {
-        if let Err(err) = result {
-            eprintln!("workload task join error: {err}");
-        }
-    }
 
     let folded = log_task.await?;
     status_handle.await?;
@@ -355,12 +355,6 @@ async fn run_multimodal(
         policy: RunPolicy::from_args(args),
         stats: Arc::new(Stats::default()),
         run_start: Instant::now(),
-        concurrency_semaphore: args
-            .max_concurrency
-            .map(|limit| Arc::new(Semaphore::new(limit))),
-        admission_order: args
-            .max_concurrency
-            .map(|_| Arc::new(AdmissionOrder::new(total_steps))),
     };
     // Media encoding is the one thing every serving system spells differently,
     // and a server that does not recognize the field answers the text alone.
@@ -403,12 +397,11 @@ async fn run_multimodal(
         (None, None)
     };
     let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
-    let log_task = tokio::spawn(write_logs(
-        args.log_path.clone(),
-        log_rx,
-        replay_summary,
-        slo_summary,
-    ));
+    let log_path = args.log_path.clone();
+    let request_log = args.request_log;
+    let log_task = tokio::task::spawn_blocking(move || {
+        write_logs(log_path, request_log, log_rx, replay_summary, slo_summary)
+    });
     let status_handle = tokio::spawn(status_task(
         state.common.stats.clone(),
         total_steps,
@@ -417,30 +410,30 @@ async fn run_multimodal(
         state.common.run_start,
     ));
 
-    let mut join_set = tokio::task::JoinSet::new();
-    for (request_ordinal, request) in prepared.into_iter().enumerate() {
-        let state_ref = state.clone();
-        let log_tx_ref = log_tx.clone();
-        let timeline_ref = timeline_sink.clone();
-        join_set.spawn(async move {
-            run_multimodal_request(
-                state_ref,
-                log_tx_ref,
-                timeline_ref,
-                request_ordinal,
-                request,
-            )
-            .await;
-        });
-    }
+    drive_bounded(
+        prepared,
+        args.max_concurrency,
+        |request_ordinal, request| {
+            let request_ordinal =
+                global_shard_ordinal(request_ordinal, args.shard_count, args.shard_index);
+            let state_ref = state.clone();
+            let log_tx_ref = log_tx.clone();
+            let timeline_ref = timeline_sink.clone();
+            async move {
+                run_multimodal_request(
+                    state_ref,
+                    log_tx_ref,
+                    timeline_ref,
+                    request_ordinal,
+                    request,
+                )
+                .await;
+            }
+        },
+    )
+    .await;
     drop(log_tx);
     drop(timeline_sink);
-    while let Some(result) = join_set.join_next().await {
-        if let Err(error) = result {
-            eprintln!("workload task join error: {error}");
-        }
-    }
-
     let folded = log_task.await?;
     status_handle.await?;
     let timeline_summary = match timeline_task {
@@ -463,6 +456,19 @@ async fn run_multimodal(
 /// Reject argument combinations that are contradictory rather than merely
 /// unusual, before anything is loaded or any request is sent.
 fn validate(args: &Args) -> Result<()> {
+    if args.shard_count == 0 {
+        return Err(anyhow!("--shard-count must be greater than 0"));
+    }
+    if args.shard_index >= args.shard_count {
+        return Err(anyhow!(
+            "--shard-index {} must be less than --shard-count {}",
+            args.shard_index,
+            args.shard_count
+        ));
+    }
+    if args.runtime_worker_threads == Some(0) {
+        return Err(anyhow!("--runtime-worker-threads must be greater than 0"));
+    }
     if args.max_concurrency == Some(0) {
         return Err(anyhow!("--max-concurrency must be greater than 0"));
     }
@@ -512,6 +518,12 @@ fn validate(args: &Args) -> Result<()> {
     Ok(())
 }
 
+fn global_shard_ordinal(local_ordinal: usize, shard_count: usize, shard_index: usize) -> usize {
+    local_ordinal
+        .saturating_mul(shard_count)
+        .saturating_add(shard_index)
+}
+
 /// Say on stderr which arrival timeline this run will actually replay, and
 /// rescale the workload when `--rate` asked for a different one.
 fn report_arrival_rate(
@@ -552,5 +564,17 @@ fn client_runtime_summary(sampled_global_queue_depth_peak: usize) -> ClientRunti
     ClientRuntimeSummary {
         tokio_worker_threads: tokio::runtime::Handle::current().metrics().num_workers(),
         sampled_global_queue_depth_peak,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::global_shard_ordinal;
+
+    #[test]
+    fn shard_local_ordinals_map_back_to_their_canonical_prompt_seeds() {
+        assert_eq!(global_shard_ordinal(0, 3, 1), 1);
+        assert_eq!(global_shard_ordinal(1, 3, 1), 4);
+        assert_eq!(global_shard_ordinal(2, 3, 1), 7);
     }
 }

@@ -24,11 +24,6 @@ pub(crate) async fn run_session(
     steps: Vec<SessionRound>,
 ) {
     wait_for_session_arrival(&state, &steps).await;
-    // Bound to this scope on purpose: the session owns its slot for every round
-    // and every tool wait below, and gives it up only when the whole
-    // conversation ends. That is the contract VibeSim's session ledger mirrors.
-    let _concurrency_permit = state.common.acquire_capacity_slot(session_ordinal).await;
-
     let token_provider = match TokenProvider::new(
         state.token_pool.clone(),
         session_ordinal.wrapping_mul(9_973),

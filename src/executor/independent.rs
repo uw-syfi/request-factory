@@ -22,7 +22,6 @@ pub(crate) async fn run_independent_request(
     request: IndependentRequest,
 ) {
     let arrival_release_lag_ms = wait_for_arrival(&state, request.arrival_time).await;
-    let _concurrency_permit = state.common.acquire_capacity_slot(request_ordinal).await;
     let mut token_provider = match TokenProvider::new(
         state.token_pool.clone(),
         request_ordinal.wrapping_mul(9_973),
