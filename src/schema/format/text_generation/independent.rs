@@ -40,15 +40,30 @@ pub struct IndependentRequest {
     pub priority: RequestPriority,
 }
 
-/// Read a native trace, checking it against what it says it is.
+/// Load every declared field for consumers that own their own request type.
+///
+/// The HTTP replay runtime intentionally narrows these rows to
+/// [`IndependentRequest`], but simulators also consume the session and
+/// speculative tags. Exposing the validated rows keeps those consumers on the
+/// same parser instead of forcing them to reimplement this format.
+pub fn load(
+    path: &str,
+    input_file_schema: &InputFileSchema,
+) -> Result<Vec<ParsedIndependentRow<TextGenerationRow>>> {
+    load_utils::load(path, input_file_schema)
+}
+
+/// Project validated rows into the narrower HTTP replay request shape.
 ///
 /// The header is verified before any row is parsed. That is the whole point of a
 /// declaration: a column nobody expected is data whose author meant something by
 /// it, and silently dropping it is how a trace and the run that replayed it stop
 /// describing the same workload.
-pub fn load(path: &str, input_file_schema: &InputFileSchema) -> Result<Vec<IndependentRequest>> {
-    let rows: Vec<ParsedIndependentRow<TextGenerationRow>> =
-        load_utils::load(path, input_file_schema)?;
+pub fn load_requests(
+    path: &str,
+    input_file_schema: &InputFileSchema,
+) -> Result<Vec<IndependentRequest>> {
+    let rows = load(path, input_file_schema)?;
     Ok(rows
         .into_iter()
         .map(|parsed| IndependentRequest {
@@ -119,6 +134,27 @@ mod tests {
         assert_eq!(requests[0].priority.priority, Some(7));
         assert!(requests[1].slo.is_empty());
         assert!(requests[1].priority.is_empty());
+    }
+
+    #[test]
+    fn load_preserves_tags_the_http_request_shape_does_not_consume() {
+        let path = write(
+            "all-tags",
+            "id,arrival_time,input_len,output_len,session_id,prefix_kv,tool_wait_after_ms,accept_rate\n\
+             req-1,0,16,4,session-a,8,25,0.75\n",
+        );
+        let input_file_schema = InputFileSchema::new(
+            InputFileFormat::TextGenerationIndependent,
+            vec![TraceTag::Session, TraceTag::Speculative],
+        )
+        .unwrap();
+
+        let rows = load(path.to_str().unwrap(), &input_file_schema).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(rows[0].session.session_id.as_deref(), Some("session-a"));
+        assert_eq!(rows[0].session.prefix_kv, Some(8));
+        assert_eq!(rows[0].speculative.accept_rate, Some(0.75));
     }
 
     #[test]

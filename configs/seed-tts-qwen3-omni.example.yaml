@@ -1,0 +1,21 @@
+input:
+  trace: ../out/seed-tts-en/requests.jsonl
+  format: multimodal-independent-v1
+
+server:
+  backend: openai-chat
+  base_url: http://127.0.0.1:8000/v1
+  model: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  temperature: 0.0
+
+replay:
+  arrival_mode: saturated
+  max_concurrency: 8
+  stream_idle_timeout_seconds: 600
+
+measurement:
+  timeline: true
+
+output:
+  directory: ../out/seed-tts-qwen3-omni-run
+  artifacts: audio

@@ -336,10 +336,12 @@ For text-generation CSV workloads, a live run:
   fabricated;
 - sends `output_len` as `max_tokens` with `ignore_eos: true`, so output length
   is the trace's, not the model's stopping point;
-- requires server-side prefix caching plus cached-prompt-token usage details,
-  and aborts on a two-request preflight if they are missing — this holds for
-  `independent` workloads too, because the accounting is what proves the
-  planned reuse actually happened.
+- requires server-side prefix caching plus cached-prompt-token usage details for
+  **session** workloads, and aborts on a two-request preflight if they are
+  missing, because the accounting is what proves the planned reuse actually
+  happened. `independent` workloads seed every unit at a distinct pool offset so
+  reuse is never planned; their hit rate is ~0 by construction, and they are not
+  gated on a feature they do not use.
 
 For `multimodal-independent-v1`, the runtime instead verifies and prepares all
 assets before the arrival clock starts, sends their original bytes as data
@@ -377,9 +379,15 @@ RESULT
   SLO           not declared
 ```
 
-Before measured requests, every live run performs a two-request prefix-cache
-preflight. vLLM must keep prefix caching enabled and expose prompt-token details
-with `--enable-prompt-tokens-details`. For native token-in/token-out, launch
+Before measured requests, a live **session** run performs a two-request
+prefix-cache preflight; an `independent` run skips it. vLLM must then keep prefix
+caching enabled and expose prompt-token details with
+`--enable-prompt-tokens-details`. The probe is 8k tokens because a server caches
+whole blocks only, and a hybrid attention/SSM model's block can be far larger
+than a typical one (1056 tokens for Qwen3.6-35B-A3B, sized so the attention page
+covers the mamba page); a probe shorter than one block can never register a hit.
+Note that vLLM disables prefix caching by default for hybrid models, calling the
+feature experimental. For native token-in/token-out, launch
 vLLM with `--tokens-only` and set:
 
 ```yaml
@@ -417,8 +425,11 @@ and use `--base-url http://127.0.0.1:8000 --backend vllm-tokens`.
 
 | Server setting | Why req-frontend needs it |
 |---|---|
-| `--enable-prefix-caching` | Enables the cache behavior audited by the mandatory two-request preflight. |
-| `--enable-prompt-tokens-details` | Returns cached-token usage needed to prove the preflight and report cache alignment. |
+| `--enable-prefix-caching` | Enables the cache behavior audited by the session-workload preflight. Off by default for hybrid models. |
+| `--enable-prompt-tokens-details` | Returns cached-token usage needed to prove the preflight and report cache alignment. Useful on `independent` runs too, as evidence the hit rate really is ~0. |
+| `--stream-interval 1` | Requests one-token streaming cadence. It does not guarantee one SSE event per token if the API process falls behind. |
+| `--api-server-count N` | Adds independent HTTP API **processes**, not threads, for request parsing and streamed-output drain. |
+| `--tokens-only` | Enables `/inference/v1/generate` and removes server-side detokenization from the native-token path. |
 
 **SGLang and `--backend openai`.** SGLang's OpenAI-compatible `/v1/completions`
 returns a usage block with no cached-token field *on any flag* — verified
@@ -426,9 +437,6 @@ against a live server by sending one prompt twice and reading the streamed
 usage. The prefix-cache preflight therefore cannot pass on that route, and it
 aborts by design rather than reporting a hit rate it cannot see. Use
 `--backend sglang-tokens`, whose `meta_info` carries `cached_tokens`.
-| `--stream-interval 1` | Requests one-token streaming cadence. It does not guarantee one SSE event per token if the API process falls behind. |
-| `--api-server-count N` | Adds independent HTTP API **processes**, not threads, for request parsing and streamed-output drain. |
-| `--tokens-only` | Enables `/inference/v1/generate` and removes server-side detokenization from the native-token path. |
 
 ### Recommended SGLang launch
 
@@ -510,7 +518,8 @@ never used to guess which schema a file is.
 
 One non-empty line is one `RequestSpec`: ordered, repeatable text/image/audio/
 video/tensor inputs and typed outputs. Optional `system` text inputs must come
-before user content and preserve the chat role on compatible backends. IDs must be unique and arrivals
+before user content and preserve the chat role on compatible backends. IDs must
+be unique and arrivals
 nondecreasing. The format is JSON Lines because nested modality data should not
 be escaped into CSV cells. See
 [Adding modality-compositional benchmarks](docs/ADDING_BENCHMARKS.md) for its
@@ -519,8 +528,8 @@ schema and extension contract.
 The live `openai-chat` adapter accepts text, image, audio, and video
 user inputs in any order and produces text, image, or audio. `openai-images`
 produces image output from text, and `openai-speech` streams raw PCM audio from
-user text while ignoring chat-only system instructions. Unsupported modalities or
-output combinations fail during preparation, before any request is sent.
+user text while ignoring chat-only system instructions. Unsupported modalities
+or output combinations fail during preparation, before any request is sent.
 
 ### Food101/BAGEL image-to-text benchmark
 
@@ -552,6 +561,54 @@ uv run python -m launcher run configs/food101.example.yaml
 
 For vLLM, point the same config at the server's OpenAI-compatible `/v1` base URL
 and use its served BAGEL model name. The request artifact does not change.
+
+### VBench/BAGEL image-generation benchmarks
+
+Materialize the exact VBench sources used by the public M* harness:
+
+```bash
+uv run python -m benchmarks vbench --task t2i \
+  --dataset-dir data/vbench --output-dir out/vbench-t2i --download
+
+uv run python -m benchmarks vbench --task i2i \
+  --dataset-dir data/vbench --output-dir out/vbench-i2i --download
+```
+
+T2I uses all 72 official subject-consistency prompts. I2I uses the official
+VBench-I2V original images and captions, hashes the original bytes, and requests
+aspect-preserving output with a 1024-pixel long edge. The I2I artifact carries
+M*'s BAGEL controls: 50 steps, `cfg_img_scale=2`,
+`cfg_renorm_type=text_channel`, and `cfg_interval=[0,1]`. See
+[VBench replay](docs/VBENCH.md) for acquisition, provenance, and the documented
+paper/source discrepancy around I2I dimensions.
+
+### Seed-TTS audio-generation benchmark
+
+Download the official Seed-TTS evaluation archive and materialize the 160
+English text-to-audio requests used by M*:
+
+```bash
+uv run --with gdown python -m benchmarks seed-tts \
+  --dataset-dir data/seedtts_testset \
+  --output-dir out/seed-tts-en \
+  --download --set en --limit 160 \
+  --arrival-rate 10 --sample-rate-hz 24000 --max-tokens 256
+```
+
+The artifact carries M*'s exact Qwen system role and target text while retaining
+the reference voice transcript and WAV hash in `labels.jsonl`. It can be
+replayed unchanged against Qwen3-Omni's streaming chat API or an
+OpenAI-compatible raw-PCM speech service:
+
+```bash
+uv run python -m launcher run configs/seed-tts-qwen3-omni.example.yaml
+uv run python -m launcher run configs/seed-tts-orpheus.example.yaml
+```
+
+The Orpheus example expects M*'s `/v1/audio/speech` service or another
+conforming wrapper; upstream Orpheus does not provide that endpoint directly.
+See [Seed-TTS replay](docs/SEED_TTS.md) for voice selection, dataset provenance,
+runtime metrics, and the load-scheduling difference from M*'s offline harness.
 
 ### Canonical execution CSV — `session-execution-v2`
 
