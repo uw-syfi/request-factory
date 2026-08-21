@@ -315,7 +315,7 @@ surface is rejected at startup rather than discovered as a 404 mid-run:
 | `/videos` | ✅ | — | ✅ | — | ✅ | ✅ |
 | `/audio/speech` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `/audio/transcriptions` | ✅ | ✅ | — | ✅ | — | — |
-| `/audio/translations` | ✅ | ✅ | — | ✅ | — | — |
+| `/audio/translations` | ✅ | ✅ | — | — | — | — |
 | `/realtime` (WebSocket) | ✅ | — | ✅¹ | ✅¹ | — | — |
 
 Adding a serving system is a `const` in `src/backend/dialect/profiles.rs` plus a

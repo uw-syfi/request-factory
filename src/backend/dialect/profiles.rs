@@ -238,7 +238,10 @@ const SGLANG_OMNI: Dialect = Dialect {
     image_edits_suffix: None,
     videos_suffix: None,
     transcriptions_suffix: Some("/audio/transcriptions"),
-    translations_suffix: Some("/audio/translations"),
+    // Current Qwen3-ASR serving documents and accepts transcription only. The
+    // nominal translations route answers 400 rather than translating to
+    // English, so do not advertise it as a usable surface.
+    translations_suffix: None,
     media_input: MediaInput::TopLevelLists,
     // Staged sampling has its own named field (`stage_sampling`); it is a model
     // knob like any other and reaches the root the same way.
@@ -474,6 +477,7 @@ mod tests {
             SGLANG_OMNI.transcriptions_suffix,
             Some("/audio/transcriptions")
         );
+        assert_eq!(SGLANG_OMNI.translations_suffix, None);
     }
 
     #[test]

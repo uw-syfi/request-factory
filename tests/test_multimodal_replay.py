@@ -604,7 +604,7 @@ def test_dynamo_video_uses_nvext_and_input_reference_end_to_end(tmp_path: Path) 
     assert all(row["steps"] == 4 for row in rows)
 
 
-def test_transcription_and_translation_surfaces_replay_against_sglang_omni(
+def test_transcription_surface_replays_against_sglang_omni(
     tmp_path: Path,
 ) -> None:
     subprocess.run(
@@ -615,28 +615,32 @@ def test_transcription_and_translation_surfaces_replay_against_sglang_omni(
     audio.write_bytes(b"RIFF" + b"\x00" * 60)
     process, port, log = _serve(tmp_path, "sglang-omni")
     try:
-        for name, backend in (
-            ("asr", "openai-transcriptions"),
-            ("translate", "openai-translations"),
-        ):
-            result = _run_surface(
-                tmp_path, port, name, backend, "sglang-omni",
-                [{"type": "audio", "asset": _asset(audio, "audio/wav")}],
-                [{"type": "text", "max_tokens": 16}],
-            )
-            assert result["success_steps"] == 2, name
-            assert result["failed_steps"] == 0, name
+        result = _run_surface(
+            tmp_path, port, "asr", "openai-transcriptions", "sglang-omni",
+            [{"type": "audio", "asset": _asset(audio, "audio/wav")}],
+            [{"type": "text", "max_tokens": 16}],
+        )
+        assert result["success_steps"] == 2
+        assert result["failed_steps"] == 0
     finally:
         process.terminate()
         process.wait(timeout=10)
 
     rows = workload_rows(log)
     assert len([r for r in rows if r["surface"] == "audio_transcriptions"]) == 2
-    assert len([r for r in rows if r["surface"] == "audio_translations"]) == 2
     assert all(row["upload_bytes"] == 64 for row in rows)
 
 
-def test_a_dialect_that_does_not_serve_a_surface_fails_before_running(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("backend", "dialect", "surface"),
+    [
+        ("openai-transcriptions", "mstar", "transcription"),
+        ("openai-translations", "sglang-omni", "translation"),
+    ],
+)
+def test_a_dialect_that_does_not_serve_a_surface_fails_before_running(
+    tmp_path: Path, backend: str, dialect: str, surface: str
+) -> None:
     """Coverage is declared, not discovered mid-run."""
     audio = tmp_path / "clip.wav"
     audio.write_bytes(b"RIFF" + b"\x00" * 60)
@@ -658,9 +662,8 @@ def test_a_dialect_that_does_not_serve_a_surface_fails_before_running(tmp_path: 
             "--trace", str(trace),
             "--input-file-format", "multimodal-independent-v1",
             "--base-url", "http://127.0.0.1:9/v1",
-            # M* exposes no ASR surface at all.
-            "--backend", "openai-transcriptions",
-            "--dialect", "mstar",
+            "--backend", backend,
+            "--dialect", dialect,
             "--model", "m",
             "--arrival-mode", "saturated",
             "--summary-path", str(tmp_path / "s.json"),
@@ -668,5 +671,5 @@ def test_a_dialect_that_does_not_serve_a_surface_fails_before_running(tmp_path: 
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=60, check=False,
     )
     assert completed.returncode != 0
-    assert "does not serve transcription" in completed.stderr
+    assert f"does not serve {surface}" in completed.stderr
     assert not (tmp_path / "s.json").exists(), "nothing should have run"
