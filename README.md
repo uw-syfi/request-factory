@@ -363,7 +363,8 @@ never used to guess which schema a file is.
 
 One non-empty line is one `RequestSpec`: ordered, repeatable text/image/audio/
 video/tensor inputs and typed outputs. Optional `system` text inputs must come
-before user content and preserve the chat role on compatible backends. IDs must be unique and arrivals
+before user content and preserve the chat role on compatible backends. IDs must
+be unique and arrivals
 nondecreasing. The format is JSON Lines because nested modality data should not
 be escaped into CSV cells. See
 [Adding modality-compositional benchmarks](docs/ADDING_BENCHMARKS.md) for its
@@ -372,8 +373,8 @@ schema and extension contract.
 The live `openai-chat` adapter accepts text, image, audio, and video
 user inputs in any order and produces text, image, or audio. `openai-images`
 produces image output from text, and `openai-speech` streams raw PCM audio from
-user text while ignoring chat-only system instructions. Unsupported modalities or
-output combinations fail during preparation, before any request is sent.
+user text while ignoring chat-only system instructions. Unsupported modalities
+or output combinations fail during preparation, before any request is sent.
 
 ### Food101/BAGEL image-to-text benchmark
 
@@ -405,6 +406,26 @@ uv run python -m launcher run configs/food101.example.yaml
 
 For vLLM, point the same config at the server's OpenAI-compatible `/v1` base URL
 and use its served BAGEL model name. The request artifact does not change.
+
+### VBench/BAGEL image-generation benchmarks
+
+Materialize the exact VBench sources used by the public M* harness:
+
+```bash
+uv run python -m benchmarks vbench --task t2i \
+  --dataset-dir data/vbench --output-dir out/vbench-t2i --download
+
+uv run python -m benchmarks vbench --task i2i \
+  --dataset-dir data/vbench --output-dir out/vbench-i2i --download
+```
+
+T2I uses all 72 official subject-consistency prompts. I2I uses the official
+VBench-I2V original images and captions, hashes the original bytes, and requests
+aspect-preserving output with a 1024-pixel long edge. The I2I artifact carries
+M*'s BAGEL controls: 50 steps, `cfg_img_scale=2`,
+`cfg_renorm_type=text_channel`, and `cfg_interval=[0,1]`. See
+[VBench replay](docs/VBENCH.md) for acquisition, provenance, and the documented
+paper/source discrepancy around I2I dimensions.
 
 ### Canonical execution CSV — `session-execution-v2`
 
