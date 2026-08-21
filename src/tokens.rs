@@ -292,6 +292,7 @@ mod tests {
             tool_wait_after_ms: 0.0,
             slo: Default::default(),
             priority: Default::default(),
+            speculative: Default::default(),
         }
     }
 
