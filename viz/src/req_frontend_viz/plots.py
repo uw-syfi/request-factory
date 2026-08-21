@@ -21,9 +21,9 @@ import matplotlib
 
 matplotlib.use("Agg")  # Written to files, never shown; a sweep runs on a server.
 
-import matplotlib.pyplot as pyplot  # noqa: E402
+from matplotlib import pyplot
 
-from .load import (  # noqa: E402
+from .load import (
     LATENCY_FIELDS,
     Series,
     Sweep,
@@ -297,9 +297,9 @@ def _save(figure: pyplot.Figure, out: Path) -> Path:
 
 
 __all__ = [
+    "Series",
     "attainment_curve",
     "latency_distributions",
     "throughput_curve",
     "token_arrivals",
-    "Series",
 ]

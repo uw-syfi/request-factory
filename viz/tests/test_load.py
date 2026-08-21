@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from req_frontend_viz.load import (
     Sweep,
     iter_point_directories,
@@ -24,17 +23,17 @@ from req_frontend_viz.load import (
 
 
 def sweep(**overrides) -> Sweep:
-    base = dict(
-        knob="rate",
-        objective="max sustainable rate",
-        config={},
-        curve=[
+    base = {
+        "knob": "rate",
+        "objective": "max sustainable rate",
+        "config": {},
+        "curve": [
             {"rate": 2.0, "request_throughput_per_s": 2.0, "slo_attainment": 1.0},
             {"rate": 8.0, "request_throughput_per_s": 6.0, "slo_attainment": None},
             {"rate": 4.0, "request_throughput_per_s": 4.0, "slo_attainment": 0.9},
         ],
-        points=[],
-    )
+        "points": [],
+    }
     base.update(overrides)
     return Sweep(**base)
 

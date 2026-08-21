@@ -4,6 +4,8 @@
 
 **Replay typed text and multimodal workloads against an inference server.**
 
+[![CI](https://github.com/uw-syfi/request-factory/actions/workflows/ci.yml/badge.svg)](https://github.com/uw-syfi/request-factory/actions/workflows/ci.yml)
+
 Session chains · Asset-backed benchmarks · Exact token-ID prompts · Prefix-cache auditing · TTFT/TPOT
 
 [Quickstart](#quickstart) ·
