@@ -69,7 +69,7 @@ uv run python -m launcher selfcheck configs/selfcheck.yaml
 
 ```text
 input       输入文件、完整 format、tags
-corpus      text corpus、tokenizer、token-pool limit
+corpus      text corpus、tokenizer、token-pool limit（仅 text replay）
 server      endpoint、backend、model、sampling
 replay      arrival、capacity、context-limit 与 failure policy
 measurement timeline 与可选 run-level SLO
@@ -201,35 +201,38 @@ type SessionPlans = Vec<(String, Vec<SessionRound>)>;
 
 ### 解析成功不等于当前 client 能执行
 
-shared schema 定义了多个 request families，因此 media format 可以被合法解析和验证；但
-当前 HTTP replay runtime 只实现了 text-generation prompt builder。`load_workload` 会在
-runtime boundary 明确拒绝“schema 合法、client 尚不支持”的 family，而不是让 schema 层
-谎称这些 format 不存在。
+shared schema 定义了多个 request families。runtime 会执行两个 text format 与
+asset-backed `multimodal-independent-v1`；只有 dimensions/token counts、没有实际 assets
+的 media CSV 仍只可解析而不可执行。`load_workload` 会在 runtime boundary 拒绝它们，
+不会凭空生成 media。
 
 ## 5. 为什么 loader 之后还有 `ReplayWorkload`
 
-两个 loader 返回不同的 Rust 类型：
+loaders 返回不同的 Rust 类型：
 
 ```text
 independent::load(...) → Vec<IndependentRequest>
 session::load(...)     → SessionPlans
+multimodal::load(...)  → Vec<RequestSpec>
 ```
 
 而 `--input-file-format` 到 runtime 才能确定，所以 `load_workload` 不能在编译时选择其中一个
-返回类型。`ReplayWorkload` 只是承载这两个可能结果的 sum type：
+返回类型。`ReplayWorkload` 只是承载这些可能结果的 sum type：
 
 ```rust
 enum ReplayWorkload {
     IndependentRequests(Vec<IndependentRequest>),
     Sessions(SessionPlans),
+    MultimodalRequests(Vec<RequestSpec>),
 }
 ```
 
 它没有重新解析 rows，也没有增加一种 schema。variant 直接拥有对应 loader 的原始输出；
 整份文件只选择一个 variant，runner 最终只进入对应 executor。
 
-这个 branch 本身无法消失，因为两种执行结构确实不同：independent requests 可以分别
-release，而 session rounds 必须按 predecessor 顺序 closed-loop 执行。若删除这个 enum，
+这个 branch 本身无法消失，因为执行结构确实不同：independent requests 可以分别
+release，multimodal requests 需要预先准备 assets，而 session rounds 必须按 predecessor
+顺序 closed-loop 执行。若删除这个 enum，
 只能把同一个 `match` 搬进 `runner.rs` 并让两条路径分别承担后续 setup，或者引入更复杂的
 trait abstraction。把 session 强行 flatten 成 independent rows 则会丢失 dependency 和
 tool-wait 语义。
@@ -256,12 +259,10 @@ request。offered rate 与 delivered step throughput 比较时必须通过
 
 ```text
 WorkloadSummary / dry-run early return
-  ↓
-load tokenizer + build/reuse synthetic token pool
+  ├─ text → tokenizer + synthetic token pool → prefix-cache preflight
+  └─ multimodal → 在 run_start 前验证/read/hash/base64 assets
   ↓
 construct GenerationClient and protocol adapter
-  ↓
-prefix-cache capability preflight
   ↓
 create AppState, concurrency gate, log channel, optional timeline channel
 ```
@@ -269,14 +270,14 @@ create AppState, concurrency gate, log channel, optional timeline channel
 `--dry-run` 在 token corpus 和网络访问前返回，因此它验证的是输入与 workload shaping，
 不是 serving endpoint。
 
-tokenizer 与 synthetic corpus 可由 `CorpusCache` 跨 sweep points 复用。backend preflight
-在正式 replay 前确认 server 能报告所需的 prefix-cache usage，避免把“没有 telemetry”
-误读成“cache hit 为零”。
+text replay 的 tokenizer 与 synthetic corpus 可由 `CorpusCache` 跨 sweep points 复用，
+backend preflight 在正式 replay 前确认 server 能报告所需的 prefix-cache usage。
+multimodal replay 没有 corpus/cache preflight；它在 arrival clock 前准备 immutable assets。
 
 ## 7. `executor/` 负责 release、dependency 与 admission
 
 runner 对每个 top-level workload unit 启动一个 task，然后按 `ReplayWorkload` variant
-进入两条执行路径。
+进入三条执行路径（text independent、text session、multimodal independent）。
 
 ### Independent request
 

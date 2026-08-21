@@ -1,5 +1,6 @@
 mod admission;
 mod independent;
+mod multimodal;
 mod session;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,6 +16,7 @@ use crate::util::reaches_context_limit;
 
 pub(crate) use admission::AdmissionOrder;
 pub(crate) use independent::run_independent_request;
+pub(crate) use multimodal::{prepare_multimodal_requests, run_multimodal_request, MultimodalState};
 pub(crate) use session::run_session;
 
 /// The four run-level decisions a workload-unit executor actually makes.

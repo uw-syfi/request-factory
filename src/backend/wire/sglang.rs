@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::super::{Backend, GenRequest, Prompt, StreamEvent, Usage};
@@ -26,13 +27,15 @@ impl Backend for SglangTokensBackend {
         "/generate"
     }
 
-    fn build_payload(&self, req: &GenRequest) -> Value {
-        let Prompt::Tokens(prompt_ids) = req.prompt;
+    fn build_payload(&self, req: &GenRequest) -> Result<Value> {
+        let Prompt::Tokens(prompt_ids) = req.prompt else {
+            bail!("sglang-tokens requires token-id prompts")
+        };
         // No `model` field: an SGLang server hosts exactly one model. No
         // `return_logprob` either — `output_ids` is a native top-level response
         // field, so recovering ids out of per-token logprobs would only add
         // compute and serialization to the path we are timing.
-        serde_json::json!({
+        Ok(serde_json::json!({
             "rid": req.request_id,
             "input_ids": prompt_ids,
             "sampling_params": {
@@ -43,7 +46,7 @@ impl Backend for SglangTokensBackend {
                 "ignore_eos": true,
             },
             "stream": req.stream,
-        })
+        }))
     }
 
     fn parse_event(&self, value: &Value) -> StreamEvent {
@@ -111,14 +114,16 @@ mod tests {
     #[test]
     fn sglang_backend_sends_input_ids_without_model_or_logprobs() {
         let backend = SglangTokensBackend;
-        let payload = backend.build_payload(&GenRequest {
-            model: "ignored-by-sglang",
-            request_id: "req-1",
-            prompt: Prompt::Tokens(&[7, 8, 9]),
-            max_tokens: 16,
-            temperature: 0.0,
-            stream: true,
-        });
+        let payload = backend
+            .build_payload(&GenRequest {
+                model: "ignored-by-sglang",
+                request_id: "req-1",
+                prompt: Prompt::Tokens(&[7, 8, 9]),
+                max_tokens: 16,
+                temperature: 0.0,
+                stream: true,
+            })
+            .unwrap();
 
         assert_eq!(backend.endpoint_suffix(), "/generate");
         assert_eq!(payload["input_ids"], serde_json::json!([7, 8, 9]));

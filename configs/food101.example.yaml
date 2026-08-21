@@ -1,0 +1,20 @@
+input:
+  trace: ../out/food101/requests.jsonl
+  format: multimodal-independent-v1
+
+server:
+  backend: openai-chat
+  base_url: http://127.0.0.1:8000/v1
+  model: ByteDance-Seed/BAGEL-7B-MoT
+  temperature: 0.0
+
+replay:
+  arrival_mode: trace-timed
+  max_concurrency: 16
+  stream_idle_timeout_seconds: 600
+
+measurement:
+  timeline: true
+
+output:
+  directory: ../out/food101-run

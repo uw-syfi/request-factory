@@ -2,6 +2,7 @@
 //! protocol, plus the accessor helpers they share for reading server usage.
 
 mod openai;
+mod openai_chat;
 mod sglang;
 mod vllm;
 
@@ -11,6 +12,7 @@ use crate::cli::BackendKind;
 
 use super::Backend;
 pub(super) use openai::OpenAiCompletionsBackend;
+pub(super) use openai_chat::OpenAiChatBackend;
 pub(super) use sglang::SglangTokensBackend;
 pub(super) use vllm::VllmTokensBackend;
 
@@ -20,6 +22,7 @@ pub(crate) fn build_backend(kind: BackendKind) -> Box<dyn Backend> {
         BackendKind::Openai => Box::new(OpenAiCompletionsBackend),
         BackendKind::VllmTokens => Box::new(VllmTokensBackend),
         BackendKind::SglangTokens => Box::new(SglangTokensBackend),
+        BackendKind::OpenaiChat => Box::new(OpenAiChatBackend),
     }
 }
 

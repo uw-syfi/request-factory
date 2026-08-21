@@ -15,8 +15,9 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::backend::GenerationClient;
 use crate::cli::Args;
 use crate::executor::{
-    run_independent_request, run_session, status_task, AdmissionOrder, CommonState, RunPolicy,
-    Stats, TextGenerationState,
+    prepare_multimodal_requests, run_independent_request, run_multimodal_request, run_session,
+    status_task, AdmissionOrder, CommonState, MultimodalState, RunPolicy, Stats,
+    TextGenerationState,
 };
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
@@ -141,6 +142,20 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
         return Ok(summary);
     }
 
+    let workload = match workload {
+        ReplayWorkload::MultimodalRequests(requests) => {
+            return run_multimodal(
+                &args,
+                requests,
+                workload_summary,
+                replay_summary,
+                slo_summary,
+            )
+            .await;
+        }
+        text_workload => text_workload,
+    };
+
     // Size the synthetic token pool to the workload by default: it must exceed the longest
     // prompt so no single request repeats content, and stay larger than the session count so
     // per-session seed offsets stay distinct (otherwise distant sessions draw identical content
@@ -154,8 +169,15 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
             .max(workload.unit_count())
             .max(MIN_TOKEN_POOL)
     });
-    let (tokenizer, token_pool) =
-        corpus.get_or_build(&args.tokenizer, &args.text_file, pool_limit)?;
+    let tokenizer_path = args
+        .tokenizer
+        .as_deref()
+        .ok_or_else(|| anyhow!("--tokenizer is required for text-generation formats"))?;
+    let text_file = args
+        .text_file
+        .as_deref()
+        .ok_or_else(|| anyhow!("--text-file is required for text-generation formats"))?;
+    let (tokenizer, token_pool) = corpus.get_or_build(tokenizer_path, text_file, pool_limit)?;
     if token_pool.len() < workload_summary.max_prompt_len() {
         eprintln!(
             "warning: token pool ({} tokens) is smaller than the longest prompt ({} tokens); \
@@ -283,6 +305,9 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
                 });
             }
         }
+        ReplayWorkload::MultimodalRequests(_) => {
+            unreachable!("multimodal workloads return through their own runtime branch")
+        }
     }
     // Both writers finish when their last sender is gone.
     drop(log_tx);
@@ -313,6 +338,103 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
     Ok(summary)
 }
 
+async fn run_multimodal(
+    args: &Args,
+    requests: Vec<crate::schema::RequestSpec>,
+    workload_summary: WorkloadSummary,
+    replay_summary: ReplaySummary,
+    slo_summary: Option<SloSummary>,
+) -> Result<RunSummary> {
+    // All reads, hashes, MIME inference, and base64 encoding happen before the
+    // run clock starts, so request timing contains transport/server work rather
+    // than benchmark setup.
+    let prepared = prepare_multimodal_requests(&args.trace, requests)?;
+    let total_steps = prepared.len();
+    let common = CommonState {
+        policy: RunPolicy::from_args(args),
+        stats: Arc::new(Stats::default()),
+        run_start: Instant::now(),
+        concurrency_semaphore: args
+            .max_concurrency
+            .map(|limit| Arc::new(Semaphore::new(limit))),
+        admission_order: args
+            .max_concurrency
+            .map(|_| Arc::new(AdmissionOrder::new(total_steps))),
+    };
+    let state = Arc::new(MultimodalState {
+        common,
+        client: Arc::new(GenerationClient::new_chat(args)?),
+    });
+
+    const TIMELINE_QUEUE_REQUESTS: usize = 4_096;
+    let (timeline_sink, timeline_task) = if args.timeline {
+        let (sink, receiver) = timeline::channel(TIMELINE_QUEUE_REQUESTS);
+        let dropped = sink.dropped_handle();
+        let path = args.timeline_path.clone();
+        let task =
+            tokio::task::spawn_blocking(move || timeline::write_timeline(path, receiver, dropped));
+        (Some(sink), Some(task))
+    } else {
+        (None, None)
+    };
+    let (log_tx, log_rx) = mpsc::channel::<StepLog>(100_000);
+    let log_task = tokio::spawn(write_logs(
+        args.log_path.clone(),
+        log_rx,
+        replay_summary,
+        slo_summary,
+    ));
+    let status_handle = tokio::spawn(status_task(
+        state.common.stats.clone(),
+        total_steps,
+        total_steps,
+        "requests",
+        state.common.run_start,
+    ));
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for (request_ordinal, request) in prepared.into_iter().enumerate() {
+        let state_ref = state.clone();
+        let log_tx_ref = log_tx.clone();
+        let timeline_ref = timeline_sink.clone();
+        join_set.spawn(async move {
+            run_multimodal_request(
+                state_ref,
+                log_tx_ref,
+                timeline_ref,
+                request_ordinal,
+                request,
+            )
+            .await;
+        });
+    }
+    drop(log_tx);
+    drop(timeline_sink);
+    while let Some(result) = join_set.join_next().await {
+        if let Err(error) = result {
+            eprintln!("workload task join error: {error}");
+        }
+    }
+
+    let folded = log_task.await?;
+    status_handle.await?;
+    let timeline_summary = match timeline_task {
+        Some(task) => task.await?,
+        None => TimelineSummary::default(),
+    };
+    let summary = RunSummary {
+        workload: workload_summary,
+        replay: folded.replay,
+        client_runtime: client_runtime_summary(
+            state.common.stats.runtime_global_queue_depth_peak(),
+        ),
+        timeline: timeline_summary,
+        slo: folded.slo,
+    };
+    write_summary_if_requested(args.summary_path.as_deref(), &summary)?;
+    Ok(summary)
+}
+
 /// Reject argument combinations that are contradictory rather than merely
 /// unusual, before anything is loaded or any request is sent.
 fn validate(args: &Args) -> Result<()> {
@@ -328,6 +450,23 @@ fn validate(args: &Args) -> Result<()> {
     if args.skip_when_reaching_limit && args.max_model_len.is_none() {
         return Err(anyhow!(
             "--skip-when-reaching-limit requires --max-model-len"
+        ));
+    }
+    let format = InputFileFormat::parse(&args.input_file_format)?;
+    if format == InputFileFormat::MultimodalIndependentV1 {
+        if args.backend != crate::cli::BackendKind::OpenaiChat {
+            return Err(anyhow!(
+                "multimodal-independent-v1 requires --backend openai-chat"
+            ));
+        }
+        if args.max_model_len.is_some() || args.skip_when_reaching_limit {
+            return Err(anyhow!(
+                "context-token guards are text-replay-only and cannot be used with multimodal-independent-v1"
+            ));
+        }
+    } else if args.backend == crate::cli::BackendKind::OpenaiChat {
+        return Err(anyhow!(
+            "--backend openai-chat requires multimodal-independent-v1"
         ));
     }
     Ok(())

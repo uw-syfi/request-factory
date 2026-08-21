@@ -12,6 +12,8 @@ pub enum BackendKind {
     VllmTokens,
     /// SGLang native token-in/token-out `/generate` endpoint.
     SglangTokens,
+    /// OpenAI-compatible `/chat/completions` with interleaved text/media input.
+    OpenaiChat,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -46,11 +48,11 @@ pub struct Args {
 
     /// Text corpus used to build synthetic prompt/input/output token pools.
     #[arg(long)]
-    pub text_file: String,
+    pub text_file: Option<String>,
 
     /// tokenizer.json path or a model directory containing tokenizer.json.
     #[arg(long)]
-    pub tokenizer: String,
+    pub tokenizer: Option<String>,
 
     /// Protocol base URL. Use http://host:port/v1 for openai and
     /// http://host:port for the native token endpoints.

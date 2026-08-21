@@ -139,7 +139,7 @@ fn reset_endpoint(args: &Args) -> Option<String> {
         // SGLang has `/flush_cache`, but it is not the same operation on every
         // version and a wrong guess would report a reset that did not happen.
         // Saying "unsupported" is the honest state until it is verified.
-        req_frontend::BackendKind::SglangTokens => None,
+        req_frontend::BackendKind::SglangTokens | req_frontend::BackendKind::OpenaiChat => None,
     }
 }
 

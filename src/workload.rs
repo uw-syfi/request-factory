@@ -11,12 +11,14 @@ use serde::Serialize;
 use crate::schema::format::text_generation::independent::{self, IndependentRequest};
 use crate::schema::format::text_generation::session::{self, SessionPlans};
 use crate::schema::{InputFileFormat, InputFileSchema, RequestFamily, TraceTag};
+use crate::schema::{Modality, OutputSpec, RequestSpec};
 use crate::util::reaches_context_limit;
 
 /// Typed replay plans produced by the format loaders.
 pub(crate) enum ReplayWorkload {
     Sessions(SessionPlans),
     IndependentRequests(Vec<IndependentRequest>),
+    MultimodalRequests(Vec<RequestSpec>),
 }
 
 /// The result of rescaling trace arrival offsets to a requested workload-unit rate.
@@ -44,6 +46,9 @@ pub(crate) fn load_workload(
         InputFileFormat::TextGenerationSessionExecutionV2 => {
             ReplayWorkload::Sessions(session::load(path, input_file_schema)?)
         }
+        InputFileFormat::MultimodalIndependentV1 => ReplayWorkload::MultimodalRequests(
+            crate::schema::format::multimodal_independent::load(path)?,
+        ),
         unsupported => bail!(
             "input file format {:?} is valid, but this HTTP client has no request builder for {:?}",
             unsupported.name(),
@@ -56,7 +61,9 @@ pub(crate) fn load_workload(
 
 /// Refuse valid input declarations that this HTTP replay client cannot execute.
 fn reject_unsupported_replay(input_file_schema: &InputFileSchema) -> Result<()> {
-    if input_file_schema.request_family() != RequestFamily::TextGeneration {
+    if input_file_schema.request_family() != RequestFamily::TextGeneration
+        && input_file_schema.input_file_format != InputFileFormat::MultimodalIndependentV1
+    {
         bail!(
             "request family {:?} is defined by the shared input schema, but this client can only \
              submit text generation: no media prompt builder exists yet",
@@ -80,6 +87,7 @@ impl ReplayWorkload {
         match self {
             Self::Sessions(sessions) => sessions.truncate(max_items),
             Self::IndependentRequests(requests) => requests.truncate(max_items),
+            Self::MultimodalRequests(requests) => requests.truncate(max_items),
         }
     }
 
@@ -87,13 +95,14 @@ impl ReplayWorkload {
         match self {
             Self::Sessions(sessions) => sessions.len(),
             Self::IndependentRequests(requests) => requests.len(),
+            Self::MultimodalRequests(requests) => requests.len(),
         }
     }
 
     pub(crate) fn unit_label(&self) -> &'static str {
         match self {
             Self::Sessions(_) => "sessions",
-            Self::IndependentRequests(_) => "requests",
+            Self::IndependentRequests(_) | Self::MultimodalRequests(_) => "requests",
         }
     }
 
@@ -107,6 +116,9 @@ impl ReplayWorkload {
             ),
             Self::IndependentRequests(requests) => {
                 arrival_rate(requests.iter().map(|request| request.arrival_time))
+            }
+            Self::MultimodalRequests(requests) => {
+                arrival_rate(requests.iter().map(|request| request.arrival_time_ms))
             }
         }
     }
@@ -133,6 +145,11 @@ impl ReplayWorkload {
             Self::IndependentRequests(requests) => {
                 for request in requests {
                     request.arrival_time *= time_scale;
+                }
+            }
+            Self::MultimodalRequests(requests) => {
+                for request in requests {
+                    request.arrival_time_ms *= time_scale;
                 }
             }
         }
@@ -183,6 +200,7 @@ fn validate_target_rate(target_rate: f64) -> Result<()> {
 pub(crate) enum WorkloadSummary {
     Sessions(SessionWorkloadSummary),
     IndependentRequests(IndependentRequestSummary),
+    MultimodalRequests(MultimodalRequestSummary),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +231,17 @@ pub(crate) struct IndependentRequestSummary {
     max_arrival_time_ms: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MultimodalRequestSummary {
+    requests: usize,
+    assets: usize,
+    input_parts_by_modality: std::collections::BTreeMap<String, usize>,
+    output_specs_by_modality: std::collections::BTreeMap<String, usize>,
+    max_text_output_tokens: usize,
+    total_text_output_tokens: usize,
+    max_arrival_time_ms: f64,
+}
+
 impl WorkloadSummary {
     pub(crate) fn from_workload(workload: &ReplayWorkload, max_model_len: Option<usize>) -> Self {
         match workload {
@@ -222,6 +251,9 @@ impl WorkloadSummary {
             ReplayWorkload::IndependentRequests(requests) => Self::IndependentRequests(
                 IndependentRequestSummary::from_requests(requests, max_model_len),
             ),
+            ReplayWorkload::MultimodalRequests(requests) => {
+                Self::MultimodalRequests(MultimodalRequestSummary::from_requests(requests))
+            }
         }
     }
 
@@ -229,6 +261,7 @@ impl WorkloadSummary {
         match self {
             Self::Sessions(summary) => summary.rounds,
             Self::IndependentRequests(summary) => summary.requests,
+            Self::MultimodalRequests(summary) => summary.requests,
         }
     }
 
@@ -236,6 +269,7 @@ impl WorkloadSummary {
         match self {
             Self::Sessions(summary) => summary.max_prompt_len,
             Self::IndependentRequests(summary) => summary.max_input_len,
+            Self::MultimodalRequests(_) => 0,
         }
     }
 
@@ -262,6 +296,7 @@ impl WorkloadSummary {
         match self {
             Self::Sessions(summary) => summary.sessions,
             Self::IndependentRequests(summary) => summary.requests,
+            Self::MultimodalRequests(summary) => summary.requests,
         }
     }
 
@@ -289,7 +324,67 @@ impl WorkloadSummary {
         match self {
             Self::Sessions(summary) => summary.print(),
             Self::IndependentRequests(summary) => summary.print(),
+            Self::MultimodalRequests(summary) => summary.print(),
         }
+    }
+}
+
+impl MultimodalRequestSummary {
+    fn from_requests(requests: &[RequestSpec]) -> Self {
+        let mut summary = Self {
+            requests: requests.len(),
+            assets: 0,
+            input_parts_by_modality: Default::default(),
+            output_specs_by_modality: Default::default(),
+            max_text_output_tokens: 0,
+            total_text_output_tokens: 0,
+            max_arrival_time_ms: 0.0,
+        };
+        for request in requests {
+            summary.assets += request.assets().count();
+            summary.max_arrival_time_ms = summary.max_arrival_time_ms.max(request.arrival_time_ms);
+            for input in &request.inputs {
+                *summary
+                    .input_parts_by_modality
+                    .entry(modality_name(input.modality()).into())
+                    .or_default() += 1;
+            }
+            for output in &request.outputs {
+                *summary
+                    .output_specs_by_modality
+                    .entry(modality_name(output.modality()).into())
+                    .or_default() += 1;
+                if let OutputSpec::Text { max_tokens } = output {
+                    summary.max_text_output_tokens =
+                        summary.max_text_output_tokens.max(*max_tokens);
+                    summary.total_text_output_tokens += max_tokens;
+                }
+            }
+        }
+        summary
+    }
+
+    fn print(&self) {
+        eprintln!(
+            "multimodal workload | requests={} assets={} inputs={:?} outputs={:?} max_text_output_tokens={} total_text_output_tokens={} max_arrival_time_ms={:.3}",
+            self.requests,
+            self.assets,
+            self.input_parts_by_modality,
+            self.output_specs_by_modality,
+            self.max_text_output_tokens,
+            self.total_text_output_tokens,
+            self.max_arrival_time_ms,
+        );
+    }
+}
+
+fn modality_name(modality: Modality) -> &'static str {
+    match modality {
+        Modality::Text => "text",
+        Modality::Image => "image",
+        Modality::Audio => "audio",
+        Modality::Video => "video",
+        Modality::Tensor => "tensor",
     }
 }
 

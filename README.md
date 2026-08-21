@@ -2,18 +2,19 @@
 
 <h1>req-frontend</h1>
 
-**Replay real coding-agent workload shapes against an inference server.**
+**Replay typed text and multimodal workloads against an inference server.**
 
-Session chains · Independent requests · Exact token-ID prompts · Prefix-cache auditing · TTFT/TPOT
+Session chains · Asset-backed benchmarks · Exact token-ID prompts · Prefix-cache auditing · TTFT/TPOT
 
 [Quickstart](#quickstart) ·
 [Launcher](#launcher-yaml-interface) ·
 [Architecture](ARCHITECTURE.md) ·
 [Adding benchmarks](docs/ADDING_BENCHMARKS.md) ·
+[Food101](docs/FOOD101.md) ·
 [中文架构](ARCHITECTURE.zh-CN.md) ·
 [Engine setup](#engine-side-setup-guide) ·
 [Configuration axes](#configuration-axes) ·
-[CSV formats](#input-csv-formats) ·
+[Input formats](#input-artifact-formats) ·
 [Backends](#request-backends) ·
 [Metrics](#metrics) ·
 [YAML reference](#launcher-yaml-interface) ·
@@ -25,11 +26,12 @@ Session chains · Independent requests · Exact token-ID prompts · Prefix-cache
 
 ## What this runner does
 
-`session_runner` converts a typed CSV workload into streaming generation
-requests. It preserves the trace's request lengths, release timing, session
-ordering, and tool waits while replacing private prompt contents with synthetic
-token IDs from a user-supplied text corpus. This runner reproduces workload
-shape, not original private text or model answers.
+`session_runner` converts a typed CSV or canonical multimodal JSONL workload
+into streaming generation requests. Text traces preserve request lengths,
+release timing, session ordering, and tool waits while replacing private prompt
+contents with synthetic token IDs. Asset-backed benchmarks preserve real input
+media and prompts, verify their hashes, and delegate model preprocessing to the
+system under test.
 
 It reads a trace; it does not collect one. The public coding-agent corpus these
 traces are usually derived from lives in [TraceLab][tracelab], which exports raw
@@ -72,7 +74,7 @@ Common `run`/`sweep` blocks are:
 | Block | Owns |
 |---|---|
 | `input` | trace path, complete input-file format, declared tags |
-| `corpus` | synthetic text corpus, matching tokenizer, token-pool bound |
+| `corpus` | synthetic text corpus, matching tokenizer, token-pool bound; text replay only |
 | `server` | backend, endpoint, served model, temperature |
 | `replay` | arrival mode/rate, item and concurrency caps, context/error policy |
 | `measurement` | timeline recording and optional TTFT/TPOT/E2E objective |
@@ -81,7 +83,8 @@ Common `run`/`sweep` blocks are:
 
 `tracegen` instead uses `generator.type: synthetic` or `coding-session` plus
 generator-specific fields. `selfcheck` uses `tokenizer`, `checks`, and `output`.
-See the four files under `configs/` for complete, commented shapes.
+See the files under `configs/` for complete, commented shapes, including the
+asset-backed Food101 example.
 
 Use launcher `--dry-run` to validate and print the resolved internal command
 without building or executing. Set `replay.dry_run: true` in a `run` YAML to
@@ -97,7 +100,7 @@ per axis.
 |---|---|---|---|
 | 1 | **Input-file format** — request family, row schema, and topology | `input.format` | Complete names such as `text-generation-session-execution-v2` |
 | 2 | **Arrival and load control** — when top-level units are released, how many run at once | `replay.*`, CSV `arrival_time` | `trace-timed` (default) or `saturated`, each with an optional cap |
-| 3 | **Wire backend** — endpoint and output representation | `server.backend` | `openai` (default), `vllm-tokens`, `sglang-tokens` |
+| 3 | **Wire backend** — endpoint and output representation | `server.backend` | `openai` (default), `openai-chat`, `vllm-tokens`, `sglang-tokens` |
 
 The prefix/append split a session round replays is **not** an axis of a run. It
 is resolved once, when the canonical trace is generated, and recorded in that
@@ -106,7 +109,7 @@ file's manifest — see
 
 ### Axis 1 — input-file format
 
-Two typed frontends with separate schemas. An independent request is never
+Three typed frontends with separate schemas. An independent request is never
 rewritten into a session row with placeholder fields, and a session round is
 never flattened into a standalone one.
 
@@ -114,6 +117,7 @@ never flattened into a standalone one.
 |---|---|---|
 | `text-generation-session-execution-v2` | One **already-materialized** text-generation round | Rounds are closed-loop: submit round `i`, await its response, wait `tool_wait_after_ms`, then submit round `i + 1` |
 | `text-generation-independent` | One standalone text-generation request | Each row releases independently |
+| `multimodal-independent-v1` | One canonical JSON object with ordered text/media inputs and typed outputs | Each request releases independently; currently executed by `openai-chat` when the output is text |
 
 `text-generation-session-execution-v2` reads a canonical file whose `prefix_len` is
 guaranteed to exist by the time the round runs, so the runtime has nothing left
@@ -159,9 +163,12 @@ workload shape.
 | `openai` | `POST {base_url}/completions` | Text plus vLLM's optional `return_token_ids` extension |
 | `vllm-tokens` | `POST {base_url}/inference/v1/generate` | Native token-ID deltas; server must run with `--tokens-only` |
 | `sglang-tokens` | `POST {base_url}/generate` | Native `output_ids` deltas; server must run with `--skip-tokenizer-init` and `--stream-output` |
+| `openai-chat` | `POST {base_url}/chat/completions` | Interleaved text/image/audio/video input and streamed text output |
 
-All three send the prompt as token IDs; they differ only in whether the server
-detokenizes. See [Request backends](#request-backends) for the comparison.
+The first three are exact token-ID text-replay transports. `openai-chat` is the
+asset-backed multimodal transport and intentionally delegates media
+preprocessing/tokenization to the system under test. See
+[Request backends](#request-backends) for the comparison.
 
 Each native token endpoint additionally requires its own server launch flags,
 listed with the backend in [Request backends](#request-backends). Those are
@@ -172,7 +179,7 @@ both live inside axis 2.
 
 ### Always on, not configurable
 
-Independent of every axis above, a live run:
+For text-generation CSV workloads, a live run:
 
 - sends prompts as explicit token-ID arrays built from `corpus.text_file`, with a
   distinct pool offset per workload unit so cross-unit prefix sharing is never
@@ -185,6 +192,10 @@ Independent of every axis above, a live run:
   happened. `independent` workloads seed every unit at a distinct pool offset so
   reuse is never planned; their hit rate is ~0 by construction, and they are not
   gated on a feature they do not use.
+
+For `multimodal-independent-v1`, the runtime instead verifies and prepares all
+assets before the arrival clock starts, sends their original bytes as data
+URLs, and does not run the text-only prefix-cache preflight.
 
 For what is deliberately *not* implemented, see [Current scope](#current-scope).
 
@@ -338,13 +349,57 @@ multi-API path. Before measuring, also confirm that the req-frontend prefix-cach
 preflight passes and that the server reports the intended model, TP/DP layout,
 prefix caching, token mode, and `stream_interval`.
 
-## Input CSV formats
+## Input artifact formats
 
 Select the complete parser explicitly with
 `--input-file-format text-generation-session-execution-v2` or
 `--input-file-format text-generation-independent`. The schemas are intentionally separate: independent requests are
 not converted into fake session rows with placeholder fields, and a header is
 never used to guess which schema a file is.
+
+### Canonical multimodal JSONL — `multimodal-independent-v1`
+
+One non-empty line is one `RequestSpec`: ordered, repeatable text/image/audio/
+video/tensor inputs and typed outputs. IDs must be unique and arrivals
+nondecreasing. The format is JSON Lines because nested modality data should not
+be escaped into CSV cells. See
+[Adding modality-compositional benchmarks](docs/ADDING_BENCHMARKS.md) for its
+schema and extension contract.
+
+The live `openai-chat` adapter currently accepts text, image, audio, and video
+inputs in any order and produces one text output. Unsupported modalities or
+output combinations fail during preparation, before any request is sent.
+
+### Food101/BAGEL image-to-text benchmark
+
+Download the official Food-101 archive and deterministically materialize a
+performance workload with one command:
+
+```bash
+uv run python -m benchmarks food101 \
+  --dataset-dir data/food-101 \
+  --output-dir out/food101 \
+  --download --split test --limit 1000 --seed 0 \
+  --arrival-rate 10 --max-tokens 64
+```
+
+This writes `requests.jsonl`, `labels.jsonl`, and `manifest.json`. The manifest
+records the official source URL, archive/split/artifact hashes, selection seed,
+prompt, and load parameters. Source images are referenced and hashed without
+resize or re-encoding; BAGEL/vLLM owns image preprocessing. `labels.jsonl` is
+kept for a future quality evaluator, but the current replay measures serving
+performance rather than classification accuracy.
+
+To validate the entire client path without a GPU, start the CPU mock and run the
+example config:
+
+```bash
+uv run python tools/mock_multimodal_server.py --port 8000
+uv run python -m launcher run configs/food101.example.yaml
+```
+
+For vLLM, point the same config at the server's OpenAI-compatible `/v1` base URL
+and use its served BAGEL model name. The request artifact does not change.
 
 ### Canonical execution CSV — `session-execution-v2`
 
@@ -579,8 +634,8 @@ complete format declares them, including the canonical one:
 ```
 
 Selecting a format or tag this client cannot execute is refused by name rather
-than half-attempted: a media format (no prompt builder exists yet, so replaying one
-would mean inventing content the trace never described), the `speculative` tag
+than half-attempted: shape-only media CSV formats (they carry dimensions but no
+assets, so replaying one would mean inventing content), the `speculative` tag
 (an acceptance rate is a simulation input; against a real server it is measured,
 not imposed), and the `session` tag on an independent format (multi-round replay
 uses the canonical text session format). The taxonomy is shared with a simulator that has more of it
@@ -638,7 +693,7 @@ Every flag, including the ones outside this axis, is listed in the
 
 ## Request backends
 
-All three backends submit the prompt as explicit token IDs, so they are
+The three text-completion backends submit the prompt as explicit token IDs, so they are
 **identical on the input side**: the server's prefix-cache keys are the exact
 ids req-frontend constructed. They differ only in what comes back, and the
 difference is not whether generated token IDs are available — they are, on all
@@ -649,6 +704,7 @@ three — but whether the server performs detokenization at all.
 | `openai` | `POST {base_url}/completions` | Token-ID array | Text, plus echoed IDs via `return_token_ids` | **Yes** (output side) |
 | `vllm-tokens` | `POST {base_url}/inference/v1/generate` | `token_ids` | Token-ID deltas | No |
 | `sglang-tokens` | `POST {base_url}/generate` | `input_ids` | `output_ids` deltas | No |
+| `openai-chat` | `POST {base_url}/chat/completions` | Ordered text and verified media data URLs | Text deltas plus usage | Model-specific media preprocessing |
 
 So `openai` is **token-in, but not token-out**: the server still decodes, and
 the echoed IDs ride alongside the text rather than replacing it. In vLLM only
@@ -660,6 +716,12 @@ completions path never sets it.
 Pick accordingly: `vllm-tokens` and `sglang-tokens` are the two comparable
 high-fidelity paths, and `openai` is the portable fallback whose TTFT/TPOT
 include decode cost.
+
+`openai-chat` is selected only with `multimodal-independent-v1`. It preserves
+input order, supports repeated media, and sends original asset bytes after
+SHA-256 verification. Asset reads, hashing, MIME inference, and base64 encoding
+finish before `run_start`; measured latency begins when the request enters the
+shared HTTP streaming client.
 
 ### OpenAI-compatible completions
 
@@ -1440,19 +1502,19 @@ binary. The axis columns map back to [Configuration axes](#configuration-axes).
 
 | Flag | Value | Notes |
 |---|---|---|
-| `--trace` | Path | Source CSV, interpreted by `--input-file-format` |
-| `--text-file` | Path | Synthetic token corpus. Required even for `--dry-run`, which never opens it |
-| `--tokenizer` | Path or HF repo id | `tokenizer.json`, a directory containing one, or a repo id to download. Must match the served model |
+| `--trace` | Path | Source CSV or canonical JSONL, interpreted by `--input-file-format` |
+| `--text-file` | Path | Synthetic token corpus. Required for live text replay; omitted for multimodal replay and never opened by `--dry-run` |
+| `--tokenizer` | Path or HF repo id | Required for live text replay; omitted for multimodal replay |
 | `--model` | String | Model name placed in the request payload. Accepted but unused by `sglang-tokens`, whose server hosts one model and takes no model field |
 
 ### Axis selection
 
 | Flag | Default | Values |
 |---|---|---|
-| `--input-file-format` | `text-generation-session-execution-v2` | Complete family-specific format. The HTTP client currently executes the two `text-generation-*` formats |
+| `--input-file-format` | `text-generation-session-execution-v2` | Complete family-specific format. The client executes the two `text-generation-*` formats plus `multimodal-independent-v1` |
 | `--trace-tags` | none | Comma-separated. `slo` adds TTFT/TPOT/E2E bounds; `priority` adds scheduling priority |
-| `--backend` | `openai` | `openai`, `vllm-tokens`, `sglang-tokens` — axis 3 |
-| `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for `openai`, omit it for the native token endpoints |
+| `--backend` | `openai` | `openai`, `openai-chat`, `vllm-tokens`, `sglang-tokens` — axis 3 |
+| `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for OpenAI-compatible backends, omit it for native token endpoints |
 
 ### Load control (axis 2)
 
@@ -1602,7 +1664,8 @@ metrics described above.
 
 Not currently provided:
 
-- an OpenAI Chat Completions backend;
+- multimodal generated outputs on a concrete server backend (the schema already represents them);
+- Food101 accuracy scoring (the materializer emits labels, while replay reports performance);
 - raw private prompt/tool-result reconstruction;
 - per-token timestamp dumps;
 - TTFT/TPOT SLO pass/fail policy;

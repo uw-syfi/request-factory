@@ -49,17 +49,18 @@ pub(crate) async fn run_session(
             derived_append_len,
             prefix_shortfall_len,
         } = prompt_builder.build_prompt(&step);
+        let prompt_len = prompt_ids.len();
         let prompt = Prompt::Tokens(&prompt_ids);
         let request_id = step.request_id.clone();
         state.common.stats.record_submit();
         let context_limit_skipped = state
             .common
             .policy
-            .skips_at_context_limit(prompt.token_len(), step.output_len);
+            .skips_at_context_limit(prompt_len, step.output_len);
         let result = if context_limit_skipped {
             context_limit_skip_result(
                 request_id,
-                prompt.token_len(),
+                prompt_len,
                 step.output_len,
                 state.common.policy.max_model_len(),
             )
@@ -82,7 +83,7 @@ pub(crate) async fn run_session(
         }
         let log = StepLog::session_round(
             &step,
-            prompt.token_len(),
+            prompt_len,
             derived_prefix_len,
             derived_append_len,
             prefix_shortfall_len,

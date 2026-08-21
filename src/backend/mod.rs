@@ -13,9 +13,11 @@ mod preflight;
 mod stream;
 mod wire;
 
+use anyhow::Result;
 use serde_json::Value;
 
 use crate::record::GenerationOutcome;
+use crate::schema::Modality;
 use crate::timeline::TimelineEvent;
 use crate::util::unix_seconds_now;
 
@@ -37,14 +39,17 @@ pub(crate) enum Prompt<'a> {
     /// Token ids built by the caller and sent verbatim, so the server's
     /// prefix-cache keys match the exact ids the workload planned.
     Tokens(&'a [u32]),
+    /// Interleaved content already resolved and encoded before replay starts.
+    Parts(&'a [PreparedInputPart]),
 }
 
-impl Prompt<'_> {
-    /// Tokens the server will charge as this prompt's length.
-    pub(crate) fn token_len(&self) -> usize {
-        let Self::Tokens(prompt_ids) = self;
-        prompt_ids.len()
-    }
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedInputPart {
+    Text(String),
+    Media {
+        modality: Modality,
+        data_url: String,
+    },
 }
 
 /// Normalized, backend-agnostic description of one generation request.
@@ -85,7 +90,7 @@ pub(crate) trait Backend: Send + Sync {
     /// Path appended to `--base-url` to form the request endpoint.
     fn endpoint_suffix(&self) -> &str;
     /// Shape one generation request into this backend's request body.
-    fn build_payload(&self, req: &GenRequest) -> Value;
+    fn build_payload(&self, req: &GenRequest) -> Result<Value>;
     /// Normalize one response JSON object (a stream chunk or a full body).
     fn parse_event(&self, value: &Value) -> StreamEvent;
 }
@@ -140,6 +145,42 @@ pub(crate) fn context_limit_skip_result(
                 output_len_target,
                 limit,
             )),
+        },
+        output_ids: Vec::new(),
+        timeline: Vec::new(),
+    }
+}
+
+pub(crate) fn request_build_failure_result(
+    request_id: String,
+    error: impl std::fmt::Display,
+) -> GenerationResult {
+    let now = unix_seconds_now();
+    GenerationResult {
+        outcome: GenerationOutcome {
+            request_id,
+            output_len_actual: 0,
+            output_len_text_tokens: 0,
+            echoed_prompt_tokens: 0,
+            server_usage: None,
+            finish_reason: None,
+            submit_timestamp: now,
+            post_timestamp: None,
+            complete_timestamp: now,
+            first_token_ms: None,
+            first_token_id_ms: None,
+            last_token_id_ms: None,
+            first_token_event_tokens: 0,
+            token_event_count: 0,
+            usage_event_count: 0,
+            token_delivery_tpot_ms: None,
+            response_complete_ms: None,
+            terminal_tail_ms: None,
+            total_duration_ms: 0.0,
+            chunk_count: 0,
+            status: "FAILED".into(),
+            output_preview: String::new(),
+            error: Some(format!("request build error: {error}")),
         },
         output_ids: Vec::new(),
         timeline: Vec::new(),

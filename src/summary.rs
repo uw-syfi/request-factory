@@ -23,6 +23,9 @@ pub(crate) enum ReplaySummary {
     IndependentRequests {
         common: CommonReplaySummary,
     },
+    MultimodalRequests {
+        common: CommonReplaySummary,
+    },
 }
 
 /// Statistics with identical meaning for every text-generation source.
@@ -102,6 +105,9 @@ impl ReplaySummary {
             ReplayWorkload::IndependentRequests(_) => Self::IndependentRequests {
                 common: CommonReplaySummary::default(),
             },
+            ReplayWorkload::MultimodalRequests(_) => Self::MultimodalRequests {
+                common: CommonReplaySummary::default(),
+            },
         }
     }
 
@@ -120,13 +126,18 @@ impl ReplaySummary {
             (Self::IndependentRequests { common }, SourceRecord::IndependentRequest(source)) => {
                 common.add(source.output_len_target, &record.outcome)
             }
+            (Self::MultimodalRequests { common }, SourceRecord::MultimodalRequest(source)) => {
+                common.add(source.output_len_target, &record.outcome)
+            }
             _ => unreachable!("log source must match the selected replay workload"),
         }
     }
 
     fn finalize(&mut self, measurements: &mut ReplayMeasurements) {
         let common = match self {
-            Self::Sessions { common, .. } | Self::IndependentRequests { common } => common,
+            Self::Sessions { common, .. }
+            | Self::IndependentRequests { common }
+            | Self::MultimodalRequests { common } => common,
         };
         common.finalize(measurements);
 
@@ -367,7 +378,8 @@ impl RunSummary {
     pub fn metrics(&self) -> RunMetrics {
         let common = match &self.replay {
             ReplaySummary::Sessions { common, .. }
-            | ReplaySummary::IndependentRequests { common } => common,
+            | ReplaySummary::IndependentRequests { common }
+            | ReplaySummary::MultimodalRequests { common } => common,
         };
         RunMetrics {
             attempted_steps: common.attempted_steps,
