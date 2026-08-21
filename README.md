@@ -8,7 +8,9 @@ Session chains · Asset-backed benchmarks · Exact token-ID prompts · Prefix-ca
 
 [Quickstart](#quickstart) ·
 [Launcher](#launcher-yaml-interface) ·
+[Configuration](docs/CONFIGURATION.md) ·
 [Architecture](ARCHITECTURE.md) ·
+[Testing](docs/TESTING.md) ·
 [Performance](docs/LOADGEN_PERFORMANCE.md) ·
 [Adding benchmarks](docs/ADDING_BENCHMARKS.md) ·
 [Food101](docs/FOOD101.md) ·
@@ -18,7 +20,7 @@ Session chains · Asset-backed benchmarks · Exact token-ID prompts · Prefix-ca
 [Input formats](#input-artifact-formats) ·
 [Backends](#request-backends) ·
 [Metrics](#metrics) ·
-[YAML reference](#launcher-yaml-interface) ·
+[YAML reference](docs/CONFIGURATION.md) ·
 [Troubleshooting](#troubleshooting)
 
 </div>
@@ -85,7 +87,9 @@ Common `run`/`sweep` blocks are:
 `tracegen` instead uses `generator.type: synthetic` or `coding-session` plus
 generator-specific fields. `selfcheck` uses `tokenizer`, `checks`, and `output`.
 See the files under `configs/` for complete, commented shapes, including the
-asset-backed Food101 example.
+asset-backed Food101 example. The field-by-field contract, including defaults
+and task-specific constraints, is in
+[Configuration reference](docs/CONFIGURATION.md).
 
 Use launcher `--dry-run` to validate and print the resolved internal command
 without building or executing. Set `replay.dry_run: true` in a `run` YAML to
@@ -101,7 +105,7 @@ per axis.
 |---|---|---|---|
 | 1 | **Input-file format** — request family, row schema, and topology | `input.format` | Complete names such as `text-generation-session-execution-v2` |
 | 2 | **Arrival and load control** — when top-level units are released, how many run at once | `replay.*`, CSV `arrival_time` | `trace-timed` (default) or `saturated`, each with an optional cap |
-| 3 | **Wire backend** — endpoint and output representation | `server.backend` | `openai` (default), `openai-chat`, `openai-images`, `openai-speech`, `vllm-tokens`, `sglang-tokens` |
+| 3 | **Wire backend** — endpoint and output representation | `server.backend` | Eleven values, from text completion transports through chat, image, audio, video, ASR, and realtime surfaces; see the table below |
 
 The prefix/append split a session round replays is **not** an axis of a run. It
 is resolved once, when the canonical trace is generated, and recorded in that
@@ -110,7 +114,7 @@ file's manifest — see
 
 ### Axis 1 — input-file format
 
-Three typed frontends with separate schemas. An independent request is never
+Three executable typed frontends with separate schemas. An independent request is never
 rewritten into a session row with placeholder fields, and a session round is
 never flattened into a standalone one.
 
@@ -118,7 +122,7 @@ never flattened into a standalone one.
 |---|---|---|
 | `text-generation-session-execution-v2` | One **already-materialized** text-generation round | Rounds are closed-loop: submit round `i`, await its response, wait `tool_wait_after_ms`, then submit round `i + 1` |
 | `text-generation-independent` | One standalone text-generation request | Each row releases independently |
-| `multimodal-independent-v1` | One canonical JSON object with ordered text/media inputs and typed outputs | Each request releases independently; text, generated-image, and generated-audio outputs use modality-capable backends |
+| `multimodal-independent-v1` | One canonical JSON object with ordered text/media inputs and typed outputs | Each request releases independently; text, image, audio, and video outputs use modality-capable backends |
 
 `text-generation-session-execution-v2` reads a canonical file whose `prefix_len` is
 guaranteed to exist by the time the round runs, so the runtime has nothing left
@@ -141,7 +145,7 @@ This axis has two sub-axes that compose freely — *when* a unit may start, and
 | `replay.rate: N` | Rescale all arrivals to `N` units/s, preserving relative gaps and simultaneous-arrival bursts. Needs at least two distinct arrival times |
 | `replay.max_concurrency: N` | Bound concurrently active units under either arrival mode. One session holds its slot across all rounds **and tool waits** |
 | `replay.max_items: N` | Keep the first `N` units in trace order after the complete file has been validated |
-| `replay.runtime_worker_threads: N` | Override the profiled default cap of eight Tokio workers per process |
+| `replay.runtime_worker_threads: N` | Override the profiled default cap of 16 Tokio workers per process |
 | `replay.processes: N` | Partition whole top-level units across `N` processes for saturated capacity tests |
 
 `--max-concurrency` bounds *workload units*, not HTTP requests in flight. There
@@ -170,7 +174,7 @@ workload shape.
 | `openai-images` | `POST {base_url}/images/generations` | Text-to-image JSON output |
 | `openai-speech` | `POST {base_url}/audio/speech` | Text-to-audio raw PCM streaming output |
 | `openai-image-edits` | `POST {base_url}/images/edits` | Multipart: uploaded image plus instruction, image out |
-| `openai-videos` | `POST {base_url}/videos/generations` | Video out, optionally conditioned on an image or video |
+| `openai-videos` | Dialect-specific video route (`/videos`, `/videos/sync`, or `/videos/generations`) | Video out, optionally conditioned on an image or video |
 | `openai-transcriptions` | `POST {base_url}/audio/transcriptions` | Multipart: uploaded audio, text out |
 | `openai-translations` | `POST {base_url}/audio/translations` | As transcription, translated to English |
 | `openai-realtime` | `WS {base_url}/realtime` | One session per request; streamed audio or text out |
@@ -246,7 +250,7 @@ carries and the resulting byte rate — so a run can be sized before it is made.
 ### `server.dialect`: which vocabulary, not which endpoint
 
 `backend` selects the endpoint surface. `dialect` selects the words used on it.
-The two are orthogonal because five serving systems accept multimodal generation
+The two are orthogonal because six serving systems accept multimodal generation
 over OpenAI-shaped paths and no two agree on how to say it:
 
 | Axis | `openai` | `vllm` / `vllm-omni` | `sglang-omni` | `mstar` | `dynamo` |
@@ -315,8 +319,9 @@ surface is rejected at startup rather than discovered as a 404 mid-run:
 | `/audio/translations` | ✅ | ✅ | — | ✅ | — | — |
 | `/realtime` (WebSocket) | ✅ | — | ✅¹ | ✅¹ | — | — |
 
-Adding a serving system is a `const` in `src/backend/dialect/profiles.rs` plus a
-name in `KNOWN_DIALECTS`; no new backend, executor, or match arm.
+Adding a serving system is a profile plus registry entries in
+`src/backend/dialect/profiles.rs` and `launcher/config.py`; no new backend or
+executor is needed when the system uses existing endpoint surfaces.
 
 The token transports preserve exact text IDs. The OpenAI-compatible multimodal
 backends intentionally delegate media
@@ -511,9 +516,9 @@ prefix caching, token mode, and `stream_interval`.
 
 ## Input artifact formats
 
-Select the complete parser explicitly with
-`--input-file-format text-generation-session-execution-v2` or
-`--input-file-format text-generation-independent`. The schemas are intentionally separate: independent requests are
+Select one of the three executable parsers explicitly:
+`text-generation-session-execution-v2`, `text-generation-independent`, or
+`multimodal-independent-v1`. The schemas are intentionally separate: independent requests are
 not converted into fake session rows with placeholder fields, and a header is
 never used to guess which schema a file is.
 
@@ -528,11 +533,13 @@ be escaped into CSV cells. See
 [Adding modality-compositional benchmarks](docs/ADDING_BENCHMARKS.md) for its
 schema and extension contract.
 
-The live `openai-chat` adapter accepts text, image, audio, and video
-user inputs in any order and produces text, image, or audio. `openai-images`
-produces image output from text, and `openai-speech` streams raw PCM audio from
-user text while ignoring chat-only system instructions. Unsupported modalities
-or output combinations fail during preparation, before any request is sent.
+The media surfaces cover chat, image generation/editing, video generation,
+speech, transcription, translation, and realtime WebSockets. Their exact input,
+output, route, and dialect combinations are listed under
+[Axis 3](#axis-3--wire-backend). Unsupported combinations fail during
+preparation, before any request is sent. The eight additional shape-only CSV
+formats in `InputFileFormat::CHOICES` remain schema/simulator contracts; the live
+runner rejects them because dimensions and token counts are not media content.
 
 ### Food101/BAGEL image-to-text benchmark
 
@@ -558,7 +565,7 @@ To validate the entire client path without a GPU, start the CPU mock and run the
 example config:
 
 ```bash
-uv run python tools/mock_multimodal_server.py --port 8000
+uv run python tools/mock_multimodal_server.py --dialect vllm --port 8000
 uv run python -m launcher run configs/food101.example.yaml
 ```
 
@@ -581,7 +588,8 @@ T2I uses all 72 official subject-consistency prompts. I2I uses the official
 VBench-I2V original images and captions, hashes the original bytes, and requests
 aspect-preserving output with a 1024-pixel long edge. The I2I artifact carries
 M*'s BAGEL controls: 50 steps, `cfg_img_scale=2`,
-`cfg_renorm_type=text_channel`, and `cfg_interval=[0,1]`. See
+`cfg_renorm_type=text_channel`, and `cfg_interval=[0,1]`, namespaced under
+`model_params` so only the selected dialect receives them. See
 [VBench replay](docs/VBENCH.md) for acquisition, provenance, and the documented
 paper/source discrepancy around I2I dimensions.
 
@@ -610,6 +618,8 @@ uv run python -m launcher run configs/seed-tts-orpheus.example.yaml
 
 The Orpheus example expects M*'s `/v1/audio/speech` service or another
 conforming wrapper; upstream Orpheus does not provide that endpoint directly.
+Both checked-in Seed-TTS examples declare `dialect: mstar`; select another
+dialect explicitly when using a different serving stack.
 See [Seed-TTS replay](docs/SEED_TTS.md) for voice selection, dataset provenance,
 runtime metrics, and the load-scheduling difference from M*'s offline harness.
 
@@ -906,7 +916,7 @@ relative gaps and simultaneous-arrival bursts. Rate scaling is applied after
 times.
 
 Every flag, including the ones outside this axis, is listed in the
-[CLI reference](#cli-reference).
+[internal CLI reference](#internal-rust-cli-reference).
 
 ## Request backends
 
@@ -925,7 +935,7 @@ three — but whether the server performs detokenization at all.
 | `openai-images` | `POST {base_url}/images/generations` | Text prompt | Base64 image JSON | None |
 | `openai-speech` | `POST {base_url}/audio/speech` | Text prompt | Raw mono PCM16 chunks, or SSE `speech.audio.delta` | None |
 | `openai-image-edits` | `POST {base_url}/images/edits` | Multipart image upload plus prompt | Base64 image JSON | None |
-| `openai-videos` | `POST {base_url}/videos/generations` | Prompt plus optional image/video conditioning | Base64 video JSON | None |
+| `openai-videos` | Dialect-specific video route | Prompt plus optional image/video conditioning | Base64 JSON or raw MP4, by dialect | None |
 | `openai-transcriptions` / `openai-translations` | `POST {base_url}/audio/{transcriptions,translations}` | Multipart audio upload | `{"text": ...}` | Server-side ASR |
 
 So `openai` is **token-in, but not token-out**: the server still decodes, and
@@ -939,8 +949,8 @@ Pick accordingly: `vllm-tokens` and `sglang-tokens` are the two comparable
 high-fidelity paths, and `openai` is the portable fallback whose TTFT/TPOT
 include decode cost.
 
-The three multimodal backends are selected only with `multimodal-independent-v1`. They preserve
-input order, supports repeated media, and sends original asset bytes after
+The eight media backends are selected only with `multimodal-independent-v1`. They preserve
+input order, support repeated media, and send original asset bytes after
 SHA-256 verification. Asset reads, hashing, MIME inference, and base64 encoding
 finish before `run_start`; measured latency begins when the request enters the
 shared HTTP streaming client.
@@ -1134,11 +1144,14 @@ this zero-fill cannot mean "the server never reports cache detail at all".
 
 ## Output contracts
 
-### Per-request JSONL — schema v11
+### Per-request JSONL — schema v15
 
-`--log-path` receives one typed record per attempted request. Session and
-independent-request source data are tagged variants rather than one sparse
-object.
+`--log-path` receives one typed record per attempted request. Session,
+independent-request, and multimodal source data are tagged variants rather than
+one sparse object. v15 distinguishes generated media inputs from recorded
+assets with `source.data.synthetic_inputs`; v14 changed the serialized
+`output_spec`, v13 added modality-neutral output measurements, and v12 added the
+multimodal source variant.
 
 v11 replaces the single per-row completion deadline with metric-specific
 `declared_ttft_slo_ms`, `declared_tpot_slo_ms`, and `declared_e2e_slo_ms`.
@@ -1173,11 +1186,11 @@ described under [Request backends](#request-backends). Consumers reading
 Abbreviated session example:
 
 <details>
-<summary><b>View a schema-v14 session record</b></summary>
+<summary><b>View a schema-v15 session record</b></summary>
 
 ```json
 {
-  "schema_version": 14,
+  "schema_version": 15,
   "source": {
     "type": "session_round",
     "data": {
@@ -1569,9 +1582,10 @@ every version, and a wrong guess would report a reset that never happened.
 
 ## Plotting a sweep — `viz/`
 
-An optional Python sidecar with its own `pyproject.toml`, run under `uv`. It is
-never invoked by a sweep and nothing in `src/` knows it exists: a missing
-plotting dependency must not be able to cost anyone a measurement.
+An optional Python sidecar with its own `pyproject.toml`, run under `uv`.
+Nothing in `src/` depends on it. The launcher runs it after a successful sweep
+only when `visualization.enabled: true`; a missing plotting dependency cannot
+invalidate or alter the measurements already written.
 
 ```bash
 cd viz
@@ -1736,7 +1750,8 @@ binary. The axis columns map back to [Configuration axes](#configuration-axes).
 |---|---|---|
 | `--input-file-format` | `text-generation-session-execution-v2` | Complete family-specific format. The client executes the two `text-generation-*` formats plus `multimodal-independent-v1` |
 | `--trace-tags` | none | Comma-separated. `slo` adds TTFT/TPOT/E2E bounds; `priority` adds scheduling priority |
-| `--backend` | `openai` | `openai`, `openai-chat`, `openai-images`, `openai-speech`, `vllm-tokens`, `sglang-tokens` — axis 3 |
+| `--backend` | `openai` | `openai`, `vllm-tokens`, `sglang-tokens`, `openai-chat`, `openai-images`, `openai-speech`, `openai-image-edits`, `openai-videos`, `openai-transcriptions`, `openai-translations`, `openai-realtime` |
+| `--dialect` | `openai` | `openai`, `vllm`, `vllm-omni`, `sglang-omni`, `mstar`, `dynamo`; selects wire vocabulary, not endpoint |
 | `--base-url` | `http://127.0.0.1:8000/v1` | Include `/v1` for OpenAI-compatible backends, omit it for native token endpoints |
 
 ### Load control (axis 2)
@@ -1747,12 +1762,14 @@ binary. The axis columns map back to [Configuration axes](#configuration-axes).
 | `--max-items N` | unlimited | Alias `--max-sessions`. See the axis-3 table for its per-frontend selection order |
 | `--rate N` | trace arrivals unchanged | Units/s. Needs at least two distinct arrival times after `--max-items` |
 | `--max-concurrency N` | unlimited | Must be greater than `0`; `0` is rejected at startup. Caps active units — a session counts while it waits on a tool |
+| `--runtime-worker-threads N` | min(host CPUs, 16) | Tokio workers in this load-generator process; override only after profiling |
+| `--shard-count N` / `--shard-index I` | `1` / `0` | Internal process partitioning; operators use `replay.processes` for saturated runs |
 
 ### Generation
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--temperature X` | `0` | Applies to both backends |
+| `--temperature X` | `0` | Sent on generation surfaces where the selected adapter supports sampling |
 | `--stream-idle-timeout-secs N` | `600` | Fail the request when no stream chunk arrives within this interval |
 
 ### Context guard
@@ -1775,12 +1792,13 @@ A context-limit skip always ends its session, independently of this flag.
 | Flag | Default | Notes |
 |---|---|---|
 | `--log-path` | `session_runner_output.jsonl` | Per-request JSONL, flushed per record |
+| `--request-log` | `true` | Disable durable per-request JSONL for capacity tests; summaries are still computed |
 | `--summary-path` | unset | No JSON summary is written unless given. Also written by `--dry-run` |
 | `--dry-run` | off | Static inspection only; returns before the tokenizer, corpus, and preflight |
 | `--token-pool-limit N` | see [Synthetic token corpus](#synthetic-token-corpus) | Cap on synthetic pool size |
 | `--timeline` | `true` | Per-event Parquet timeline. Takes an explicit value: `--timeline false` |
 | `--timeline-path` | `session_runner_timeline.parquet` | Where that timeline is written |
-| `--output-artifact-dir` | unset | Optional directory for generated image/audio files; writes happen after measured response completion |
+| `--output-artifact-dir` | unset | Optional directory for generated media files; writes happen after measured response completion |
 | `--slo` | trace sidecar, else none | `ttft_ms=500,tpot_ms=50`. Overrides a `<trace>.slo.json` sidecar. See [Service-level objectives](#service-level-objectives) |
 
 </details>
@@ -1796,7 +1814,7 @@ A context-limit skip always ends its session, independently of this flag.
 ├── launcher/                 strict config lowering, lifecycle, and result UI
 ├── examples/                 canonical trace + raw tracegen inputs
 ├── skills/                   agent-facing operating guide for a replay
-├── tests/                    launcher config/UI tests
+├── tests/                    launcher, materializer, mock-protocol, and replay integration tests
 ├── tools/                    stub server for measuring the client alone
 ├── viz/                      optional Python plotting; nothing here depends on it
 ├── src/
@@ -1816,7 +1834,10 @@ A context-limit skip always ends its session, independently of this flag.
 │   ├── backend/
 │   │   ├── mod.rs            normalized request/response vocabulary + Backend
 │   │   ├── wire/             one file per protocol: openai, vllm, sglang
+│   │   ├── dialect/          per-serving-system field, route, and stream profiles
 │   │   ├── client.rs         the protocol-blind streaming engine
+│   │   ├── media_client.rs   image/audio/video/ASR transport and measurement
+│   │   ├── realtime_client.rs  one WebSocket session per replay request
 │   │   ├── stream.rs         the response fold, testable without a server
 │   │   ├── integrity.rs      may this response be believed at all
 │   │   └── preflight.rs      the prefix-cache gate run once before a workload
@@ -1860,7 +1881,7 @@ frontend's row type.
 `src/lib.rs` exposes two things. `schema/`, because what a trace file is — which
 kinds exist, what columns each one obliges a file to carry — is the artifact
 other programs must agree with us about; a simulator reading the same file links
-the library rather than reimplementing the taxonomy, and adding a tenth kind is
+the library rather than reimplementing the taxonomy, and adding another kind is
 then an edit in one repository. And `run_once`, because a run is not only
 something a person starts from a shell: a sweep drives dozens of them, and doing
 that in one process is what lets it pay for the tokenizer and the synthetic token
@@ -1888,7 +1909,7 @@ metrics described above.
 
 Not currently provided:
 
-- generated video/tensor outputs and backend adapters beyond the documented image/audio protocols;
+- generated tensor outputs and tensor backend adapters;
 - Food101 accuracy scoring (the materializer emits labels, while replay reports performance);
 - raw private prompt/tool-result reconstruction;
 - per-token timestamp dumps;

@@ -43,7 +43,8 @@ and streams text and a final usage event.
 
 ```bash
 uv run python tools/mock_multimodal_server.py \
-  --port 8000 --log-path /tmp/food101-mock.jsonl --chunk-delay-ms 2
+  --dialect vllm --port 8000 \
+  --log-path /tmp/food101-mock.jsonl --chunk-delay-ms 2
 
 uv run python -m launcher run configs/food101.example.yaml
 ```
@@ -71,6 +72,7 @@ encoded-token expansion, batching, and caching. Prefix-cache preflight and
 prefix-hit summaries remain text-session concerns and are not fabricated for
 this independent image workload.
 
-The current adapter observes streamed text output. The canonical request model
-already represents image/audio/video/tensor outputs, but each needs a concrete
-server protocol and output observer before it can be replayed.
+This benchmark intentionally observes streamed text output. The runtime also
+implements image, audio, and video generation plus transcription, translation,
+and realtime surfaces; tensor output still needs a concrete protocol and
+observer.

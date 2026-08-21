@@ -4,6 +4,7 @@ input:
 
 server:
   backend: openai-speech
+  dialect: mstar
   base_url: http://127.0.0.1:8000/v1
   model: canopylabs/orpheus-3b-0.1-ft
   temperature: 0.0

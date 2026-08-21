@@ -392,15 +392,19 @@ def materialize_vbench(config: VBenchConfig) -> MaterializationResult:
                 "height": output_height,
                 "steps": config.steps,
                 "count": config.count,
+                # BAGEL on M* reads `num_timesteps`, while the dialect's general
+                # image profile calls the semantic knob `num_inference_steps`.
+                # Keep the model exception explicit and scoped to M*.
+                "model_params": {"mstar": {"num_timesteps": config.steps}},
             }
             if config.task == "i2i":
-                output.update(
-                    {
-                        "cfg_img_scale": config.i2i_cfg_img_scale,
-                        "cfg_renorm_type": config.i2i_cfg_renorm_type,
-                        "cfg_interval": list(config.i2i_cfg_interval),
-                    }
-                )
+                i2i_params = {
+                    "cfg_img_scale": config.i2i_cfg_img_scale,
+                    "cfg_renorm_type": config.i2i_cfg_renorm_type,
+                    "cfg_interval": list(config.i2i_cfg_interval),
+                }
+                output["model_params"]["mstar"].update(i2i_params)
+                output["model_params"]["vllm-omni"] = i2i_params
             request = {
                 "id": f"vbench-{config.task}-{source_index:04d}",
                 "arrival_time_ms": request_index * interval_ms,

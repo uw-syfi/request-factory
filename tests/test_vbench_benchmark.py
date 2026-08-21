@@ -32,7 +32,14 @@ def test_t2i_materialization_is_deterministic(tmp_path: Path) -> None:
     requests = _requests(first.requests_path)
     assert all(request["inputs"][0]["type"] == "text" for request in requests)
     assert requests[0]["outputs"] == [
-        {"type": "image", "width": 1024, "height": 1024, "steps": 50, "count": 1}
+        {
+            "type": "image",
+            "width": 1024,
+            "height": 1024,
+            "steps": 50,
+            "count": 1,
+            "model_params": {"mstar": {"num_timesteps": 50}},
+        }
     ]
     manifest = json.loads(first.manifest_path.read_text())
     assert manifest["selection"]["selected_examples"] == 2
@@ -66,9 +73,18 @@ def test_i2i_uses_original_assets_and_scales_output_metadata(tmp_path: Path) -> 
     assert by_id["vbench-i2i-0000"]["outputs"][0]["height"] == 512
     assert by_id["vbench-i2i-0001"]["outputs"][0]["width"] == 683
     assert by_id["vbench-i2i-0001"]["outputs"][0]["height"] == 1024
-    assert by_id["vbench-i2i-0001"]["outputs"][0]["cfg_img_scale"] == 2.0
-    assert by_id["vbench-i2i-0001"]["outputs"][0]["cfg_renorm_type"] == "text_channel"
-    assert by_id["vbench-i2i-0001"]["outputs"][0]["cfg_interval"] == [0.0, 1.0]
+    params = by_id["vbench-i2i-0001"]["outputs"][0]["model_params"]
+    assert params["mstar"] == {
+        "num_timesteps": 50,
+        "cfg_img_scale": 2.0,
+        "cfg_renorm_type": "text_channel",
+        "cfg_interval": [0.0, 1.0],
+    }
+    assert params["vllm-omni"] == {
+        "cfg_img_scale": 2.0,
+        "cfg_renorm_type": "text_channel",
+        "cfg_interval": [0.0, 1.0],
+    }
     for request in requests:
         asset = request["inputs"][0]["asset"]
         source = (result.requests_path.parent / asset["path"]).resolve()

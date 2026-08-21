@@ -3,10 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from launcher import ui
 from launcher.__main__ import _shard_command
-from launcher.config import ConfigError, LaunchSpec, load_task_config
+from launcher.config import REPO_ROOT, ConfigError, LaunchSpec, load_task_config
 
 
 def write_config(directory: Path, text: str, name: str = "task.yaml") -> Path:
@@ -42,6 +43,48 @@ output:
   directory: results
 {extra}
 """
+
+
+@pytest.mark.parametrize(
+    ("task", "filename"),
+    [
+        ("run", "run.example.yaml"),
+        ("run", "food101.example.yaml"),
+        ("run", "multimodal-surfaces.example.yaml"),
+        ("run", "realtime.example.yaml"),
+        ("run", "seed-tts-orpheus.example.yaml"),
+        ("run", "seed-tts-qwen3-omni.example.yaml"),
+        ("run", "synthetic.example.yaml"),
+        ("run", "vbench-i2i.example.yaml"),
+        ("run", "vbench-t2i.example.yaml"),
+        ("sweep", "sweep.example.yaml"),
+        ("tracegen", "tracegen.example.yaml"),
+        ("selfcheck", "selfcheck.example.yaml"),
+    ],
+)
+def test_checked_in_examples_stay_in_the_launcher_schema(
+    task: str, filename: str
+) -> None:
+    specification = load_task_config(task, REPO_ROOT / "configs" / filename)
+    assert specification.task == task
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "food101.example.yaml",
+        "multimodal-surfaces.example.yaml",
+        "realtime.example.yaml",
+        "seed-tts-orpheus.example.yaml",
+        "seed-tts-qwen3-omni.example.yaml",
+        "synthetic.example.yaml",
+        "vbench-i2i.example.yaml",
+        "vbench-t2i.example.yaml",
+    ],
+)
+def test_media_examples_declare_their_serving_dialect(filename: str) -> None:
+    config = yaml.safe_load((REPO_ROOT / "configs" / filename).read_text())
+    assert "dialect" in config["server"]
 
 
 def test_run_config_lowers_nested_blocks_and_resolves_paths(tmp_path: Path) -> None:

@@ -64,9 +64,27 @@ not invent a CFG override and leaves that setting to the served model. The
 default `cfg_interval=[0,1]` matches the current M* BAGEL adapter (this interval
 is an implementation detail not stated in the paper).
 
+Model-specific values are stored under `output.model_params`: M* receives its
+BAGEL `num_timesteps` spelling and I2I CFG fields, while vLLM-Omni receives the
+I2I CFG fields in its own namespace. The selected dialect reads only its own
+namespace.
+
 `manifest.json` records source metadata hashes, seeded selection, selected
 source-index hash, load/generation controls, request hash, selected-asset hash,
 and the no-client-transform guarantee.
+
+## Replay
+
+The checked-in examples target M* and therefore declare `dialect: mstar`:
+
+```bash
+uv run python -m launcher run configs/vbench-t2i.example.yaml
+uv run python -m launcher run configs/vbench-i2i.example.yaml
+```
+
+For vLLM-Omni, change `server.dialect` to `vllm-omni` and set that server's
+model/base URL. The request artifact stays unchanged; only the matching
+`model_params` namespace is sent.
 
 ## Reproducibility boundary
 

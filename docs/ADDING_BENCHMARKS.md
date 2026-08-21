@@ -70,8 +70,10 @@ Most benchmark additions should contain only a Python materializer and fixture:
 1. deterministically select source examples;
 2. emit canonical requests and immutable asset references;
 3. emit provenance, including source URL/revision and hashes;
-4. choose an existing backend adapter (`openai-chat`, `openai-images`, or
-   `openai-speech`) and validate its input/output capability set;
+4. choose an existing media adapter (`openai-chat`, `openai-images`,
+   `openai-speech`, `openai-image-edits`, `openai-videos`,
+   `openai-transcriptions`, `openai-translations`, or `openai-realtime`) and
+   declare the serving dialect explicitly;
 5. test conversion against a tiny checked-in fixture and a downloaded source
    sample.
 
@@ -86,6 +88,10 @@ that case:
 5. expose first-output, byte, duration, and artifact metadata through the shared
 outcome rather than introducing benchmark-only timing fields;
 6. update this document and the backend support table.
+
+The protocol test layers and the distinction between mock validation, component
+benchmarks, and live-server evidence are documented in
+[Testing and benchmarking](TESTING.md).
 
 `assets::AssetStore` resolves asset paths relative to the request artifact,
 verifies SHA-256 and MIME declarations, caches immutable bytes, and can produce
