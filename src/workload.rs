@@ -80,6 +80,17 @@ fn reject_unsupported_replay(input_file_schema: &InputFileSchema) -> Result<()> 
 }
 
 impl ReplayWorkload {
+    pub(crate) fn shard(&mut self, count: usize, index: usize) {
+        if count == 1 {
+            return;
+        }
+        match self {
+            Self::Sessions(sessions) => retain_shard(sessions, count, index),
+            Self::IndependentRequests(requests) => retain_shard(requests, count, index),
+            Self::MultimodalRequests(requests) => retain_shard(requests, count, index),
+        }
+    }
+
     fn truncate(&mut self, max_items: Option<usize>) {
         let Some(max_items) = max_items else {
             return;
@@ -159,6 +170,15 @@ impl ReplayWorkload {
             time_scale,
         })
     }
+}
+
+fn retain_shard<T>(items: &mut Vec<T>, count: usize, index: usize) {
+    let mut ordinal = 0usize;
+    items.retain(|_| {
+        let keep = ordinal % count == index;
+        ordinal += 1;
+        keep
+    });
 }
 
 fn arrival_rate(arrivals: impl Iterator<Item = f64>) -> Option<f64> {
@@ -549,6 +569,23 @@ mod tests {
             .1
             .iter()
             .all(|round| round.arrival_time == 250.0));
+    }
+
+    #[test]
+    fn shards_top_level_units_by_canonical_ordinal() {
+        let mut workload = session_workload(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        workload.shard(3, 1);
+
+        let ReplayWorkload::Sessions(sessions) = workload else {
+            panic!("expected session workload")
+        };
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|(session_id, _)| session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "4"]
+        );
     }
 
     #[test]

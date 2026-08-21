@@ -7,14 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::Semaphore;
-
 use crate::backend::GenerationClient;
 use crate::cli::Args;
 use crate::release::ArrivalMode;
 use crate::util::reaches_context_limit;
 
-pub(crate) use admission::AdmissionOrder;
+pub(crate) use admission::drive_bounded;
 pub(crate) use independent::run_independent_request;
 pub(crate) use multimodal::{prepare_multimodal_requests, run_multimodal_request, MultimodalState};
 pub(crate) use session::run_session;
@@ -76,36 +74,6 @@ pub(crate) struct CommonState {
     pub(crate) policy: RunPolicy,
     pub(crate) stats: Arc<Stats>,
     pub(crate) run_start: Instant,
-    pub(crate) concurrency_semaphore: Option<Arc<Semaphore>>,
-    /// Present only alongside `concurrency_semaphore`: it exists to make the
-    /// contended case deterministic, and there is no contention without a cap.
-    pub(crate) admission_order: Option<Arc<AdmissionOrder>>,
-}
-
-impl CommonState {
-    /// Take one capacity slot, in declaration order.
-    ///
-    /// The returned permit owns the slot for as long as it is alive — for a
-    /// session that is every round *and* every tool wait in between, because the
-    /// binding lives in `run_session`'s scope. Callers must therefore bind it,
-    /// not discard it.
-    ///
-    /// Returns `None` when the run is uncapped, which is also the only case
-    /// where units may enter concurrently with each other.
-    pub(crate) async fn acquire_capacity_slot(
-        &self,
-        ordinal: usize,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let semaphore = self.concurrency_semaphore.as_ref()?;
-        // The turn guard is dropped the moment the permit is in hand, so the
-        // next ordinal starts contending only once this one holds a slot. That
-        // is exactly VibeSim's cursor rule: row k+1 never enters before row k.
-        let _turn = match &self.admission_order {
-            Some(order) => Some(order.wait_for_turn(ordinal).await),
-            None => None,
-        };
-        semaphore.clone().acquire_owned().await.ok()
-    }
 }
 
 /// State used only by the existing token-id text replay executors.

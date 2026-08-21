@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import ui
@@ -106,6 +108,103 @@ def _execute(
         return process.wait()
 
 
+def _shard_command(
+    specification: LaunchSpec, command: list[str], shard_index: int
+) -> tuple[list[str], Path, Path]:
+    shard_directory = specification.output_directory / "shards" / f"{shard_index:02d}"
+    shard_directory.mkdir(parents=True, exist_ok=True)
+    rewritten = list(command)
+    output_options = {
+        "--log-path": "requests.jsonl",
+        "--summary-path": "summary.json",
+        "--timeline-path": "timeline.parquet",
+        "--output-artifact-dir": "artifacts",
+    }
+    for option, filename in output_options.items():
+        if option in rewritten:
+            rewritten[rewritten.index(option) + 1] = str(shard_directory / filename)
+    rewritten.extend(
+        [
+            "--shard-count",
+            str(specification.processes),
+            "--shard-index",
+            str(shard_index),
+        ]
+    )
+    return rewritten, shard_directory / "terminal.log", shard_directory / "summary.json"
+
+
+def _execute_sharded(
+    specification: LaunchSpec,
+    command: list[str],
+    *,
+    show_engine_output: bool,
+) -> int:
+    started = time.monotonic()
+    running: list[tuple[subprocess.Popen[str], object, Path, Path]] = []
+    commands: list[str] = []
+    for shard_index in range(specification.processes):
+        shard_command, terminal_log, summary_path = _shard_command(
+            specification, command, shard_index
+        )
+        commands.append(shlex.join(shard_command))
+        writer = terminal_log.open("w")
+        process = subprocess.Popen(
+            shard_command,
+            cwd=REPO_ROOT,
+            stdout=writer,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        running.append((process, writer, terminal_log, summary_path))
+
+    returncodes: list[int] = []
+    for process, writer, terminal_log, _ in running:
+        returncodes.append(process.wait())
+        writer.close()  # type: ignore[attr-defined]
+        if show_engine_output:
+            print(f"\n[{terminal_log.parent.name}] {terminal_log}")
+            _print_tail(terminal_log, lines=100)
+
+    specification.terminal_log.write_text("\n".join(commands) + "\n")
+    failed = next((code for code in returncodes if code != 0), 0)
+    if failed:
+        return failed
+    _write_sharded_summary(
+        specification,
+        [summary for _, _, _, summary in running],
+        time.monotonic() - started,
+    )
+    return 0
+
+
+def _write_sharded_summary(
+    specification: LaunchSpec, summary_paths: list[Path], wall_seconds: float
+) -> None:
+    reports = [json.loads(path.read_text()) for path in summary_paths]
+    commons = [report["replay"]["common"] for report in reports]
+    aggregate = {
+        "attempted_steps": sum(common["attempted_steps"] for common in commons),
+        "success_steps": sum(common["success_steps"] for common in commons),
+        "failed_steps": sum(common["failed_steps"] for common in commons),
+        "request_throughput_per_s": sum(
+            common["request_throughput_per_s"] for common in commons
+        ),
+        "output_token_throughput_per_s": sum(
+            common["output_token_throughput_per_s"] for common in commons
+        ),
+    }
+    payload = {
+        "kind": "sharded_run",
+        "processes": specification.processes,
+        "wall_duration_s": wall_seconds,
+        "aggregate": aggregate,
+        "shards": [str(path) for path in summary_paths],
+    }
+    assert specification.result_file is not None
+    specification.result_file.write_text(json.dumps(payload, indent=2) + "\n")
+
+
 def _visualize(specification: LaunchSpec) -> int:
     visualization_log = specification.output_directory / "visualize.log"
     command = [
@@ -177,11 +276,18 @@ def main(argv: list[str] | None = None) -> int:
     ]
     _snapshot_invocation(specification, config_path, command)
     ui.stage(2, stage_count, "execute", specification.task)
-    returncode = _execute(
-        specification,
-        command,
-        show_engine_output=arguments.show_engine_output,
-    )
+    if specification.processes > 1:
+        returncode = _execute_sharded(
+            specification,
+            command,
+            show_engine_output=arguments.show_engine_output,
+        )
+    else:
+        returncode = _execute(
+            specification,
+            command,
+            show_engine_output=arguments.show_engine_output,
+        )
     if returncode != 0:
         ui.render_failure(specification, returncode)
         if not arguments.show_engine_output:

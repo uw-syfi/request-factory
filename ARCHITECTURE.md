@@ -293,7 +293,7 @@ WorkloadSummary / dry-run early return
   ↓
 construct GenerationClient and its protocol adapter
   ↓
-create AppState, concurrency gate, log channel, optional timeline channel
+create AppState, bounded dispatcher, log channel, optional timeline channel
 ```
 
 `--dry-run` returns before corpus construction and network access. It validates
@@ -307,14 +307,14 @@ before starting the arrival clock.
 
 ## 7. `executor/` owns release, dependencies, and admission
 
-The runner spawns one task per top-level workload unit and follows one of three
-paths selected by `ReplayWorkload`.
+The runner's central `JoinSet` dispatcher starts at most the configured number
+of top-level workload tasks and follows one of three paths selected by
+`ReplayWorkload`. It does not park one task per trace row.
 
 ### Multimodal independent request
 
 ```text
 wait for request arrival
-  → acquire concurrency slot
   → send prevalidated ordered text/media parts
   → fold the streamed text response through the shared client
   → StepLog with modalities and asset byte counts
@@ -324,7 +324,6 @@ wait for request arrival
 
 ```text
 wait for request arrival
-  → acquire concurrency slot
   → draw input_len synthetic tokens
   → context-limit check
   → GenerationClient::run_step
@@ -337,7 +336,7 @@ Each independent request releases and holds capacity independently.
 
 ```text
 wait for session arrival
-  → acquire one concurrency slot for the entire session
+  → hold one dispatcher slot for the entire session
   → for each round in order:
        build prompt from carried context
        context-limit check
@@ -352,10 +351,13 @@ They form a closed-loop chain and wait for their predecessor and tool delay.
 The session holds its capacity slot across every round and tool wait; that is
 the current concurrency contract.
 
-`arrival_mode=trace` honors recorded arrival offsets. `arrival_mode=saturated`
+`arrival_mode=trace-timed` honors recorded arrival offsets. `arrival_mode=saturated`
 ignores that timeline and moves units into admission as soon as possible.
-`--max-concurrency` limits active units and uses deterministic admission order
-when tasks contend.
+`--max-concurrency` sizes the dispatch window. Completion admits exactly the
+next canonical unit, so order is deterministic and scheduler memory is
+proportional to active concurrency rather than trace length. For saturated
+scale-out, launcher processes partition canonical top-level ordinals; sessions
+remain indivisible.
 
 ## 8. `tokens.rs` materializes actual prompts
 
@@ -407,8 +409,16 @@ has no name for rather than guessing. Nothing in `dialect/` touches time,
 concurrency, or measurement -- it only renames and re-nests, so the request path
 stays one code path no matter how many servers exist.
 
-`backend/wire/` owns token/text JSON differences among OpenAI, vLLM native-token, and
-SGLang native-token endpoints. `GenerationClient` owns the shared async
+A dialect names fields at runtime, and the generation path cannot afford a JSON
+DOM, so shaping is written once as a borrowed `Serialize` and rendered twice:
+straight to body bytes for generation, and to a `Value` only on the media
+surfaces, whose operator-supplied `model_params` is arbitrary JSON. One
+implementation, so the two renderings cannot drift.
+
+`backend/wire/` owns typed token/text wire differences among OpenAI, vLLM
+native-token, and SGLang native-token endpoints. It serializes borrowed request
+structs and parses SSE bytes without an intermediate JSON DOM.
+`GenerationClient` owns the shared async
 lifecycle:
 
 1. build and send a payload;
@@ -446,8 +456,8 @@ GenerationOutcome
 
 Two output paths avoid blocking request execution:
 
-- the log channel lets `summary::write_logs` write per-step JSONL while folding
-  replay metrics, prefix-cache metrics, and optional SLO attainment;
+- the log channel lets `summary::write_logs` fold replay metrics, prefix-cache
+  metrics, and optional SLO attainment, and optionally persist per-step JSONL;
 - the optional timeline channel encodes per-event Parquet in a separate
   blocking writer. A full channel drops timeline samples instead of applying
   disk or Arrow backpressure to the measured submission path.

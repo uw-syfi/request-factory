@@ -504,29 +504,34 @@ pub(crate) struct ClientRuntimeSummary {
 /// SLO attainment folds in the same pass rather than in a second one: every step
 /// is already in hand here, and a separate statistics path over the same records
 /// is how two numbers that must agree stop agreeing.
-pub(crate) async fn write_logs(
+pub(crate) fn write_logs(
     path: String,
+    persist_records: bool,
     mut rx: mpsc::Receiver<StepLog>,
     mut summary: ReplaySummary,
     mut slo: Option<SloSummary>,
 ) -> LogFold {
-    let file = File::create(&path).expect("failed to create log file");
-    let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+    let mut writer = persist_records.then(|| {
+        let file = File::create(&path).expect("failed to create log file");
+        std::io::BufWriter::with_capacity(1024 * 1024, file)
+    });
     let mut measurements = ReplayMeasurements::default();
 
-    while let Some(record) = rx.recv().await {
+    while let Some(record) = rx.blocking_recv() {
         summary.add(&record);
         measurements.add(&record.outcome);
         if let Some(slo) = slo.as_mut() {
             slo.add(&record.slo_measurement());
         }
-        log_server_prefix_hit_rate(&record);
-        if let Ok(json) = serde_json::to_string(&record) {
-            let _ = writeln!(writer, "{json}");
-            let _ = writer.flush();
+        if let Some(writer) = writer.as_mut() {
+            if serde_json::to_writer(&mut *writer, &record).is_ok() {
+                let _ = writer.write_all(b"\n");
+            }
         }
     }
-    let _ = writer.flush();
+    if let Some(writer) = writer.as_mut() {
+        let _ = writer.flush();
+    }
     summary.finalize(&mut measurements);
     log_server_prefix_hit_rate_summary(&summary);
     if let Some(slo) = slo.as_ref() {
@@ -535,34 +540,6 @@ pub(crate) async fn write_logs(
     LogFold {
         replay: summary,
         slo,
-    }
-}
-
-fn log_server_prefix_hit_rate(record: &StepLog) {
-    if !record.outcome.is_success() {
-        return;
-    }
-    let SourceRecord::SessionRound(source) = &record.source else {
-        return;
-    };
-    let Some(usage) = &record.outcome.server_usage else {
-        return;
-    };
-    if let (Some(planned), Some(actual), Some(cached), Some(prompt)) = (
-        source.planned_prefix_hit_rate,
-        usage.prefix_hit_rate,
-        usage.cached_prompt_tokens,
-        usage.prompt_tokens,
-    ) {
-        eprintln!(
-            "prefix hit rate | request_id={} planned={:.4} actual={:.4} delta={:+.4} server_cached_prompt_tokens={} server_prompt_tokens={}",
-            record.outcome.request_id,
-            planned,
-            actual,
-            actual - planned,
-            cached,
-            prompt,
-        );
     }
 }
 

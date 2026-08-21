@@ -5,7 +5,6 @@
 use anyhow::Result;
 use bytes::BytesMut;
 use futures::StreamExt;
-use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
@@ -95,7 +94,7 @@ impl GenerationClient {
 
         // Submit raw token ids: no client-side decode, so even million-token prompts cost nothing
         // here and the server's prefix-cache keys match the exact ids we built.
-        let payload = match self.backend.build_payload(&GenRequest {
+        let payload = match self.backend.serialize_payload(&GenRequest {
             model: &self.model,
             request_id: &request_id,
             prompt,
@@ -112,7 +111,7 @@ impl GenerationClient {
         let send_instant = Instant::now();
 
         let mut fold = StreamAccumulator::new(max_tokens, self.record_timeline);
-        self.fold_response(&request_id, &payload, send_instant, &mut fold)
+        self.fold_response(&request_id, payload, send_instant, &mut fold)
             .await;
 
         // Stop the wire-response clock before output re-tokenization and log shaping.
@@ -280,7 +279,7 @@ impl GenerationClient {
     async fn fold_response(
         &self,
         request_id: &str,
-        payload: &Value,
+        payload: Vec<u8>,
         send_instant: Instant,
         fold: &mut StreamAccumulator,
     ) {
@@ -288,7 +287,8 @@ impl GenerationClient {
             .client
             .post(&self.endpoint)
             .header("x-request-id", request_id)
-            .json(payload)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload)
             .send()
             .await;
 
@@ -313,20 +313,18 @@ impl GenerationClient {
                     buffer.extend_from_slice(&chunk);
                     while let Some(idx) = buffer.iter().position(|&b| b == b'\n') {
                         let line_bytes = buffer.split_to(idx + 1);
-                        let line = String::from_utf8_lossy(&line_bytes);
-                        let line = line.trim();
-                        if !line.starts_with("data: ") {
+                        let line = trim_ascii(&line_bytes);
+                        let Some(data) = line.strip_prefix(b"data: ") else {
                             continue;
-                        }
-                        let data = line.trim_start_matches("data: ").trim();
-                        if data == "[DONE]" {
+                        };
+                        let data = trim_ascii(data);
+                        if data == b"[DONE]" {
                             done = true;
                             break;
                         }
                         // A line that is not valid JSON is skipped rather than
                         // failed: some servers interleave keep-alive comments.
-                        if let Ok(value) = serde_json::from_str::<Value>(data) {
-                            let event = self.backend.parse_event(&value);
+                        if let Ok(event) = self.backend.parse_event(data) {
                             if fold.absorb(event, elapsed_ms(send_instant)).is_break() {
                                 done = true;
                                 break;
@@ -345,4 +343,14 @@ impl GenerationClient {
             }
         }
     }
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }

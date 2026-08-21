@@ -236,9 +236,21 @@ struct CurveEntry {
     failed_steps: usize,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let mut args = SweepArgs::parse();
+fn main() -> Result<()> {
+    let args = SweepArgs::parse();
+    let workers = args.run.runtime_worker_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(16)
+    });
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(workers)
+        .build()?
+        .block_on(run_sweep(args))
+}
+
+async fn run_sweep(mut args: SweepArgs) -> Result<()> {
     validate(&args)?;
     // Said once, at the top, rather than left for a reader to discover: the
     // sweep owns these three paths and whatever was passed for them is not used.
