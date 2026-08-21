@@ -64,6 +64,8 @@ const OPENAI: Dialect = Dialect {
     video: VideoShape {
         multipart: false,
         raw_response: false,
+        nested_controls: false,
+        input_reference: false,
     },
     knob_names: KnobNames {
         steps: None,
@@ -121,6 +123,8 @@ const VLLM: Dialect = Dialect {
     video: VideoShape {
         multipart: false,
         raw_response: false,
+        nested_controls: false,
+        input_reference: false,
     },
     knob_names: KnobNames {
         steps: None,
@@ -186,6 +190,8 @@ const VLLM_OMNI: Dialect = Dialect {
     video: VideoShape {
         multipart: true,
         raw_response: true,
+        nested_controls: false,
+        input_reference: false,
     },
     knob_names: KnobNames {
         steps: Some("num_inference_steps"),
@@ -246,6 +252,8 @@ const SGLANG_OMNI: Dialect = Dialect {
     video: VideoShape {
         multipart: false,
         raw_response: false,
+        nested_controls: false,
+        input_reference: false,
     },
     knob_names: KnobNames {
         steps: None,
@@ -308,6 +316,8 @@ const MSTAR: Dialect = Dialect {
     video: VideoShape {
         multipart: false,
         raw_response: false,
+        nested_controls: false,
+        input_reference: false,
     },
     knob_names: KnobNames {
         steps: Some("num_inference_steps"),
@@ -346,16 +356,17 @@ const MSTAR: Dialect = Dialect {
 
 /// NVIDIA Dynamo. Namespaces its extensions under `nvext`.
 ///
-/// Source: docs.nvidia.com/dynamo diffusion/text-to-image and
-/// user-guides/multimodal — `nvext.num_inference_steps`, and chat image output
-/// inline at `choices[].delta.content[].image_url`.
+/// Source: docs.nvidia.com/dynamo diffusion/{text-to-image,text-to-video,
+/// image-to-video,text-to-audio} — video sampling controls live in `nvext`,
+/// image-to-video uses `input_reference`, and generated media can be returned
+/// as `data[].b64_json`.
 const DYNAMO: Dialect = Dialect {
     name: "dynamo",
     chat_suffix: "/chat/completions",
     images_suffix: "/images/generations",
     speech_suffix: "/audio/speech",
     image_edits_suffix: None,
-    videos_suffix: None,
+    videos_suffix: Some("/videos"),
     transcriptions_suffix: None,
     translations_suffix: None,
     media_input: MediaInput::UrlParts,
@@ -373,6 +384,8 @@ const DYNAMO: Dialect = Dialect {
     video: VideoShape {
         multipart: false,
         raw_response: false,
+        nested_controls: true,
+        input_reference: true,
     },
     knob_names: KnobNames {
         steps: Some("num_inference_steps"),
@@ -384,9 +397,11 @@ const DYNAMO: Dialect = Dialect {
         max_tokens: &["max_tokens"],
     },
     speech: SpeechShape {
-        max_tokens_key: None,
+        max_tokens_key: Some("max_new_tokens"),
         stream_bool: false,
-        stream_format: Some("stream_format"),
+        // Dynamo's current speech surface is one-shot; `stream: true` is
+        // explicitly unsupported and there is no stream-format selector.
+        stream_format: None,
 
         stream_format_value: "audio",
         deltas: AudioDeltas::RawBytes,
@@ -428,7 +443,9 @@ mod tests {
             VLLM_OMNI.video,
             VideoShape {
                 multipart: true,
-                raw_response: true
+                raw_response: true,
+                nested_controls: false,
+                input_reference: false
             }
         );
         // M* answers the same request as JSON carrying base64.
@@ -437,7 +454,19 @@ mod tests {
             MSTAR.video,
             VideoShape {
                 multipart: false,
-                raw_response: false
+                raw_response: false,
+                nested_controls: false,
+                input_reference: false
+            }
+        );
+        assert_eq!(DYNAMO.videos_suffix, Some("/videos"));
+        assert_eq!(
+            DYNAMO.video,
+            VideoShape {
+                multipart: false,
+                raw_response: false,
+                nested_controls: true,
+                input_reference: true
             }
         );
         // SGLang-Omni does serve ASR; that is where transcription belongs.

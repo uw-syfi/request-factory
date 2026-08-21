@@ -251,8 +251,8 @@ over OpenAI-shaped paths and no two agree on how to say it:
 
 | Axis | `openai` | `vllm` / `vllm-omni` | `sglang-omni` | `mstar` | `dynamo` |
 |---|---|---|---|---|---|
-| Audio input | `input_audio{data,format}` | `audio_url{url}` | top-level `audios[]` | `audio_url{url}` | — |
-| Video input | not supported | `video_url{url}` | top-level `videos[]` | `video_url{url}` | — |
+| Audio input | `input_audio{data,format}` | `audio_url{url}` | top-level `audios[]` | `audio_url{url}` | `audio_url{url}` |
+| Video input | not supported | `video_url{url}` | top-level `videos[]` | `video_url{url}` | `video_url{url}` |
 | Audio output request | `modalities:["text","audio"]` | `["audio"]` accepted | `["text","audio"]` | `["text","audio"]` | `["text","audio"]` |
 | Streamed audio | `delta.audio.data` | chunk-level `"modality":"audio"` | `delta.audio.data` | `delta.audio.data` | `delta.audio.data` |
 | Model knobs | none accepted | nested in `extra_body` | flat | flat | nested in `nvext` |
@@ -289,10 +289,13 @@ them, and only that dialect's namespace is ever sent:
                   "vllm-omni": {"cfg_img_scale": 2.0}}}
 ```
 
-The rows below were probed against live servers, not inferred: vLLM-Omni
+The rows below were checked against live servers or the serving system's
+current protocol documentation: vLLM-Omni
 answers `/v1/images/edits` and `/v1/videos` but has no transcription route at
 all, and its `/v1/videos/sync` takes `multipart/form-data` and returns the MP4
-as the response body, where M* takes JSON and returns base64.
+as the response body, where M* takes JSON and returns base64. Dynamo serves
+`/v1/videos`, nests sampling controls in `nvext`, and calls an image-to-video
+source `input_reference`.
 
 ¹ Realtime is model-dependent on the omni stacks: a vLLM-Omni serving a
 TTS-only model answers `/v1/realtime` with 404, and an SGLang-Omni serving
@@ -309,7 +312,7 @@ surface is rejected at startup rather than discovered as a 404 mid-run:
 | `/chat/completions` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `/images/generations` | ✅ | — | ✅ | — | ✅ | ✅ |
 | `/images/edits` | ✅ | — | ✅ | — | ✅ | — |
-| `/videos` | ✅ | — | ✅ | — | ✅ | — |
+| `/videos` | ✅ | — | ✅ | — | ✅ | ✅ |
 | `/audio/speech` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `/audio/transcriptions` | ✅ | ✅ | — | ✅ | — | — |
 | `/audio/translations` | ✅ | ✅ | — | ✅ | — | — |

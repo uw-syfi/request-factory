@@ -23,7 +23,7 @@ use crate::timeline::{EventKind, TimelineEvent};
 use crate::util::{elapsed_ms, unix_seconds_now};
 
 use super::dialect::{AudioDeltas, MediaRead, VoiceSlot};
-use super::{dialect_for, ChatInputs, Dialect, GenerationResult, PreparedInputPart};
+use super::{dialect_for, sse_data_line, ChatInputs, Dialect, GenerationResult, PreparedInputPart};
 
 pub(crate) struct MediaClient {
     endpoint: String,
@@ -396,17 +396,36 @@ impl MediaClient {
                     "prompt": text_prompt_lenient(parts),
                     "size": format!("{width}x{height}"),
                     "response_format": "b64_json",
-                    "num_frames": frames,
                 });
-                if let Some(rate) = fps {
-                    payload["fps"] = (*rate).into();
+                if dialect.video.nested_controls {
+                    dialect.put_knob(&mut payload, "num_frames", (*frames).into());
+                    if let Some(rate) = fps {
+                        if rate.fract() != 0.0 {
+                            bail!(
+                                "dialect {} requires video fps to be a whole number",
+                                dialect.name
+                            );
+                        }
+                        dialect.put_knob(&mut payload, "fps", (*rate as u64).into());
+                    }
+                } else {
+                    payload["num_frames"] = (*frames).into();
+                    if let Some(rate) = fps {
+                        payload["fps"] = (*rate).into();
+                    }
                 }
                 // Image- and video-conditioned generation are first-class fields
                 // on this surface rather than message content.
                 for part in parts {
                     if let PreparedInputPart::Media { modality, data_url } = part {
                         match modality {
+                            Modality::Image if dialect.video.input_reference => {
+                                payload["input_reference"] = data_url.clone().into()
+                            }
                             Modality::Image => payload["image"] = data_url.clone().into(),
+                            Modality::Video if dialect.video.input_reference => {
+                                bail!("dialect {} video generation accepts image conditioning through input_reference, not video conditioning", dialect.name)
+                            }
                             Modality::Video => payload["video"] = data_url.clone().into(),
                             _ => bail!("video generation accepts image or video conditioning only"),
                         }
@@ -690,14 +709,13 @@ impl MediaClient {
                     buffer.extend_from_slice(&chunk);
                     while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
                         let line = buffer.split_to(index + 1);
-                        let line = String::from_utf8_lossy(&line);
-                        let Some(data) = line.trim().strip_prefix("data: ") else {
+                        let Some(data) = sse_data_line(&line) else {
                             continue;
                         };
-                        if data == "[DONE]" {
+                        if data == b"[DONE]" {
                             return;
                         }
-                        let Ok(value) = serde_json::from_str::<Value>(data) else {
+                        let Ok(value) = serde_json::from_slice::<Value>(data) else {
                             continue;
                         };
                         let Some(encoded) = audio_delta(deltas, &value) else {
@@ -1397,6 +1415,60 @@ mod tests {
     }
 
     #[test]
+    fn dynamo_video_uses_the_documented_surface_shape() {
+        let parts = vec![
+            PreparedInputPart::Text("pan left".into()),
+            media_part(Modality::Image, "data:image/png;base64,QUJD"),
+        ];
+        let body = MediaClient::for_test("dynamo", BackendKind::OpenaiVideos)
+            .build_payload(&parts, &video_output())
+            .unwrap()
+            .body;
+        assert_eq!(body["input_reference"], "data:image/png;base64,QUJD");
+        assert_eq!(body["nvext"]["num_frames"], 16);
+        assert_eq!(body["nvext"]["fps"], 8);
+        assert_eq!(body["nvext"]["num_inference_steps"], 30);
+        assert_eq!(body["nvext"]["guidance_scale"], 3.0);
+        assert_eq!(body["nvext"]["seed"], 1);
+        assert!(body.get("num_frames").is_none());
+        assert!(body.get("fps").is_none());
+        assert!(body.get("image").is_none());
+    }
+
+    #[test]
+    fn dynamo_speech_is_one_shot_and_honors_the_output_cap() {
+        let output = OutputSpec::Audio {
+            sample_rate_hz: 24_000,
+            max_tokens: Some(128),
+            max_samples: None,
+            voice: Some("Vivian".into()),
+            model_params: ModelParams::new(),
+        };
+        let body = MediaClient::for_test("dynamo", BackendKind::OpenaiSpeech)
+            .build_payload(&text_part(), &output)
+            .unwrap()
+            .body;
+        assert_eq!(body["voice"], "Vivian");
+        assert_eq!(body["max_new_tokens"], 128);
+        assert_eq!(body["response_format"], "pcm");
+        assert!(body.get("stream").is_none());
+        assert!(body.get("stream_format").is_none());
+    }
+
+    #[test]
+    fn dynamo_rejects_fractional_video_fps_before_sending() {
+        let mut output = video_output();
+        if let OutputSpec::Video { fps, .. } = &mut output {
+            *fps = Some(7.5);
+        }
+        let error = MediaClient::for_test("dynamo", BackendKind::OpenaiVideos)
+            .build_payload(&text_part(), &output)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("whole number"), "{error}");
+    }
+
+    #[test]
     fn transcription_uploads_audio_and_asks_for_json() {
         let parts = vec![media_part(Modality::Audio, "data:audio/wav;base64,QUJD")];
         let rendered = MediaClient::for_test("sglang-omni", BackendKind::OpenaiTranscriptions)
@@ -1424,12 +1496,16 @@ mod tests {
 
     #[test]
     fn a_surface_a_system_does_not_serve_is_named_as_such() {
-        let dialect = dialect_for("dynamo").unwrap();
+        let dialect = dialect_for("vllm").unwrap();
         let err = dialect
             .surface(BackendKind::OpenaiVideos)
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not serve video generation"), "{err}");
+        assert!(dialect_for("dynamo")
+            .unwrap()
+            .surface(BackendKind::OpenaiVideos)
+            .is_ok());
         // M* has no ASR surface at all; SGLang-Omni does.
         assert!(dialect_for("mstar")
             .unwrap()

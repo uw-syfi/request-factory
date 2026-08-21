@@ -94,15 +94,20 @@ pub(crate) enum MediaRead {
 
 /// How a video-generation surface is spoken and what it answers with.
 ///
-/// The two systems that serve it do not agree on either: M* takes JSON and
-/// returns base64 in `data[]`, while vLLM-Omni takes `multipart/form-data` and
-/// its `/v1/videos/sync` writes the MP4 back as the response body. Same
-/// request, two transports.
+/// The serving systems that expose it do not agree on either: M* takes JSON
+/// with flat controls, Dynamo takes JSON with `nvext`, and vLLM-Omni takes
+/// `multipart/form-data` whose `/v1/videos/sync` writes the MP4 as the body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VideoShape {
     pub(crate) multipart: bool,
     /// The body *is* the video, rather than JSON carrying it.
     pub(crate) raw_response: bool,
+    /// Dynamo places video sampling controls under `nvext`; the other video
+    /// surfaces read `num_frames` and `fps` from the request root.
+    pub(crate) nested_controls: bool,
+    /// Dynamo calls its image-to-video source `input_reference` and does not
+    /// expose the generic `image` / `video` conditioning pair.
+    pub(crate) input_reference: bool,
 }
 
 /// Semantic knob -> wire spelling. `None` means the dialect has no such knob and
