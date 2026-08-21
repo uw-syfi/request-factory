@@ -220,13 +220,13 @@ The trace declares the *shape*; the engine generates the bytes at load time,
 alongside asset reads and before the replay clock starts. A trace describing
 50 MB of media stays a few kilobytes on disk.
 
-**Content is real, not random bytes.** Images are valid 8-bit RGB PNGs and audio
-is valid mono PCM16 WAV — correct headers, correct checksums, random pixels and
-samples. A server that decodes its inputs accepts them, which matters because
-otherwise the run measures error handling rather than inference. Video is a
-well-formed MP4 box tree with a random `mdat` payload: enough for upload-path
-and throughput measurement, **not** enough for a server that decodes frames —
-use a recorded asset for that.
+**Content is real, not random bytes.** Images are valid 8-bit RGB PNGs, audio is
+valid mono PCM16 WAV, and video is valid Motion JPEG MP4 — correct headers,
+checksums or indexes, and deterministic random pixels and samples. A server that
+decodes its inputs accepts them, which matters because otherwise the run
+measures error handling rather than inference. Fixed-size padded JPEG samples
+keep byte sizing exact; use recorded assets when codec or compression behavior
+is itself part of the measurement.
 
 **`seed` controls uniqueness.** Pin it and every request carries byte-identical
 media, and the generator hands out one shared buffer. Omit it and each request

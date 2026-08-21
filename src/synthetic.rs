@@ -5,11 +5,10 @@
 //! chosen rate. Random bytes will not do -- a server that decodes its inputs
 //! rejects them, and then the run measures error handling instead of inference.
 //!
-//! So images and audio are produced as real PNG and WAV files: valid headers,
-//! valid checksums, random pixels and samples. Video is emitted as a
-//! structurally well-formed MP4 box tree whose sample payload is random; that is
-//! enough for a server that forwards or measures the upload, and deliberately
-//! not enough for one that decodes frames. See [`synthesize`].
+//! So images, audio, and video are produced as real PNG, WAV, and MP4 files:
+//! valid headers, valid checksums or indexes, and random pixels and samples.
+//! Video uses independently decodable Motion JPEG frames, keeping the encoder
+//! small and making every frame a seek point. See [`synthesize`].
 //!
 //! Content is a pure function of the seed and the shape, so the same spec yields
 //! the same bytes and the store hands out one shared buffer. That is what makes
@@ -19,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Result};
+use jpeg_encoder::{ColorType, Encoder};
 
 use crate::assets::LoadedAsset;
 use crate::schema::{Modality, SyntheticMedia};
@@ -141,25 +141,223 @@ fn wav(sample_rate_hz: u32, duration_ms: u32, seed: u64) -> Vec<u8> {
 }
 
 fn mp4_box(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
+    debug_assert!(body.len() <= u32::MAX as usize - 8);
     out.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
     out.extend_from_slice(kind);
     out.extend_from_slice(body);
 }
 
-/// A well-formed MP4 box tree with a random `mdat` payload.
-///
-/// Honest about what this is: the container parses and its size scales with the
-/// requested shape, which is what an upload-path or throughput measurement
-/// needs. It carries no `moov` track description, so a server that actually
-/// decodes frames will reject it -- use a recorded asset for that.
-fn mp4(width: u32, height: u32, frames: u32, seed: u64) -> Vec<u8> {
-    let payload_len = (width as usize * height as usize * 3 / 8).max(1) * frames as usize;
-    let mut payload = vec![0u8; payload_len];
-    SplitMix64(seed).fill(&mut payload);
-    let mut out = Vec::with_capacity(payload_len + 64);
-    mp4_box(&mut out, b"ftyp", b"isom\x00\x00\x02\x00isomiso2mp41");
-    mp4_box(&mut out, b"mdat", &payload);
+fn full_mp4_box(out: &mut Vec<u8>, kind: &[u8; 4], version: u8, flags: u32, body: &[u8]) {
+    let mut full_body = Vec::with_capacity(body.len() + 4);
+    full_body.push(version);
+    full_body.extend_from_slice(&flags.to_be_bytes()[1..]);
+    full_body.extend_from_slice(body);
+    mp4_box(out, kind, &full_body);
+}
+
+fn mp4_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn mp4_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn mp4_identity_matrix(out: &mut Vec<u8>) {
+    for value in [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] {
+        mp4_u32(out, value);
+    }
+}
+
+fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 8);
+    mp4_box(&mut out, kind, body);
     out
+}
+
+fn full_boxed(kind: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 12);
+    full_mp4_box(&mut out, kind, version, flags, body);
+    out
+}
+
+/// A decodable MP4 containing independently decodable Motion JPEG frames.
+///
+/// Each JPEG is zero-padded to a shape-derived slot. JPEG decoders ignore data
+/// after the end marker, so the MP4 remains valid while its byte size stays an
+/// exact function of shape rather than of random pixels' compression ratio.
+fn mp4(width: u32, height: u32, frames: u32, fps: f64, seed: u64) -> Result<Vec<u8>> {
+    const TIMESCALE: u32 = 90_000;
+    let width_u16 =
+        u16::try_from(width).map_err(|_| anyhow!("synthetic video width exceeds MP4 limits"))?;
+    let height_u16 =
+        u16::try_from(height).map_err(|_| anyhow!("synthetic video height exceeds MP4 limits"))?;
+    let pixel_bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|value| value.checked_mul(3))
+        .ok_or_else(|| anyhow!("synthetic video frame size overflows this platform"))?;
+    // Quality-75 JPEGs are substantially smaller than RGB. Two RGB-sized
+    // buffers plus fixed headroom provide a conservative, predictable slot.
+    let frame_slot = pixel_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(2_048))
+        .ok_or_else(|| anyhow!("synthetic video frame slot overflows this platform"))?;
+    let frame_slot_u32 = u32::try_from(frame_slot)
+        .map_err(|_| anyhow!("synthetic video frame exceeds MP4 sample limits"))?;
+    let media_bytes = (frames as usize)
+        .checked_mul(frame_slot)
+        .ok_or_else(|| anyhow!("synthetic video payload size overflows this platform"))?;
+    if media_bytes > u32::MAX as usize - 8 {
+        bail!("synthetic video exceeds the MP4 mdat box limit");
+    }
+    let total_bytes = media_bytes
+        .checked_add(603)
+        .ok_or_else(|| anyhow!("synthetic video size overflows this platform"))?;
+    let sample_delta = (f64::from(TIMESCALE) / fps)
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32;
+    let duration = frames
+        .checked_mul(sample_delta)
+        .ok_or_else(|| anyhow!("synthetic video duration exceeds MP4 limits"))?;
+
+    let mut pixels = vec![0u8; pixel_bytes];
+    let mut media = Vec::new();
+    media.try_reserve_exact(media_bytes)?;
+    let mut rng = SplitMix64(seed);
+    for _ in 0..frames {
+        rng.fill(&mut pixels);
+        let mut jpeg = Vec::new();
+        Encoder::new(&mut jpeg, 75)
+            .encode(&pixels, width_u16, height_u16, ColorType::Rgb)
+            .map_err(|error| anyhow!("failed to encode synthetic video frame: {error}"))?;
+        if jpeg.len() > frame_slot {
+            bail!(
+                "synthetic JPEG frame is {} bytes, exceeding its {frame_slot}-byte MP4 slot",
+                jpeg.len()
+            );
+        }
+        media.extend_from_slice(&jpeg);
+        media.resize(media.len() + frame_slot - jpeg.len(), 0);
+    }
+
+    let ftyp = boxed(b"ftyp", b"isom\x00\x00\x02\x00isomiso2mp41");
+    let chunk_offset = u32::try_from(ftyp.len() + 8).unwrap();
+    let mdat = boxed(b"mdat", &media);
+
+    let mut mvhd_body = Vec::with_capacity(96);
+    for value in [0, 0, TIMESCALE, duration, 0x0001_0000] {
+        mp4_u32(&mut mvhd_body, value);
+    }
+    mp4_u16(&mut mvhd_body, 0x0100);
+    mp4_u16(&mut mvhd_body, 0);
+    mp4_u32(&mut mvhd_body, 0);
+    mp4_u32(&mut mvhd_body, 0);
+    mp4_identity_matrix(&mut mvhd_body);
+    for _ in 0..6 {
+        mp4_u32(&mut mvhd_body, 0);
+    }
+    mp4_u32(&mut mvhd_body, 2);
+    let mvhd = full_boxed(b"mvhd", 0, 0, &mvhd_body);
+
+    let mut tkhd_body = Vec::with_capacity(80);
+    for value in [0, 0, 1, 0, duration, 0, 0] {
+        mp4_u32(&mut tkhd_body, value);
+    }
+    for _ in 0..4 {
+        mp4_u16(&mut tkhd_body, 0);
+    }
+    mp4_identity_matrix(&mut tkhd_body);
+    mp4_u32(&mut tkhd_body, width << 16);
+    mp4_u32(&mut tkhd_body, height << 16);
+    let tkhd = full_boxed(b"tkhd", 0, 3, &tkhd_body);
+
+    let mut mdhd_body = Vec::with_capacity(20);
+    for value in [0, 0, TIMESCALE, duration] {
+        mp4_u32(&mut mdhd_body, value);
+    }
+    mp4_u16(&mut mdhd_body, 0x55c4); // ISO-639-2/T `und`
+    mp4_u16(&mut mdhd_body, 0);
+    let mdhd = full_boxed(b"mdhd", 0, 0, &mdhd_body);
+
+    let mut hdlr_body = Vec::with_capacity(33);
+    mp4_u32(&mut hdlr_body, 0);
+    hdlr_body.extend_from_slice(b"vide");
+    for _ in 0..3 {
+        mp4_u32(&mut hdlr_body, 0);
+    }
+    hdlr_body.extend_from_slice(b"VideoHandler\0");
+    let hdlr = full_boxed(b"hdlr", 0, 0, &hdlr_body);
+
+    let mut vmhd_body = Vec::with_capacity(8);
+    for _ in 0..4 {
+        mp4_u16(&mut vmhd_body, 0);
+    }
+    let vmhd = full_boxed(b"vmhd", 0, 1, &vmhd_body);
+    let url = full_boxed(b"url ", 0, 1, &[]);
+    let mut dref_body = Vec::with_capacity(16);
+    mp4_u32(&mut dref_body, 1);
+    dref_body.extend_from_slice(&url);
+    let dinf = boxed(b"dinf", &full_boxed(b"dref", 0, 0, &dref_body));
+
+    let mut entry_body = Vec::with_capacity(78);
+    entry_body.extend_from_slice(&[0; 6]);
+    mp4_u16(&mut entry_body, 1);
+    mp4_u16(&mut entry_body, 0);
+    mp4_u16(&mut entry_body, 0);
+    for _ in 0..3 {
+        mp4_u32(&mut entry_body, 0);
+    }
+    mp4_u16(&mut entry_body, width_u16);
+    mp4_u16(&mut entry_body, height_u16);
+    mp4_u32(&mut entry_body, 0x0048_0000);
+    mp4_u32(&mut entry_body, 0x0048_0000);
+    mp4_u32(&mut entry_body, 0);
+    mp4_u16(&mut entry_body, 1);
+    let name = b"req-frontend mjpeg";
+    entry_body.push(name.len() as u8);
+    entry_body.extend_from_slice(name);
+    entry_body.resize(entry_body.len() + 31 - name.len(), 0);
+    mp4_u16(&mut entry_body, 0x0018);
+    mp4_u16(&mut entry_body, u16::MAX);
+    debug_assert_eq!(entry_body.len(), 78);
+    let entry = boxed(b"mjpg", &entry_body);
+
+    let mut stsd_body = Vec::with_capacity(90);
+    mp4_u32(&mut stsd_body, 1);
+    stsd_body.extend_from_slice(&entry);
+    let stsd = full_boxed(b"stsd", 0, 0, &stsd_body);
+    let mut stts_body = Vec::with_capacity(12);
+    for value in [1, frames, sample_delta] {
+        mp4_u32(&mut stts_body, value);
+    }
+    let stts = full_boxed(b"stts", 0, 0, &stts_body);
+    let mut stsc_body = Vec::with_capacity(16);
+    for value in [1, 1, frames, 1] {
+        mp4_u32(&mut stsc_body, value);
+    }
+    let stsc = full_boxed(b"stsc", 0, 0, &stsc_body);
+    let mut stsz_body = Vec::with_capacity(8);
+    mp4_u32(&mut stsz_body, frame_slot_u32);
+    mp4_u32(&mut stsz_body, frames);
+    let stsz = full_boxed(b"stsz", 0, 0, &stsz_body);
+    let mut stco_body = Vec::with_capacity(8);
+    mp4_u32(&mut stco_body, 1);
+    mp4_u32(&mut stco_body, chunk_offset);
+    let stco = full_boxed(b"stco", 0, 0, &stco_body);
+
+    let stbl = boxed(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+    let minf = boxed(b"minf", &[vmhd, dinf, stbl].concat());
+    let mdia = boxed(b"mdia", &[mdhd, hdlr, minf].concat());
+    let trak = boxed(b"trak", &[tkhd, mdia].concat());
+    let moov = boxed(b"moov", &[mvhd, trak].concat());
+
+    let mut out = Vec::new();
+    out.try_reserve_exact(total_bytes)?;
+    out.extend_from_slice(&ftyp);
+    out.extend_from_slice(&mdat);
+    out.extend_from_slice(&moov);
+    debug_assert_eq!(out.len(), total_bytes);
+    Ok(out)
 }
 
 /// Build one synthetic media input.
@@ -205,8 +403,9 @@ pub(crate) fn synthesize(
                 need(spec.width, "width")?,
                 need(spec.height, "height")?,
                 need(spec.frames, "frames")?,
+                spec.fps.unwrap_or(1.0),
                 seed,
-            ),
+            )?,
             "video/mp4",
         )),
         other => bail!("synthetic content is not defined for {other:?}"),
@@ -331,21 +530,65 @@ mod tests {
     }
 
     #[test]
-    fn mp4_boxes_declare_their_own_lengths() {
-        let bytes = mp4(64, 64, 4, 3);
+    fn mp4_boxes_and_sample_table_describe_every_frame() {
+        let bytes = mp4(64, 48, 4, 2.0, 3).unwrap();
+        let frame_slot = 64 * 48 * 3 * 2 + 2_048;
+        assert_eq!(bytes.len(), 603 + 4 * frame_slot);
+
         let mut offset = 0usize;
         let mut kinds = Vec::new();
-        while offset + 8 <= bytes.len() {
-            let len = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-            assert!(
-                len >= 8 && offset + len <= bytes.len(),
-                "box length in range"
-            );
+        while offset < bytes.len() {
+            let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
             kinds.push(String::from_utf8_lossy(&bytes[offset + 4..offset + 8]).to_string());
-            offset += len;
+            assert!(size >= 8 && offset + size <= bytes.len());
+            offset += size;
         }
-        assert_eq!(kinds, vec!["ftyp", "mdat"]);
+        assert_eq!(kinds, ["ftyp", "mdat", "moov"]);
         assert_eq!(offset, bytes.len());
+        assert_eq!(&bytes[36..38], &[0xff, 0xd8], "first sample is JPEG");
+
+        let stsz = bytes
+            .windows(4)
+            .position(|window| window == b"stsz")
+            .expect("sample-size box");
+        assert_eq!(
+            u32::from_be_bytes(bytes[stsz + 8..stsz + 12].try_into().unwrap()),
+            frame_slot as u32
+        );
+        assert_eq!(
+            u32::from_be_bytes(bytes[stsz + 12..stsz + 16].try_into().unwrap()),
+            4
+        );
+    }
+
+    #[test]
+    fn mp4_is_decodable_when_ffmpeg_is_available() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = match Command::new("ffmpeg")
+            .args(["-v", "error", "-i", "pipe:0", "-f", "null", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("failed to start ffmpeg: {error}"),
+        };
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&mp4(32, 24, 3, 2.0, 5).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg rejected MP4: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
