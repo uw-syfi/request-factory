@@ -1,0 +1,31 @@
+# Capacity run with generated media: no dataset, arbitrary size and rate.
+#
+# Materialize the trace first:
+#   uv run python -m benchmarks synthetic --output-dir ../out/synthetic \
+#       --count 1000 --modality image --width 512 --height 512 --arrival-rate 20
+#
+# The trace declares the shape; the engine generates the bytes before the replay
+# clock starts. manifest.json records the exact bytes per request and byte rate.
+
+input:
+  trace: ../out/synthetic/requests.jsonl
+  format: multimodal-independent-v1
+
+server:
+  backend: openai-chat
+  dialect: vllm
+  base_url: http://127.0.0.1:8000/v1
+  model: THE_SERVED_MODEL_NAME
+  temperature: 0.0
+
+replay:
+  # trace-timed honours the arrival spacing the materializer wrote, so the
+  # request rate is the one --arrival-rate asked for.
+  arrival_mode: trace-timed
+  max_concurrency: 32
+  stream_idle_timeout_seconds: 600
+
+output:
+  # Deliberately not the materializer's directory: the run writes its own
+  # requests.jsonl there and would otherwise overwrite the trace it is replaying.
+  directory: ../out/synthetic-run

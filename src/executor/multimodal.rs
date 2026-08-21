@@ -10,7 +10,8 @@ use crate::cli::BackendKind;
 use crate::executor::independent::wait_for_common_arrival;
 use crate::executor::CommonState;
 use crate::record::StepLog;
-use crate::schema::{CapabilityProfile, InputPart, Modality, OutputSpec, RequestSpec};
+use crate::schema::{CapabilityProfile, InputPart, MediaSource, Modality, OutputSpec, RequestSpec};
+use crate::synthetic::SyntheticStore;
 use crate::timeline::{RequestTimeline, TimelineSink};
 
 pub(crate) struct MultimodalState {
@@ -94,6 +95,7 @@ pub(crate) fn prepare_multimodal_requests(
         supports_multiple_outputs: false,
     };
     let store = AssetStore::new(artifact_path)?;
+    let synthetic = SyntheticStore::default();
     let mut prepared = Vec::with_capacity(requests.len());
     for request in requests {
         capabilities
@@ -112,15 +114,25 @@ pub(crate) fn prepare_multimodal_requests(
             match input {
                 InputPart::System { text } => parts.push(PreparedInputPart::System(text.clone())),
                 InputPart::Text { text } => parts.push(PreparedInputPart::Text(text.clone())),
-                InputPart::Image { asset }
-                | InputPart::Audio { asset }
-                | InputPart::Video { asset } => {
-                    let loaded = store.load(asset).with_context(|| {
-                        format!(
-                            "prepare asset {:?} for request {:?}",
-                            asset.path, request.id
-                        )
-                    })?;
+                InputPart::Image { source }
+                | InputPart::Audio { source }
+                | InputPart::Video { source } => {
+                    let loaded = match source {
+                        MediaSource::Asset(asset) => store.load(asset).with_context(|| {
+                            format!(
+                                "prepare asset {:?} for request {:?}",
+                                asset.path, request.id
+                            )
+                        })?,
+                        // Generated here, alongside asset loading: both finish
+                        // before the replay clock starts, so neither shows up in
+                        // a measured latency.
+                        MediaSource::Synthetic(spec) => synthetic
+                            .build(spec, input.modality(), &request.id)
+                            .with_context(|| {
+                                format!("generate synthetic input for request {:?}", request.id)
+                            })?,
+                    };
                     asset_bytes = asset_bytes.saturating_add(loaded.bytes.len());
                     parts.push(PreparedInputPart::Media {
                         modality: input.modality(),

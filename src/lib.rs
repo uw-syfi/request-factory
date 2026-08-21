@@ -43,6 +43,8 @@ mod slo_source;
 #[cfg(feature = "runtime")]
 mod summary;
 #[cfg(feature = "runtime")]
+mod synthetic;
+#[cfg(feature = "runtime")]
 mod timeline;
 #[cfg(feature = "runtime")]
 mod tokens;

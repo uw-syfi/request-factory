@@ -171,6 +171,45 @@ workload shape.
 | `openai-transcriptions` | `POST {base_url}/audio/transcriptions` | Multipart: uploaded audio, text out |
 | `openai-translations` | `POST {base_url}/audio/translations` | As transcription, translated to English |
 
+### Synthetic media inputs
+
+A benchmark replays recorded assets. A capacity run often does not need them —
+it needs bytes of a chosen size, in a format the server accepts, at a chosen
+rate. Any media input can declare `synthetic` instead of `asset`:
+
+```json
+{"type": "image", "synthetic": {"width": 1024, "height": 1024, "seed": 7}}
+{"type": "audio", "synthetic": {"sample_rate_hz": 24000, "duration_ms": 5000}}
+{"type": "video", "synthetic": {"width": 512, "height": 512, "frames": 16, "fps": 8.0}}
+```
+
+The trace declares the *shape*; the engine generates the bytes at load time,
+alongside asset reads and before the replay clock starts. A trace describing
+50 MB of media stays a few kilobytes on disk.
+
+**Content is real, not random bytes.** Images are valid 8-bit RGB PNGs and audio
+is valid mono PCM16 WAV — correct headers, correct checksums, random pixels and
+samples. A server that decodes its inputs accepts them, which matters because
+otherwise the run measures error handling rather than inference. Video is a
+well-formed MP4 box tree with a random `mdat` payload: enough for upload-path
+and throughput measurement, **not** enough for a server that decodes frames —
+use a recorded asset for that.
+
+**`seed` controls uniqueness.** Pin it and every request carries byte-identical
+media, and the generator hands out one shared buffer. Omit it and each request
+gets its own content, derived from its request id. That is the difference
+between measuring a server with a warm media cache and one without.
+
+Generate a trace with `benchmarks`:
+
+```bash
+uv run python -m benchmarks synthetic --output-dir out/synthetic \
+    --count 1000 --modality image --width 512 --height 512 --arrival-rate 20
+```
+
+It prints, and records in `manifest.json`, exactly how many bytes each request
+carries and the resulting byte rate — so a run can be sized before it is made.
+
 ### `server.dialect`: which vocabulary, not which endpoint
 
 `backend` selects the endpoint surface. `dialect` selects the words used on it.

@@ -59,7 +59,7 @@ impl AssetRef {
 }
 
 /// One ordered input part. A request may mix and repeat modalities.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputPart {
     /// A chat-level instruction. It must precede every user input part.
@@ -70,13 +70,16 @@ pub enum InputPart {
         text: String,
     },
     Image {
-        asset: AssetRef,
+        #[serde(flatten)]
+        source: MediaSource,
     },
     Audio {
-        asset: AssetRef,
+        #[serde(flatten)]
+        source: MediaSource,
     },
     Video {
-        asset: AssetRef,
+        #[serde(flatten)]
+        source: MediaSource,
     },
     Tensor {
         asset: AssetRef,
@@ -95,13 +98,25 @@ impl InputPart {
         }
     }
 
+    /// The recorded asset behind this input, if it has one. Synthetic inputs
+    /// have no file and no digest, so callers that need bytes go through
+    /// [`Self::source`] instead.
     pub fn asset(&self) -> Option<&AssetRef> {
+        match self.source() {
+            Some(MediaSource::Asset(asset)) => Some(asset),
+            _ => match self {
+                Self::Tensor { asset } => Some(asset),
+                _ => None,
+            },
+        }
+    }
+
+    pub fn source(&self) -> Option<&MediaSource> {
         match self {
-            Self::System { .. } | Self::Text { .. } => None,
-            Self::Image { asset }
-            | Self::Audio { asset }
-            | Self::Video { asset }
-            | Self::Tensor { asset } => Some(asset),
+            Self::Image { source } | Self::Audio { source } | Self::Video { source } => {
+                Some(source)
+            }
+            _ => None,
         }
     }
 
@@ -111,8 +126,90 @@ impl InputPart {
                 bail!("{at}: text must not be empty")
             }
             Self::System { .. } | Self::Text { .. } => Ok(()),
-            _ => self.asset().expect("media input has an asset").validate(at),
+            Self::Tensor { asset } => asset.validate(at),
+            _ => match self.source().expect("media input has a source") {
+                MediaSource::Asset(asset) => asset.validate(at),
+                MediaSource::Synthetic(spec) => spec.validate(self.modality(), at),
+            },
         }
+    }
+}
+
+/// Where one media input's bytes come from.
+///
+/// A benchmark replays real recorded assets. A capacity run does not need them:
+/// it needs bytes of a chosen size, in a format the server will accept, at a
+/// chosen rate. Making that a source rather than a second input type keeps every
+/// downstream layer -- encoding, dialects, capability checks -- unchanged.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaSource {
+    Asset(AssetRef),
+    Synthetic(SyntheticMedia),
+}
+
+/// A generated media input, described by shape rather than by content.
+///
+/// Content is a pure function of `seed` and the shape fields, which is what
+/// makes "non-unique" expressible: two requests sharing a seed carry
+/// byte-identical media and the generator hands out one shared buffer. Omit the
+/// seed and each request gets its own bytes, derived from its request id.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SyntheticMedia {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate_hz: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+}
+
+impl SyntheticMedia {
+    /// Check that this description names a shape the generator can build for
+    /// `modality`. The modality comes from the input part, so the fields a
+    /// given kind needs are known here rather than guessed at generation time.
+    pub fn validate(&self, modality: Modality, at: &str) -> Result<()> {
+        let missing = |what: &str| -> Result<()> {
+            bail!("{at}: synthetic {modality:?} input requires {what}")
+        };
+        match modality {
+            Modality::Image => {
+                if !matches!((self.width, self.height), (Some(w), Some(h)) if w > 0 && h > 0) {
+                    return missing("positive width and height");
+                }
+            }
+            Modality::Audio => {
+                if !matches!(self.sample_rate_hz, Some(rate) if rate > 0) {
+                    return missing("a positive sample_rate_hz");
+                }
+                if !matches!(self.duration_ms, Some(ms) if ms > 0) {
+                    return missing("a positive duration_ms");
+                }
+            }
+            Modality::Video => {
+                if !matches!((self.width, self.height), (Some(w), Some(h)) if w > 0 && h > 0) {
+                    return missing("positive width and height");
+                }
+                if !matches!(self.frames, Some(frames) if frames > 0) {
+                    return missing("a positive frames");
+                }
+                if !self.fps.is_none_or(|fps| fps.is_finite() && fps > 0.0) {
+                    return missing("a positive fps");
+                }
+            }
+            Modality::Text | Modality::Tensor => {
+                bail!("{at}: synthetic content is not defined for {modality:?}")
+            }
+        }
+        Ok(())
     }
 }
 
@@ -358,6 +455,16 @@ impl RequestSpec {
     pub fn assets(&self) -> impl Iterator<Item = &AssetRef> {
         self.inputs.iter().filter_map(InputPart::asset)
     }
+
+    /// Inputs whose bytes are generated rather than read from a file. Counted
+    /// separately from [`Self::assets`] so a record showing bytes but no assets
+    /// is legible instead of looking like an accounting bug.
+    pub fn synthetic_inputs(&self) -> usize {
+        self.inputs
+            .iter()
+            .filter(|input| matches!(input.source(), Some(MediaSource::Synthetic(_))))
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -382,13 +489,13 @@ mod tests {
                     text: "compare these".into(),
                 },
                 InputPart::Image {
-                    asset: asset("one.jpg"),
+                    source: MediaSource::Asset(asset("one.jpg")),
                 },
                 InputPart::Image {
-                    asset: asset("two.jpg"),
+                    source: MediaSource::Asset(asset("two.jpg")),
                 },
                 InputPart::Audio {
-                    asset: asset("question.wav"),
+                    source: MediaSource::Asset(asset("question.wav")),
                 },
             ],
             outputs: vec![
@@ -494,7 +601,7 @@ mod tests {
             arrival_time_ms: 0.0,
             inputs: vec![
                 InputPart::Image {
-                    asset: asset("food.jpg"),
+                    source: MediaSource::Asset(asset("food.jpg")),
                 },
                 InputPart::Text {
                     text: "describe it".into(),

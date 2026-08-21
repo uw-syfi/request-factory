@@ -14,7 +14,7 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-from benchmarks import seed_tts, vbench
+from benchmarks import seed_tts, synthetic, vbench
 
 FOOD101_URL = "https://data.vision.ee.ethz.ch/cvl/food-101.tar.gz"
 FOOD101_ARCHIVE_BYTES = 4_996_278_331
@@ -40,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     vbench.add_parser(subparsers)
     seed_tts.add_seed_tts_parser(subparsers)
+    synthetic.add_parser(subparsers)
     return parser
 
 
@@ -242,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
             return seed_tts.materialize_seed_tts(
                 seed_tts.options_from_namespace(arguments)
             )
+        if arguments.benchmark == "synthetic":
+            return synthetic.materialize(arguments)
     except (
         EOFError,
         OSError,

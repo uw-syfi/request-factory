@@ -376,6 +376,13 @@ next context instead of inventing output. `prefix_len` is the planned reusable
 prefix; it does not assert that the server hit its cache. Server-reported cached
 prompt tokens are recorded separately.
 
+`synthetic.rs` is the counterpart of `tokens.rs` for media: where the text path
+materializes token ids from a corpus, this materializes image, audio and video
+bytes from a declared shape. Both run before the replay clock starts, and both
+cache so repeated content costs one buffer rather than one per request. A
+`MediaSource` is either a recorded `AssetRef` or a `SyntheticMedia` shape, which
+keeps every layer above it -- encoding, dialects, capability checks -- unchanged.
+
 ## 9. `backend/` normalizes serving protocols
 
 The executor submits a backend-neutral request:
@@ -506,6 +513,7 @@ execution policy.
 | `runner.rs` | wiring and lifecycle for one run |
 | `executor/` | arrival release, session dependency, admission, request lifecycle |
 | `tokens.rs` | concrete token ids and session-context carry-forward |
+| `synthetic.rs` | generated image/audio/video bytes from a declared shape |
 | `backend/wire/` | protocol-specific JSON shaping and parsing |
 | `backend/dialect/` | per-serving-system wire vocabulary: field names, knob placement, media framing |
 | `backend/client.rs` | shared token/text HTTP streaming engine and integrity measurements |
