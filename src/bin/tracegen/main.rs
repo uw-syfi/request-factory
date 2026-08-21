@@ -187,7 +187,7 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut schedule = [0u32; 64];
         for (index, word) in schedule.iter_mut().take(16).enumerate() {
             let start = index * 4;
