@@ -432,15 +432,19 @@ impl MediaClient {
                     }
                 }
                 if let Some(key) = names.steps {
-                    dialect.put_knob(&mut payload, key, (*steps).into());
+                    self.put_video_knob(&mut payload, key, (*steps).into());
                 }
                 if let (Some(key), Some(value)) = (names.guidance, guidance) {
-                    dialect.put_knob(&mut payload, key, (*value).into());
+                    self.put_video_knob(&mut payload, key, (*value).into());
                 }
                 if let (Some(key), Some(value)) = (names.seed, seed) {
-                    dialect.put_knob(&mut payload, key, (*value).into());
+                    self.put_video_knob(&mut payload, key, (*value).into());
                 }
-                self.put_model_params(&mut payload, model_params);
+                if let Some(knobs) = model_params.get(dialect.name) {
+                    for (key, value) in knobs {
+                        self.put_video_knob(&mut payload, key, value.clone());
+                    }
+                }
                 if dialect.video.multipart {
                     // vLLM-Omni's video routes take multipart/form-data, so the
                     // same declared shape goes out as form fields instead.
@@ -525,6 +529,18 @@ impl MediaClient {
         };
         for (key, value) in knobs {
             self.dialect.put_knob(payload, key, value.clone());
+        }
+    }
+
+    /// Video APIs place all generation controls together. In particular,
+    /// vLLM-Omni's JSON image API uses `extra_body`, while its multipart video
+    /// API reads flat form fields; Dynamo is the inverse case and reads every
+    /// video control from `nvext`.
+    fn put_video_knob(&self, payload: &mut Value, key: &str, value: Value) {
+        if self.dialect.video.nested_controls {
+            self.dialect.put_knob(payload, key, value);
+        } else {
+            payload[key] = value;
         }
     }
 
@@ -1386,6 +1402,12 @@ mod tests {
         assert!(rendered.multipart, "vllm-omni's video route takes a form");
         assert!(rendered.file.is_none(), "text-only: nothing to upload");
         assert_eq!(rendered.body["prompt"], "a cat");
+        assert_eq!(rendered.body["num_frames"], 16);
+        assert_eq!(rendered.body["fps"], 8.0);
+        assert_eq!(rendered.body["num_inference_steps"], 30);
+        assert_eq!(rendered.body["guidance_scale"], 3.0);
+        assert_eq!(rendered.body["seed"], 1);
+        assert!(rendered.body.get("extra_body").is_none());
     }
 
     #[test]

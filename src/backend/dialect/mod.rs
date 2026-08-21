@@ -102,8 +102,8 @@ pub(crate) struct VideoShape {
     pub(crate) multipart: bool,
     /// The body *is* the video, rather than JSON carrying it.
     pub(crate) raw_response: bool,
-    /// Dynamo places video sampling controls under `nvext`; the other video
-    /// surfaces read `num_frames` and `fps` from the request root.
+    /// Dynamo places all video sampling controls under `nvext`; the other
+    /// video surfaces read them from the request root.
     pub(crate) nested_controls: bool,
     /// Dynamo calls its image-to-video source `input_reference` and does not
     /// expose the generic `image` / `video` conditioning pair.
