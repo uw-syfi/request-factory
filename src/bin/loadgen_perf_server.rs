@@ -1,6 +1,6 @@
 //! Minimal, deliberately fast vLLM token-protocol responder for load-generator profiling.
 //!
-//! This is not an inference-server mock. It implements only the wire behavior req-frontend
+//! This is not an inference-server mock. It implements only the wire behavior Request Factory
 //! needs in order to measure its own ceiling: persistent HTTP/1.1, chunked SSE, exact token
 //! counts, and the two-request prefix-cache preflight. Measured requests remain stateless so
 //! server-side bookkeeping cannot become the benchmark's bottleneck.

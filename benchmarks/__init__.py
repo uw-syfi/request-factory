@@ -1,1 +1,1 @@
-"""Dataset-to-request materializers for reproducible req-frontend benchmarks."""
+"""Dataset-to-request materializers for reproducible Request Factory benchmarks."""

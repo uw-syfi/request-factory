@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1>req-frontend</h1>
+<h1>Request Factory</h1>
 
 **Replay typed text and multimodal workloads against an inference server.**
 
@@ -35,6 +35,10 @@ release timing, session ordering, and tool waits while replacing private prompt
 contents with synthetic token IDs. Asset-backed benchmarks preserve real input
 media and prompts, verify their hashes, and delegate model preprocessing to the
 system under test.
+
+The project is named **Request Factory**. Compatibility-sensitive package,
+module, binary, cache, and protocol identifiers retain their existing
+`req-frontend` or `req_frontend` spelling.
 
 It reads a trace; it does not collect one. The public coding-agent corpus these
 traces are usually derived from lives in [TraceLab][tracelab], which exports raw
@@ -363,11 +367,11 @@ Run from the repository root. Start with the supplied shape and edit the model,
 tokenizer, corpus, endpoint, and output directory:
 
 ```bash
-cp configs/run.example.yaml "$TMPDIR/req-frontend-run.yaml"
-${EDITOR:-vi} "$TMPDIR/req-frontend-run.yaml"
+cp configs/run.example.yaml "$TMPDIR/request-factory-run.yaml"
+${EDITOR:-vi} "$TMPDIR/request-factory-run.yaml"
 
-uv run python -m launcher run "$TMPDIR/req-frontend-run.yaml" --dry-run
-uv run python -m launcher run "$TMPDIR/req-frontend-run.yaml"
+uv run python -m launcher run "$TMPDIR/request-factory-run.yaml" --dry-run
+uv run python -m launcher run "$TMPDIR/request-factory-run.yaml"
 ```
 
 The launcher builds `session_runner`, runs it, saves the YAML and resolved
@@ -406,7 +410,7 @@ server:
 
 ## Engine-side setup guide
 
-req-frontend measures the full client-visible streaming path, so engine setup is
+Request Factory measures the full client-visible streaming path, so engine setup is
 part of the measurement contract. The model engine and its HTTP frontend are
 separate capacity boundaries: TP/DP and batching control EngineCore execution,
 while vLLM API processes parse requests, receive engine outputs, serialize SSE
@@ -427,11 +431,11 @@ python -m vllm.entrypoints.cli.main serve \
   --disable-uvicorn-access-log
 ```
 
-Use `--base-url http://127.0.0.1:8000/v1 --backend openai` on the req-frontend
+Use `--base-url http://127.0.0.1:8000/v1 --backend openai` on the Request Factory
 side. For native token-in/token-out, add `--tokens-only` to the server command
 and use `--base-url http://127.0.0.1:8000 --backend vllm-tokens`.
 
-| Server setting | Why req-frontend needs it |
+| Server setting | Why Request Factory needs it |
 |---|---|
 | `--enable-prefix-caching` | Enables the cache behavior audited by the session-workload preflight. Off by default for hybrid models. |
 | `--enable-prompt-tokens-details` | Returns cached-token usage needed to prove the preflight and report cache alignment. Useful on `independent` runs too, as evidence the hit rate really is ~0. |
@@ -458,12 +462,12 @@ python -m sglang.launch_server \
 ```
 
 Use `--base-url http://127.0.0.1:30000 --backend sglang-tokens` on the
-req-frontend side — no `/v1` suffix, because `/generate` is a native route.
+Request Factory side — no `/v1` suffix, because `/generate` is a native route.
 
-| Server setting | Why req-frontend needs it |
+| Server setting | Why Request Factory needs it |
 |---|---|
 | `--skip-tokenizer-init` | Accepts `input_ids` and returns `output_ids` with no detokenization. The counterpart of vLLM's `--tokens-only`. OpenAI-compatible routes stop working on this server. |
-| `--stream-output` | Streams disjoint deltas. Without it SGLang resends the full output every chunk, which distorts late-token latency; req-frontend detects this and fails rather than reporting it. Newer SGLang renames it `--incremental-streaming-output`. |
+| `--stream-output` | Streams disjoint deltas. Without it SGLang resends the full output every chunk, which distorts late-token latency; Request Factory detects this and fails rather than reporting it. Newer SGLang renames it `--incremental-streaming-output`. |
 
 SGLang's radix prefix cache is on by default and reports `cached_tokens` in
 `meta_info`, so the preflight needs no extra flag — unlike vLLM, which needs
@@ -471,19 +475,19 @@ SGLang's radix prefix cache is on by default and reports `cached_tokens` in
 
 ### API process sizing
 
-Do not confuse vLLM API processes with req-frontend concurrency or req-frontend's
+Do not confuse vLLM API processes with Request Factory concurrency or Request Factory's
 Tokio worker threads:
 
 | Boundary | Control | Meaning |
 |---|---|---|
-| req-frontend arrival scheduler | `--arrival-mode`, CSV arrivals and `--rate` | When top-level workload units become runnable. |
-| req-frontend active work | `--max-concurrency` | Maximum active sessions or independent requests, counted across tool waits. |
-| req-frontend runtime | Tokio workers, reported under `client_runtime` | Polling release and HTTP client tasks. |
+| Request Factory arrival scheduler | `--arrival-mode`, CSV arrivals and `--rate` | When top-level workload units become runnable. |
+| Request Factory active work | `--max-concurrency` | Maximum active sessions or independent requests, counted across tool waits. |
+| Request Factory runtime | Tokio workers, reported under `client_runtime` | Polling release and HTTP client tasks. |
 | vLLM HTTP frontend | `--api-server-count N` | Number of API processes draining EngineCore outputs and emitting streams. |
 | vLLM EngineCore | TP/DP, batching, and token-budget flags | Model execution and engine-side queueing. |
 
 One API process can become the bottleneck at high request rates even while the
-GPU engine has capacity. Increasing req-frontend `--max-concurrency` does not fix
+GPU engine has capacity. Increasing Request Factory `--max-concurrency` does not fix
 that server-side bottleneck. Typical evidence is:
 
 - `arrival_release_lag_ms` remains small, proving the client released on time;
@@ -510,7 +514,7 @@ In the vLLM fork used for alignment,
 `python -m vllm.entrypoints.openai.api_server` accepts
 `--api-server-count` but still enters the single-server path. Launch through
 `vllm serve` or `python -m vllm.entrypoints.cli.main serve` to select the real
-multi-API path. Before measuring, also confirm that the req-frontend prefix-cache
+multi-API path. Before measuring, also confirm that the Request Factory prefix-cache
 preflight passes and that the server reports the intended model, TP/DP layout,
 prefix caching, token mode, and `stream_interval`.
 
@@ -922,7 +926,7 @@ Every flag, including the ones outside this axis, is listed in the
 
 The three text-completion backends submit the prompt as explicit token IDs, so they are
 **identical on the input side**: the server's prefix-cache keys are the exact
-ids req-frontend constructed. They differ only in what comes back, and the
+IDs Request Factory constructed. They differ only in what comes back, and the
 difference is not whether generated token IDs are available — they are, on all
 three — but whether the server performs detokenization at all.
 
@@ -993,7 +997,7 @@ POST {base_url}/generate
 
 The server must be launched with **two** flags:
 
-| Server flag | Why req-frontend requires it |
+| Server flag | Why Request Factory requires it |
 |---|---|
 | `--skip-tokenizer-init` | The counterpart of vLLM's `--tokens-only`. The server accepts `input_ids` and returns `output_ids` without ever detokenizing. OpenAI-compatible endpoints stop working on that server, so use `/generate`. |
 | `--stream-output` | Makes streamed chunks disjoint deltas. SGLang's default resends the entire output in every chunk, which is O(n²) bytes over the stream and inflates late-token latency — a measurement artifact, not just a parsing inconvenience. Newer SGLang renames this to `--incremental-streaming-output` and keeps `--stream-output` as a deprecated alias. |
@@ -1064,7 +1068,7 @@ vLLM server. Omitting `backend` keeps the backward-compatible `openai` default.
 
 ## Synthetic token corpus
 
-`--text-file` supplies content, while the CSV supplies shape. req-frontend tokenizes
+`--text-file` supplies content, while the CSV supplies shape. Request Factory tokenizes
 non-empty corpus lines once with `add_special_tokens = false`, stores the
 resulting IDs in a shared pool, and performs all later prompt construction in
 ID space. The tokenizer must match the served model.
@@ -1078,7 +1082,7 @@ max(2 * longest_trace_prompt, workload_unit_count, 100,000,000 tokens)
 
 The 100M-token floor consumes about 400 MB for the `u32` ID pool and generally
 requires roughly 400–600 MB or more of source text. `--token-pool-limit` can
-reduce it. If the corpus produces fewer IDs than the longest prompt, req-frontend
+reduce it. If the corpus produces fewer IDs than the longest prompt, Request Factory
 warns that content will repeat within a request and may distort prefix-cache
 measurements. Monotonic construction also keeps every actual prompt at the
 trace-reported target `prefix_len + input_len`.
@@ -1089,7 +1093,7 @@ boundary transitions but no client/server mismatch: the exact resulting IDs are
 sent directly to the server.
 
 For large-context tests, a large public corpus such as `enwik9` is suitable.
-req-frontend does not bundle it; obtain it from its original distributor and follow
+Request Factory does not bundle it; obtain it from its original distributor and follow
 the applicable license.
 
 ## Context limits and prefix-cache preflight
@@ -1104,7 +1108,7 @@ of headroom. A live request is skipped when:
 actual_prompt_len + output_len_target >= max_model_len
 ```
 
-Equality deliberately skips. req-frontend does not silently shorten the requested
+Equality deliberately skips. Request Factory does not silently shorten the requested
 output to fit. An independent request is logged as skipped and replay continues.
 A skipped session round is logged and that session terminates, because the
 missing model output makes subsequent context continuation untrustworthy.
@@ -1118,7 +1122,7 @@ the trace's own numbers only when `prefix_shortfall_tokens` is nonzero.
 
 ### Prefix-cache preflight
 
-Before every non-dry run, req-frontend sends the same 512-token-or-smaller probe
+Before every non-dry run, Request Factory sends the same 512-token-or-smaller probe
 twice and requires the second response to report a positive cached-token count.
 A single probe cannot separate "prefix caching is off" from "the cache is
 cold", so the run aborts unless the second response proves a hit. Both probe
@@ -1714,7 +1718,7 @@ token-level plan.
 | `prefix-cache preflight failed` | Enable prefix caching and prompt-token usage details — for vLLM, `--enable-prompt-tokens-details` (or `ENABLE_PROMPT_TOKENS_DETAILS=1`) with prefix caching left on. Confirm both probe requests reach the same server/cache shard. |
 | `failed to parse a session-execution-v2 row` | The file is a raw, unmaterialized CSV. Run it through `tracegen coding-session` first; `--input-file-format text-generation-session-execution-v2` reads canonical traces only. |
 | `server streamed cumulative output` | The SGLang server is in its default cumulative streaming mode. Relaunch it with `--stream-output` (named `--incremental-streaming-output` in newer builds). |
-| `the extra leading ids do not match the prompt tail` | The server streamed more generated IDs than its own `completion_tokens` count, and the excess is not an echo of the prompt. req-frontend refuses to guess what those IDs are; inspect the raw response before trusting the run. |
+| `the extra leading ids do not match the prompt tail` | The server streamed more generated IDs than its own `completion_tokens` count, and the excess is not an echo of the prompt. Request Factory refuses to guess what those IDs are; inspect the raw response before trusting the run. |
 | `--rate ... --arrival-mode saturated` rejected | One rescales the recorded timeline, the other discards it. To bound a saturated run, use `--max-concurrency`. |
 | `--max-concurrency` appears to change nothing | The units never overlap, so the cap never binds. Check the trace's arrival spacing against its per-unit duration; to force overlap, use `--arrival-mode saturated`. |
 | `cannot apply --rate` | The selected workload has fewer than two distinct top-level arrival times. |

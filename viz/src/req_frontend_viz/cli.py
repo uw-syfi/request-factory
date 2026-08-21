@@ -21,7 +21,7 @@ from .load import iter_point_directories, load_sweep, load_timeline
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="viz",
-        description="Draw a req-frontend sweep: throughput, attainment, latency, token arrivals.",
+        description="Draw a Request Factory sweep: throughput, attainment, latency, token arrivals.",
     )
     parser.add_argument(
         "sweep",

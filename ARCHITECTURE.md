@@ -1,6 +1,6 @@
-# req-frontend: from input file to replay report
+# Request Factory: from input file to replay report
 
-This document explains `req-frontend`'s own end-to-end data flow: how one run
+This document explains Request Factory's end-to-end data flow: how one run
 declares an input file, parses and validates its rows, builds a replay workload,
 releases requests, talks to a serving backend, and records the result. SLO,
 priority, session, and speculative metadata are local concerns along that path;

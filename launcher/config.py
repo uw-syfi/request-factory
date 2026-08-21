@@ -1,4 +1,4 @@
-"""Strict YAML loading and lowering to req-frontend's internal Rust argv.
+"""Strict YAML loading and lowering to Request Factory's internal Rust argv.
 
 The YAML tree is the human-facing contract. This module owns its grouping and
 path resolution, but deliberately does not implement replay semantics: after

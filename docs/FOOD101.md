@@ -1,7 +1,7 @@
 # Food101 image-to-text replay
 
 This adapter materializes the Food-101 images used for BAGEL image-to-text
-serving evaluation into req-frontend's canonical
+serving evaluation into Request Factory's canonical
 `multimodal-independent-v1` artifact. It is a serving-performance workload,
 not an accuracy harness and not a dependency on M*.
 
@@ -66,7 +66,7 @@ server:
   model: THE_SERVED_BAGEL_MODEL_NAME
 ```
 
-No corpus or tokenizer block belongs in this run. req-frontend sends original
+No corpus or tokenizer block belongs in this run. Request Factory sends original
 image bytes and text; the system under test chooses image preprocessing,
 encoded-token expansion, batching, and caching. Prefix-cache preflight and
 prefix-hit summaries remain text-session concerns and are not fabricated for

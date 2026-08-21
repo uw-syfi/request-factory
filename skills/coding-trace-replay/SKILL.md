@@ -1,13 +1,13 @@
 ---
 name: coding-trace-replay
-description: Configure, generate, run, sweep, validate, and interpret req-frontend workloads through its structured YAML launcher. Use for `python -m launcher` tasks (`run`, `sweep`, `tracegen`, `selfcheck`), choosing complete input-file formats, canonicalizing recorded or synthetic session traces, selecting arrival/concurrency and OpenAI/vLLM/SGLang backends, launching a compatible real serving endpoint, diagnosing prefix-cache or streaming failures, rendering sweep figures, and reading requests.jsonl, summary.json, timeline.parquet, sweep.json, trace manifests, or selfcheck reports.
+description: Configure, generate, run, sweep, validate, and interpret Request Factory workloads through its structured YAML launcher. Use for `python -m launcher` tasks (`run`, `sweep`, `tracegen`, `selfcheck`), choosing complete input-file formats, canonicalizing recorded or synthetic session traces, selecting arrival/concurrency and OpenAI/vLLM/SGLang backends, launching a compatible real serving endpoint, diagnosing prefix-cache or streaming failures, rendering sweep figures, and reading requests.jsonl, summary.json, timeline.parquet, sweep.json, trace manifests, or selfcheck reports.
 ---
 
 # Coding Trace Replay
 
 ## Use the supported interface
 
-Work from the `req-frontend` repository root. Represent every operator action as
+Work from the Request Factory repository root. Represent every operator action as
 one task plus one YAML file:
 
 ```bash

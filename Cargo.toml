@@ -3,7 +3,7 @@ name = "req-frontend"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Typed workload runner for OpenAI-compatible inference servers"
+description = "Request Factory: typed workload runner for OpenAI-compatible inference servers"
 
 # Shared between the replay runtime, the trace generator, and any other program
 # that reads the same files: all of them must agree on what a trace *is*, so the

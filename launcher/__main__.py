@@ -1,4 +1,4 @@
-"""Task-oriented YAML launcher for every req-frontend execution mode."""
+"""Task-oriented YAML launcher for every Request Factory execution mode."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ TASKS = ("run", "sweep", "tracegen", "selfcheck")
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m launcher",
-        description="Run req-frontend tasks from strict, structured YAML.",
+        description="Run Request Factory tasks from strict, structured YAML.",
     )
     parser.add_argument("task", choices=TASKS)
     parser.add_argument("config", type=Path, help="Task YAML path")

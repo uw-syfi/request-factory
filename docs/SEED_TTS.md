@@ -20,7 +20,7 @@ Use `--include-reference-audio` to emit ordered reference-text, reference-audio,
 and target-text inputs for a backend that implements voice conditioning. The
 reference voice metadata is always retained in `labels.jsonl`, even in M*
 compatibility mode. Quality scoring such as WER and speaker similarity remains
-outside req-frontend's serving-performance scope.
+outside Request Factory's serving-performance scope.
 
 ## Acquire and materialize
 

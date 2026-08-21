@@ -1,7 +1,7 @@
 [project]
 name = "req-frontend-launcher"
 version = "0.1.0"
-description = "Structured YAML launcher for req-frontend"
+description = "Structured YAML launcher for Request Factory"
 requires-python = ">=3.10"
 dependencies = ["pyyaml>=6"]
 

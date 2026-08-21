@@ -1,6 +1,6 @@
-# req-frontend：从输入文件到 replay 报告
+# Request Factory：从输入文件到 replay 报告
 
-本文解释 `req-frontend` 自己的端到端数据流：一次 run 如何声明输入文件、解析并验证
+本文解释 Request Factory 自己的端到端数据流：一次 run 如何声明输入文件、解析并验证
 rows、构造 replay workload、按时间 release 请求、与 serving backend 交互，最后写出日志与
 汇总。SLO、priority、session 和 speculative 都是这条主线上的局部语义，不是架构主轴。
 
