@@ -8,11 +8,14 @@
 //! parsing one. Nothing above this module sees a `serde_json::Value`.
 
 mod client;
+mod dialect;
 mod integrity;
 mod media_client;
 mod preflight;
 mod stream;
 mod wire;
+
+use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -23,6 +26,7 @@ use crate::timeline::TimelineEvent;
 use crate::util::unix_seconds_now;
 
 pub(crate) use client::GenerationClient;
+pub(crate) use dialect::{dialect_for, Dialect};
 pub(crate) use media_client::MediaClient;
 
 /// What one request sends as its input.
@@ -55,10 +59,55 @@ pub(crate) enum PreparedInputPart {
     },
 }
 
-/// Shape role-aware, interleaved input parts for OpenAI-compatible chat APIs.
-pub(crate) fn chat_messages(parts: &[PreparedInputPart]) -> Result<Vec<Value>> {
+/// A failed response's status *and* what the server said about it.
+///
+/// The status alone is rarely the answer: vLLM's 404 body carries "The model
+/// `x` does not exist", which is the whole diagnosis.
+pub(crate) async fn http_failure(response: reqwest::Response) -> String {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    match error_detail(&body) {
+        Some(detail) => format!("HTTP {status}: {detail}"),
+        None => format!("HTTP {status}"),
+    }
+}
+
+/// The human-readable part of an error body, unwrapped from whichever envelope
+/// carries it. Truncated because an error body can be an HTML page, and one
+/// line per failed request is enough to act on.
+fn error_detail(body: &str) -> Option<String> {
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string());
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    Some(detail.chars().take(300).collect())
+}
+
+/// Shape role-aware, interleaved input parts the way one dialect expects them.
+///
+/// Returns the whole input half of the request body, not just `messages`,
+/// because where media goes is itself a dialect decision: two of the three
+/// encodings put it in the message content and the third hangs it off the
+/// request root.
+pub(crate) fn chat_inputs(
+    parts: &[PreparedInputPart],
+    encoding: dialect::MediaInput,
+) -> Result<serde_json::Map<String, Value>> {
+    use dialect::MediaInput;
+
     let mut messages = Vec::new();
     let mut user_content = Vec::new();
+    let mut lists: BTreeMap<&'static str, Vec<Value>> = BTreeMap::new();
     let mut saw_user = false;
     for part in parts {
         match part {
@@ -72,28 +121,106 @@ pub(crate) fn chat_messages(parts: &[PreparedInputPart]) -> Result<Vec<Value>> {
             }
             PreparedInputPart::Media { modality, data_url } => {
                 saw_user = true;
-                user_content.push(match modality {
-                    Modality::Image => serde_json::json!({
-                        "type": "image_url", "image_url": {"url": data_url}
-                    }),
-                    Modality::Audio => serde_json::json!({
-                        "type": "audio_url", "audio_url": {"url": data_url}
-                    }),
-                    Modality::Video => serde_json::json!({
-                        "type": "video_url", "video_url": {"url": data_url}
-                    }),
-                    Modality::Text | Modality::Tensor => {
-                        bail!("unsupported prepared media modality {modality:?}")
+                match encoding {
+                    MediaInput::UrlParts => user_content.push(url_part(*modality, data_url)?),
+                    MediaInput::OpenAiParts => user_content.push(openai_part(*modality, data_url)?),
+                    MediaInput::TopLevelLists => {
+                        lists
+                            .entry(media_list_key(*modality)?)
+                            .or_default()
+                            .push(Value::String(data_url.clone()));
                     }
-                });
+                }
             }
         }
     }
-    if user_content.is_empty() {
+    if !saw_user {
         bail!("request has no user input")
     }
-    messages.push(serde_json::json!({"role": "user", "content": user_content}));
-    Ok(messages)
+    // A media-only request under `TopLevelLists` still needs a user turn, and
+    // that turn's content is a plain string there rather than an array.
+    let content = if matches!(encoding, MediaInput::TopLevelLists) {
+        Value::String(
+            user_content
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    } else {
+        if user_content.is_empty() {
+            bail!("request has no user input")
+        }
+        Value::Array(user_content)
+    };
+    messages.push(serde_json::json!({"role": "user", "content": content}));
+
+    let mut body = serde_json::Map::new();
+    body.insert("messages".into(), Value::Array(messages));
+    for (key, values) in lists {
+        body.insert(key.into(), Value::Array(values));
+    }
+    Ok(body)
+}
+
+/// vLLM's `_url` family, which is also the only spelling video has anywhere.
+fn url_part(modality: Modality, data_url: &str) -> Result<Value> {
+    let key = match modality {
+        Modality::Image => "image_url",
+        Modality::Audio => "audio_url",
+        Modality::Video => "video_url",
+        Modality::Text | Modality::Tensor => {
+            bail!("unsupported prepared media modality {modality:?}")
+        }
+    };
+    Ok(serde_json::json!({"type": key, key: {"url": data_url}}))
+}
+
+/// OpenAI proper: images by URL, audio as `input_audio`, and no video at all.
+fn openai_part(modality: Modality, data_url: &str) -> Result<Value> {
+    match modality {
+        Modality::Image => Ok(serde_json::json!({
+            "type": "image_url", "image_url": {"url": data_url}
+        })),
+        Modality::Audio => {
+            let (format, data) = split_data_url(data_url)?;
+            Ok(serde_json::json!({
+                "type": "input_audio", "input_audio": {"data": data, "format": format}
+            }))
+        }
+        Modality::Video => bail!("the openai dialect has no video input content part"),
+        Modality::Text | Modality::Tensor => {
+            bail!("unsupported prepared media modality {modality:?}")
+        }
+    }
+}
+
+fn media_list_key(modality: Modality) -> Result<&'static str> {
+    match modality {
+        Modality::Image => Ok("images"),
+        Modality::Audio => Ok("audios"),
+        Modality::Video => Ok("videos"),
+        Modality::Text | Modality::Tensor => {
+            bail!("unsupported prepared media modality {modality:?}")
+        }
+    }
+}
+
+/// `data:audio/wav;base64,AAAA` -> `("wav", "AAAA")`. `input_audio` wants the
+/// bare payload and a bare format name, not the URL wrapper.
+fn split_data_url(data_url: &str) -> Result<(String, String)> {
+    let rest = data_url
+        .strip_prefix("data:")
+        .ok_or_else(|| anyhow::anyhow!("input_audio requires a data URL, got {data_url:.32}"))?;
+    let (meta, payload) = rest
+        .split_once(',')
+        .ok_or_else(|| anyhow::anyhow!("malformed data URL"))?;
+    let mime = meta.split(';').next().unwrap_or_default();
+    let format = mime.rsplit('/').next().unwrap_or_default();
+    if format.is_empty() {
+        bail!("data URL carries no media subtype")
+    }
+    Ok((format.to_string(), payload.to_string()))
 }
 
 /// Normalized, backend-agnostic description of one generation request.
@@ -133,6 +260,14 @@ pub(crate) struct StreamEvent {
 pub(crate) trait Backend: Send + Sync {
     /// Path appended to `--base-url` to form the request endpoint.
     fn endpoint_suffix(&self) -> &str;
+    /// What an operator should do when this transport's server reports no
+    /// cached prompt tokens. Backend-specific because the remedy is: SGLang's
+    /// OpenAI layer never reports them on any flag, while vLLM's does behind
+    /// one, so identical advice would send half of them to the wrong place.
+    fn prefix_cache_remedy(&self) -> &'static str {
+        "Launch the server with prompt-token details and prefix caching enabled \
+         (vLLM: --enable-prompt-tokens-details / ENABLE_PROMPT_TOKENS_DETAILS=1); see README.md."
+    }
     /// Shape one generation request into this backend's request body.
     fn build_payload(&self, req: &GenRequest) -> Result<Value>;
     /// Normalize one response JSON object (a stream chunk or a full body).
@@ -244,5 +379,45 @@ pub(crate) fn request_build_failure_result(
         },
         output_ids: Vec::new(),
         timeline: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod error_body_tests {
+    use super::error_detail;
+
+    #[test]
+    fn an_error_envelope_is_unwrapped_to_its_message() {
+        // Shape observed from a live vLLM on an unknown model. Reporting only
+        // "HTTP 404" hands the operator nothing they can act on.
+        let detail = error_detail(
+            r#"{"error":{"message":"The model `x` does not exist.","type":"NotFoundError","code":404}}"#,
+        )
+        .unwrap();
+        assert_eq!(detail, "The model `x` does not exist.");
+    }
+
+    #[test]
+    fn a_bare_message_and_a_plain_body_both_survive() {
+        assert_eq!(
+            error_detail(r#"{"message":"overloaded"}"#).unwrap(),
+            "overloaded"
+        );
+        assert_eq!(
+            error_detail("upstream connect error").unwrap(),
+            "upstream connect error"
+        );
+    }
+
+    #[test]
+    fn an_empty_body_adds_nothing_to_the_status() {
+        assert!(error_detail("").is_none());
+        assert!(error_detail("   \n ").is_none());
+    }
+
+    #[test]
+    fn a_page_sized_body_is_truncated() {
+        let detail = error_detail(&"x".repeat(5_000)).unwrap();
+        assert_eq!(detail.chars().count(), 300);
     }
 }

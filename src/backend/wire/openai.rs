@@ -12,6 +12,13 @@ impl Backend for OpenAiCompletionsBackend {
         "/completions"
     }
 
+    fn prefix_cache_remedy(&self) -> &'static str {
+        "vLLM reports cached tokens on this route behind --enable-prompt-tokens-details \
+         (or ENABLE_PROMPT_TOKENS_DETAILS=1). SGLang's OpenAI layer does not report them \
+         on any flag -- use --backend sglang-tokens, whose meta_info carries cached_tokens. \
+         See README.md."
+    }
+
     fn build_payload(&self, req: &GenRequest) -> Result<Value> {
         let Prompt::Tokens(prompt_ids) = req.prompt else {
             bail!("openai completions requires token-id prompts")

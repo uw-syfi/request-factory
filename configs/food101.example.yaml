@@ -4,6 +4,11 @@ input:
 
 server:
   backend: openai-chat
+  # Which endpoint surface to use is `backend`; how to speak to it is `dialect`.
+  # One of: openai, vllm, vllm-omni, sglang-omni, mstar, dynamo. Getting this
+  # wrong is quiet -- most servers ignore fields they do not recognize -- so it
+  # is declared rather than guessed.
+  dialect: vllm
   base_url: http://127.0.0.1:8000/v1
   model: ByteDance-Seed/BAGEL-7B-MoT
   temperature: 0.0

@@ -19,6 +19,16 @@ pub(crate) struct MultimodalState {
     pub(crate) media_client: Option<Arc<MediaClient>>,
 }
 
+impl PreparedMultimodalRequest {
+    /// Whether this request sends any media, and so depends on the dialect's
+    /// encoding being one the server actually reads.
+    pub(crate) fn carries_media(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|part| matches!(part, PreparedInputPart::Media { .. }))
+    }
+}
+
 pub(crate) struct PreparedMultimodalRequest {
     source: RequestSpec,
     parts: Vec<PreparedInputPart>,
@@ -29,6 +39,7 @@ pub(crate) struct PreparedMultimodalRequest {
 pub(crate) fn prepare_multimodal_requests(
     artifact_path: &str,
     backend: BackendKind,
+    dialect: &crate::backend::Dialect,
     requests: Vec<RequestSpec>,
 ) -> Result<Vec<PreparedMultimodalRequest>> {
     let (accepted_inputs, produced_outputs) = match backend {
@@ -53,8 +64,29 @@ pub(crate) fn prepare_multimodal_requests(
             [Modality::Text].into_iter().collect(),
             [Modality::Audio].into_iter().collect(),
         ),
+        BackendKind::OpenaiImageEdits => (
+            [Modality::Text, Modality::Image].into_iter().collect(),
+            [Modality::Image].into_iter().collect(),
+        ),
+        BackendKind::OpenaiVideos => (
+            [Modality::Text, Modality::Image, Modality::Video]
+                .into_iter()
+                .collect(),
+            [Modality::Video].into_iter().collect(),
+        ),
+        BackendKind::OpenaiTranscriptions | BackendKind::OpenaiTranslations => (
+            [Modality::Text, Modality::Audio].into_iter().collect(),
+            [Modality::Text].into_iter().collect(),
+        ),
         _ => bail!("backend {backend:?} does not support multimodal-independent-v1"),
     };
+    // The surface decides what the model can do; the dialect decides what can be
+    // said to it. A trace needs both, and needs to be told so before the run
+    // starts rather than one failed request at a time.
+    let accepted_inputs = accepted_inputs
+        .intersection(&dialect.accepted_input_modalities())
+        .copied()
+        .collect();
     let capabilities = CapabilityProfile {
         accepted_inputs,
         produced_outputs,
@@ -126,12 +158,13 @@ pub(crate) async fn run_multimodal_request(
         wait_for_common_arrival(&state.common, request.source.arrival_time_ms).await;
     let _concurrency_permit = state.common.acquire_capacity_slot(request_ordinal).await;
     state.common.stats.record_submit();
-    let result = match &request.output {
-        OutputSpec::Text { max_tokens } => {
-            state
-                .text_client
-                .as_ref()
-                .expect("validated text request has a text client")
+    // Text output does not imply the token-streaming client: transcription and
+    // translation also answer with text, but over a one-shot multipart surface
+    // with no token stream to fold. The surface decides the client, not the
+    // output modality alone.
+    let result = match (&request.output, &state.text_client) {
+        (OutputSpec::Text { max_tokens }, Some(text_client)) => {
+            text_client
                 .run_step(
                     request.source.id.clone(),
                     Prompt::Parts(&request.parts),
@@ -139,16 +172,16 @@ pub(crate) async fn run_multimodal_request(
                 )
                 .await
         }
-        OutputSpec::Image { .. } | OutputSpec::Audio { .. } => {
+        (OutputSpec::Tensor { .. }, _) => {
+            unreachable!("capability validation rejects tensor output")
+        }
+        _ => {
             state
                 .media_client
                 .as_ref()
                 .expect("validated media request has a media client")
                 .run_step(request.source.id.clone(), &request.parts, &request.output)
                 .await
-        }
-        OutputSpec::Video { .. } | OutputSpec::Tensor { .. } => {
-            unreachable!("capability validation rejects unsupported generated media")
         }
     };
     if let Some(sink) = &timeline_sink {

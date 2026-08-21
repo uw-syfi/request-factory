@@ -6,7 +6,7 @@
 //! keeps adding a modality linear rather than requiring an executor for every
 //! pair of modalities.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -129,16 +129,15 @@ pub enum OutputSpec {
         steps: usize,
         #[serde(default = "one")]
         count: usize,
+        /// Classifier-free-guidance strength. A cross-model concept, spelled
+        /// `guidance_scale` by some servers and `cfg_text_scale` by others; the
+        /// dialect owns the spelling, the trace owns the value.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        cfg_scale: Option<f64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cfg_img_scale: Option<f64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cfg_renorm_type: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cfg_interval: Option<[f64; 2]>,
+        guidance: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<u64>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        model_params: ModelParams,
     },
     Audio {
         sample_rate_hz: u32,
@@ -149,17 +148,43 @@ pub enum OutputSpec {
         max_samples: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         voice: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        model_params: ModelParams,
     },
     Video {
         width: u32,
         height: u32,
         frames: u32,
         steps: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fps: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guidance: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<u64>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        model_params: ModelParams,
     },
     Tensor {
         shape: Vec<usize>,
         dtype: String,
     },
+}
+
+/// Model-specific generation knobs, namespaced by the dialect that reads them:
+/// `{"mstar": {"cfg_renorm_type": "text_channel"}}`.
+///
+/// These are deliberately not fields on [`OutputSpec`]. A trace carrying
+/// `cfg_renorm_type` among its declared outputs is a BAGEL trace rather than an
+/// image-generation trace, and cannot be replayed against any other model. The
+/// namespace also makes the blast radius explicit: a dialect only ever reads its
+/// own entry, so an unrecognized key is inert instead of silently mis-sent.
+pub type ModelParams = BTreeMap<String, BTreeMap<String, serde_json::Value>>;
+
+fn model_params_valid(params: &ModelParams) -> bool {
+    params.iter().all(|(dialect, knobs)| {
+        !dialect.trim().is_empty() && knobs.keys().all(|key| !key.trim().is_empty())
+    })
 }
 
 const fn one() -> usize {
@@ -185,30 +210,23 @@ impl OutputSpec {
                 height,
                 steps,
                 count,
-                cfg_scale,
-                cfg_img_scale,
-                cfg_renorm_type,
-                cfg_interval,
+                guidance,
+                model_params,
                 ..
             } => {
                 *width > 0
                     && *height > 0
                     && *steps > 0
                     && *count > 0
-                    && cfg_scale.is_none_or(|value| value.is_finite() && value > 0.0)
-                    && cfg_img_scale.is_none_or(|value| value.is_finite() && value > 0.0)
-                    && cfg_renorm_type
-                        .as_deref()
-                        .is_none_or(|value| !value.trim().is_empty())
-                    && cfg_interval.is_none_or(|[start, end]| {
-                        start.is_finite() && end.is_finite() && start >= 0.0 && start <= end
-                    })
+                    && guidance.is_none_or(|value| value.is_finite() && value > 0.0)
+                    && model_params_valid(model_params)
             }
             Self::Audio {
                 sample_rate_hz,
                 max_tokens,
                 max_samples,
                 voice,
+                model_params,
             } => {
                 *sample_rate_hz > 0
                     && max_tokens.is_none_or(|tokens| tokens > 0)
@@ -216,13 +234,26 @@ impl OutputSpec {
                     && voice
                         .as_deref()
                         .is_none_or(|value| !value.trim().is_empty())
+                    && model_params_valid(model_params)
             }
             Self::Video {
                 width,
                 height,
                 frames,
                 steps,
-            } => *width > 0 && *height > 0 && *frames > 0 && *steps > 0,
+                fps,
+                guidance,
+                model_params,
+                ..
+            } => {
+                *width > 0
+                    && *height > 0
+                    && *frames > 0
+                    && *steps > 0
+                    && fps.is_none_or(|value| value.is_finite() && value > 0.0)
+                    && guidance.is_none_or(|value| value.is_finite() && value > 0.0)
+                    && model_params_valid(model_params)
+            }
             Self::Tensor { shape, dtype } => {
                 !shape.is_empty()
                     && shape.iter().all(|dimension| *dimension > 0)
@@ -367,6 +398,7 @@ mod tests {
                     max_tokens: None,
                     max_samples: None,
                     voice: None,
+                    model_params: ModelParams::new(),
                 },
             ],
         };
@@ -399,6 +431,10 @@ mod tests {
             height: 1024,
             frames: 0,
             steps: 50,
+            fps: None,
+            guidance: None,
+            seed: None,
+            model_params: ModelParams::new(),
         }
         .validate("output")
         .is_err());
@@ -407,6 +443,7 @@ mod tests {
             max_tokens: Some(0),
             max_samples: None,
             voice: None,
+            model_params: ModelParams::new(),
         }
         .validate("output")
         .is_err());
@@ -430,6 +467,7 @@ mod tests {
                 max_tokens: Some(256),
                 max_samples: None,
                 voice: None,
+                model_params: ModelParams::new(),
             }],
         };
         request.validate("request").unwrap();
@@ -471,11 +509,9 @@ mod tests {
             height: 512,
             steps: 20,
             count: 1,
-            cfg_scale: None,
-            cfg_img_scale: None,
-            cfg_renorm_type: None,
-            cfg_interval: None,
+            guidance: None,
             seed: None,
+            model_params: ModelParams::new(),
         }];
         assert!(profile.validate(&request).is_err());
     }

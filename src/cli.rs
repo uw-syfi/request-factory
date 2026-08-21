@@ -18,6 +18,14 @@ pub enum BackendKind {
     OpenaiImages,
     /// OpenAI-compatible `/audio/speech` with raw PCM streaming output.
     OpenaiSpeech,
+    /// Multipart `/images/edits`: an uploaded image plus a prompt, image out.
+    OpenaiImageEdits,
+    /// `/videos/generations` (M*) or `/videos` (OpenAI): video out.
+    OpenaiVideos,
+    /// Multipart `/audio/transcriptions`: an uploaded audio file, text out.
+    OpenaiTranscriptions,
+    /// Multipart `/audio/translations`: as transcription, translated to English.
+    OpenaiTranslations,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -74,6 +82,13 @@ pub struct Args {
     /// builds).
     #[arg(long, value_enum, default_value = "openai")]
     pub backend: BackendKind,
+
+    /// Wire vocabulary spoken to the server: which field names, where model
+    /// knobs nest, and how streamed media is framed. Orthogonal to --backend,
+    /// which only selects the endpoint surface. One of: openai, vllm,
+    /// vllm-omni, sglang-omni, mstar, dynamo.
+    #[arg(long, default_value = "openai")]
+    pub dialect: String,
 
     #[arg(long, default_value_t = 0.0)]
     pub temperature: f64,

@@ -6,7 +6,7 @@ use crate::schema::{Modality, OutputSpec, RequestPriority, RequestSlo, RequestSp
 use crate::slo::SloMeasurement;
 use crate::util::prefix_hit_rate;
 
-const STEP_LOG_SCHEMA_VERSION: u32 = 13;
+const STEP_LOG_SCHEMA_VERSION: u32 = 14;
 
 /// One JSONL record: a typed source plus measurements shared by text generation.
 ///
@@ -397,7 +397,7 @@ mod tests {
             serde_json::to_value(StepLog::session_round(&step, 12, 8, 4, 0, outcome())).unwrap();
 
         assert_eq!(value["source"]["type"], "session_round");
-        assert_eq!(value["schema_version"], 13);
+        assert_eq!(value["schema_version"], 14);
         // A trace that declared no `slo` tag leaves no trace of it in the record:
         // absent, not null, so a reader can tell "the file had no such column"
         // from "the row left it blank".

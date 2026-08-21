@@ -17,6 +17,28 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+# Wire vocabularies the engine can speak. Kept in lockstep with
+# src/backend/dialect/profiles.rs::ALL -- the launcher validates the name so an
+# operator typo fails before a build, not after one.
+# Media surfaces the engine can drive. Which of them a given server actually
+# exposes is a dialect property, checked in Rust against the dialect table.
+MULTIMODAL_BACKENDS = frozenset(
+    {
+        "openai-chat",
+        "openai-images",
+        "openai-image-edits",
+        "openai-videos",
+        "openai-speech",
+        "openai-transcriptions",
+        "openai-translations",
+    }
+)
+
+KNOWN_DIALECTS = frozenset(
+    {"openai", "vllm", "vllm-omni", "sglang-omni", "mstar", "dynamo"}
+)
+
+
 class ConfigError(ValueError):
     """A launcher config is malformed or internally contradictory."""
 
@@ -249,7 +271,9 @@ def _build_common_run_arguments(
 
     _reject_unknown(input_config, {"trace", "format", "tags"}, "input")
     _reject_unknown(corpus, {"text_file", "tokenizer", "token_pool_limit"}, "corpus")
-    _reject_unknown(server, {"base_url", "backend", "model", "temperature"}, "server")
+    _reject_unknown(
+        server, {"base_url", "backend", "dialect", "model", "temperature"}, "server"
+    )
     _reject_unknown(
         replay,
         {
@@ -295,15 +319,21 @@ def _build_common_run_arguments(
     trace = _resolve_path(_required_string(input_config, "trace", "input"), config_path)
     input_format = _required_string(input_config, "format", "input")
     backend = _optional_string(server, "backend", "server", "openai")
+    dialect = _optional_string(server, "dialect", "server", "openai")
+    if dialect not in KNOWN_DIALECTS:
+        raise ConfigError(
+            f"server.dialect must be one of {sorted(KNOWN_DIALECTS)}, got {dialect!r}"
+        )
     is_multimodal = input_format == "multimodal-independent-v1"
     if is_multimodal:
         if corpus:
             raise ConfigError(
                 "corpus is text-replay-only and must be omitted for multimodal-independent-v1"
             )
-        if backend not in {"openai-chat", "openai-images", "openai-speech"}:
+        if backend not in MULTIMODAL_BACKENDS:
             raise ConfigError(
-                "multimodal-independent-v1 requires server.backend: openai-chat, openai-images, or openai-speech"
+                "multimodal-independent-v1 requires server.backend one of "
+                + ", ".join(sorted(MULTIMODAL_BACKENDS))
             )
         if context:
             raise ConfigError(
@@ -321,6 +351,8 @@ def _build_common_run_arguments(
         _required_string(server, "model", "server"),
         "--backend",
         backend,
+        "--dialect",
+        dialect,
         "--base-url",
         _optional_string(server, "base_url", "server", "http://127.0.0.1:8000/v1"),
         "--temperature",

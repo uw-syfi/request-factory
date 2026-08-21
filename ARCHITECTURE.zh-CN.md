@@ -344,6 +344,13 @@ GenRequest {
 }
 ```
 
+`backend/dialect/` 负责 `wire/` 不覆盖的另一个维度：不是「哪种协议」，而是「哪套词汇」。
+一个 [`Dialect`] 是一张 const 表，为某个服务系统声明：媒体如何附加到请求、模型
+旋钮嵌套在哪里、流式媒体如何分帧、每个语义旋钮叫什么名字。trace 以模型中立的方式
+声明生成参数（`steps`、`guidance`、`sample_rate_hz`），加上一个按 dialect 命名空间
+划分的 `model_params`；dialect 将其渲染为该服务器的拼写，对没有对应名称的旋钮直接
+丢弃而不是猜测。`dialect/` 不接触时间、并发或测量，只做重命名与重新嵌套。
+
 `backend/wire/` 负责 OpenAI、vLLM native token endpoint 和 SGLang native token endpoint
 之间的 JSON 差异。`GenerationClient` 负责共享 async lifecycle：
 
@@ -445,6 +452,7 @@ timings，并不是 schema loader 或 executor 的 owner。
 | `executor/` | arrival release、session dependency、admission、request lifecycle |
 | `tokens.rs` | concrete token ids 与 session context carry-forward |
 | `backend/wire/` | protocol-specific JSON shaping/parsing |
+| `backend/dialect/` | 各服务系统的线上词汇：字段名、旋钮位置、媒体分帧 |
 | `backend/client.rs` | shared token/text HTTP streaming engine 与 integrity measurements |
 | `backend/media_client.rs` | generated image/audio transport 与 modality-neutral measurements |
 | `record.rs` | per-step source + outcome JSONL contract |

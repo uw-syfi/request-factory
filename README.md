@@ -166,6 +166,77 @@ workload shape.
 | `openai-chat` | `POST {base_url}/chat/completions` | Interleaved inputs; streamed text/audio or generated-image output |
 | `openai-images` | `POST {base_url}/images/generations` | Text-to-image JSON output |
 | `openai-speech` | `POST {base_url}/audio/speech` | Text-to-audio raw PCM streaming output |
+| `openai-image-edits` | `POST {base_url}/images/edits` | Multipart: uploaded image plus instruction, image out |
+| `openai-videos` | `POST {base_url}/videos/generations` | Video out, optionally conditioned on an image or video |
+| `openai-transcriptions` | `POST {base_url}/audio/transcriptions` | Multipart: uploaded audio, text out |
+| `openai-translations` | `POST {base_url}/audio/translations` | As transcription, translated to English |
+
+### `server.dialect`: which vocabulary, not which endpoint
+
+`backend` selects the endpoint surface. `dialect` selects the words used on it.
+The two are orthogonal because five serving systems accept multimodal generation
+over OpenAI-shaped paths and no two agree on how to say it:
+
+| Axis | `openai` | `vllm` / `vllm-omni` | `sglang-omni` | `mstar` | `dynamo` |
+|---|---|---|---|---|---|
+| Audio input | `input_audio{data,format}` | `audio_url{url}` | top-level `audios[]` | `audio_url{url}` | — |
+| Video input | not supported | `video_url{url}` | top-level `videos[]` | `video_url{url}` | — |
+| Audio output request | `modalities:["text","audio"]` | `["audio"]` accepted | `["text","audio"]` | `["text","audio"]` | `["text","audio"]` |
+| Streamed audio | `delta.audio.data` | chunk-level `"modality":"audio"` | `delta.audio.data` | `delta.audio.data` | `delta.audio.data` |
+| Model knobs | none accepted | nested in `extra_body` | flat | flat | nested in `nvext` |
+| Guidance knob | — | `guidance_scale` | — | `cfg_text_scale` | `guidance_scale` |
+| Output-token cap | `max_completion_tokens` | `max_tokens` | `max_tokens` | `max_tokens` **and** `max_output_tokens` | `max_tokens` |
+
+Two consequences worth stating plainly:
+
+- **Knob placement is not cosmetic.** A server reading pydantic `extra="allow"`
+  (M\*) takes unknown fields flat, from `model_extra`. The OpenAI Python SDK's
+  `extra_body=` is a *client-side* convenience that flattens into the body before
+  sending, so a literal `"extra_body"` key on the wire is one unrecognized field
+  and every knob inside it is discarded. vLLM-Omni is the exception: its serving
+  docs define a real `extra_body` envelope.
+- **Getting it wrong is quiet.** vLLM and SGLang ignore fields they do not
+  recognize, so a misplaced knob costs a default value and no error. Declaring
+  the dialect is what turns that into a table entry someone can check.
+
+**A semantic knob's wire name can be model-specific, not just system-specific.**
+`steps` maps to the spelling a dialect uses most commonly — `num_inference_steps`
+for M\*'s diffusion-video models, per its `docs/models.rst`. BAGEL on the same
+server reads `num_timesteps` instead (`mstar/model/bagel/config.py`), and M\*'s
+own benchmark adapter sends neither. When a model disagrees with its system, put
+the name the model reads in `model_params` rather than expecting `steps` to
+cover it; verified against a live M\* serving BAGEL, where neither spelling
+changed generation latency, so the server is the authority on what it honours.
+
+Model-specific knobs live in the trace, namespaced by the dialect that reads
+them, and only that dialect's namespace is ever sent:
+
+```json
+{"type": "image", "width": 1024, "height": 1024, "steps": 50, "guidance": 4.0,
+ "model_params": {"mstar": {"cfg_renorm_type": "text_channel"},
+                  "vllm-omni": {"cfg_img_scale": 2.0}}}
+```
+
+The rows below were probed against live servers, not inferred: vLLM-Omni
+answers `/v1/images/edits` and `/v1/videos` but has no transcription route at
+all, and its `/v1/videos/sync` takes `multipart/form-data` and returns the MP4
+as the response body, where M* takes JSON and returns base64.
+
+Not every system serves every surface, and the table says so — an unsupported
+surface is rejected at startup rather than discovered as a 404 mid-run:
+
+| Surface | `openai` | `vllm` | `vllm-omni` | `sglang-omni` | `mstar` | `dynamo` |
+|---|---|---|---|---|---|---|
+| `/chat/completions` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `/images/generations` | ✅ | — | ✅ | — | ✅ | ✅ |
+| `/images/edits` | ✅ | — | ✅ | — | ✅ | — |
+| `/videos` | ✅ | — | ✅ | — | ✅ | — |
+| `/audio/speech` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `/audio/transcriptions` | ✅ | ✅ | — | ✅ | — | — |
+| `/audio/translations` | ✅ | ✅ | — | ✅ | — | — |
+
+Adding a serving system is a `const` in `src/backend/dialect/profiles.rs` plus a
+name in `KNOWN_DIALECTS`; no new backend, executor, or match arm.
 
 The token transports preserve exact text IDs. The OpenAI-compatible multimodal
 backends intentionally delegate media
@@ -282,6 +353,13 @@ and use `--base-url http://127.0.0.1:8000 --backend vllm-tokens`.
 | `--stream-interval 1` | Requests one-token streaming cadence. It does not guarantee one SSE event per token if the API process falls behind. |
 | `--api-server-count N` | Adds independent HTTP API **processes**, not threads, for request parsing and streamed-output drain. |
 | `--tokens-only` | Enables `/inference/v1/generate` and removes server-side detokenization from the native-token path. |
+
+**SGLang and `--backend openai`.** SGLang's OpenAI-compatible `/v1/completions`
+returns a usage block with no cached-token field *on any flag* — verified
+against a live server by sending one prompt twice and reading the streamed
+usage. The prefix-cache preflight therefore cannot pass on that route, and it
+aborts by design rather than reporting a hit rate it cannot see. Use
+`--backend sglang-tokens`, whose `meta_info` carries `cached_tokens`.
 
 ### Recommended SGLang launch
 
@@ -760,7 +838,10 @@ three — but whether the server performs detokenization at all.
 | `sglang-tokens` | `POST {base_url}/generate` | `input_ids` | `output_ids` deltas | No |
 | `openai-chat` | `POST {base_url}/chat/completions` | Ordered text and verified media data URLs | Text deltas, PCM16 audio deltas, or an image data URL | Model-specific media preprocessing |
 | `openai-images` | `POST {base_url}/images/generations` | Text prompt | Base64 image JSON | None |
-| `openai-speech` | `POST {base_url}/audio/speech` | Text prompt | Raw mono PCM16 chunks | None |
+| `openai-speech` | `POST {base_url}/audio/speech` | Text prompt | Raw mono PCM16 chunks, or SSE `speech.audio.delta` | None |
+| `openai-image-edits` | `POST {base_url}/images/edits` | Multipart image upload plus prompt | Base64 image JSON | None |
+| `openai-videos` | `POST {base_url}/videos/generations` | Prompt plus optional image/video conditioning | Base64 video JSON | None |
+| `openai-transcriptions` / `openai-translations` | `POST {base_url}/audio/{transcriptions,translations}` | Multipart audio upload | `{"text": ...}` | Server-side ASR |
 
 So `openai` is **token-in, but not token-out**: the server still decodes, and
 the echoed IDs ride alongside the text rather than replacing it. In vLLM only
@@ -1007,11 +1088,11 @@ described under [Request backends](#request-backends). Consumers reading
 Abbreviated session example:
 
 <details>
-<summary><b>View a schema-v11 session record</b></summary>
+<summary><b>View a schema-v14 session record</b></summary>
 
 ```json
 {
-  "schema_version": 11,
+  "schema_version": 14,
   "source": {
     "type": "session_round",
     "data": {

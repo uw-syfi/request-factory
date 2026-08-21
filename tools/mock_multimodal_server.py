@@ -1,4 +1,17 @@
-"""CPU-only OpenAI mock for text, generated-image, and streaming-audio replay."""
+"""CPU-only mock for every multimodal surface req-frontend can drive.
+
+Serves the seven HTTP surfaces exposed by M*, vLLM-Omni and SGLang-Omni:
+chat completions, image generation, image edits, video generation, speech,
+transcription and translation.
+
+It answers in a chosen **dialect** and, just as importantly, *validates the
+request against that dialect*. A mock that mirrors whatever the client sends can
+never fail a test: both sides agree on a shape no real server serves, and a
+wrong field name looks like success. So this one rejects media encoded the wrong
+way, and rejects model knobs placed in the wrong envelope -- the two mistakes
+that are otherwise silent, because real servers ignore what they do not
+recognize.
+"""
 
 from __future__ import annotations
 
@@ -11,9 +24,44 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+DIALECTS = ("openai", "vllm", "vllm-omni", "sglang-omni", "mstar", "dynamo")
+
+# How each dialect attaches media to a chat request.
+ENCODING = {
+    "openai": "openai_parts",
+    "vllm": "url_parts",
+    "vllm-omni": "url_parts",
+    "sglang-omni": "top_level_lists",
+    "mstar": "url_parts",
+    "dynamo": "url_parts",
+}
+
+# Where each dialect expects model knobs. `None` means flat at the request root,
+# which is what a pydantic ``extra="allow"`` server reads from ``model_extra``.
+KNOB_ENVELOPE = {
+    "openai": None,
+    "vllm": None,
+    "vllm-omni": "extra_body",
+    "sglang-omni": None,
+    "mstar": None,
+    "dynamo": "nvext",
+}
+
+_PNG = base64.b64decode(
+    b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+_MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 24
+
+
+class KnobPlacementError(ValueError):
+    """Knobs arrived in an envelope this dialect does not read."""
+
 
 class State:
-    def __init__(self, log_path: Path | None, chunk_delay_ms: float) -> None:
+    def __init__(self, log_path: Path | None, chunk_delay_ms: float, dialect: str) -> None:
+        self.dialect = dialect
+        self.encoding = ENCODING[dialect]
+        self.knob_envelope = KNOB_ENVELOPE[dialect]
         self.log_path = log_path
         self.chunk_delay_s = chunk_delay_ms / 1000.0
         self.lock = threading.Lock()
@@ -28,6 +76,7 @@ class State:
             self.max_active = max(self.max_active, self.active)
             value["active_at_receive"] = self.active
             value["max_active"] = self.max_active
+            value["dialect"] = self.dialect
             if self.log_path is not None:
                 with self.log_path.open("a") as writer:
                     writer.write(json.dumps(value) + "\n")
@@ -37,9 +86,44 @@ class State:
             self.active -= 1
 
 
+def _data_url_bytes(url: str) -> bytes:
+    if not url.startswith("data:") or "," not in url:
+        raise ValueError(f"expected a data URL, got {url[:32]!r}")
+    return base64.b64decode(url.split(",", 1)[1])
+
+
+def _parse_multipart(body: bytes, content_type: str) -> tuple[dict[str, str], dict[str, bytes]]:
+    """Minimal multipart/form-data reader: fields and file parts."""
+    marker = "boundary="
+    if marker not in content_type:
+        raise ValueError("multipart request without a boundary")
+    boundary = content_type.split(marker, 1)[1].strip().strip('"')
+    sections = body.split(b"--" + boundary.encode())
+    fields: dict[str, str] = {}
+    files: dict[str, bytes] = {}
+    for section in sections:
+        section = section.strip(b"\r\n")
+        if not section or section == b"--":
+            continue
+        head, _, payload = section.partition(b"\r\n\r\n")
+        headers = head.decode("utf-8", "replace")
+        name = ""
+        for chunk in headers.split(";"):
+            chunk = chunk.strip()
+            if chunk.startswith("name="):
+                name = chunk[5:].strip().strip('"').split("\r\n")[0]
+        if not name:
+            continue
+        if "filename=" in headers:
+            files[name] = payload
+        else:
+            fields[name] = payload.decode("utf-8", "replace")
+    return fields, files
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "req-frontend-multimodal-mock/1"
+    server_version = "req-frontend-multimodal-mock/2"
 
     @property
     def state(self) -> State:
@@ -47,6 +131,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
+
+    # ---- plumbing -------------------------------------------------------
 
     def _json_error(self, status: int, message: str) -> None:
         body = json.dumps({"error": message}).encode()
@@ -56,86 +142,172 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _write_json(self, value: dict[str, object]) -> None:
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _start_stream(self, content_type: str) -> None:
+        self.send_response(200)
+        self.send_header("content-type", content_type)
+        self.send_header("cache-control", "no-cache")
+        # Body framed by connection close, not chunked: the mock writes raw SSE
+        # and raw PCM, and announcing chunked without framing it corrupts both.
+        self.send_header("connection", "close")
+        self.end_headers()
+
+    def _stream_event(self, value: dict[str, object]) -> None:
+        self.wfile.write(f"data: {json.dumps(value)}\n\n".encode())
+        self.wfile.flush()
+
+    # ---- dialect enforcement --------------------------------------------
+
+    def _knob(self, payload: dict[str, object], key: str) -> object:
+        """Read a knob from where this dialect says it belongs -- only there."""
+        envelope = self.state.knob_envelope
+        if envelope is None:
+            return payload.get(key)
+        nested = payload.get(envelope)
+        return nested.get(key) if isinstance(nested, dict) else None
+
+    def _check_knob_placement(self, payload: dict[str, object]) -> None:
+        """Reject knobs sent in an envelope this dialect does not read.
+
+        This is the failure that motivated the whole dialect table: a server
+        reading ``model_extra`` receives a literal ``extra_body`` key as one
+        unknown field and drops every knob inside it, reporting nothing.
+        """
+        wrong = [name for name in ("extra_body", "nvext") if name != self.state.knob_envelope]
+        for name in wrong:
+            if isinstance(payload.get(name), dict):
+                raise KnobPlacementError(
+                    f"dialect {self.state.dialect} reads knobs from "
+                    f"{self.state.knob_envelope or 'the request root'}, "
+                    f"but received a {name!r} envelope"
+                )
+
+    def _collect_media(self, payload: dict[str, object]) -> tuple[int, int, int]:
+        """Count text/media parts, enforcing this dialect's input encoding."""
+        messages = payload["messages"]
+        users = [message for message in messages if message.get("role") == "user"]
+        if len(users) != 1:
+            raise ValueError("mock requires exactly one user message")
+        content = users[0]["content"]
+        text_parts = media_parts = media_bytes = 0
+        encoding = self.state.encoding
+
+        if encoding == "top_level_lists":
+            if not isinstance(content, str):
+                raise ValueError(
+                    "sglang-omni carries plain-text content and media in top-level lists"
+                )
+            text_parts = 1 if content else 0
+            for key in ("images", "audios", "videos"):
+                for url in payload.get(key, []) or []:
+                    media_parts += 1
+                    media_bytes += len(_data_url_bytes(url))
+            return text_parts, media_parts, media_bytes
+
+        if not isinstance(content, list) or not content:
+            raise ValueError("user message content must be a non-empty list")
+        for part in content:
+            kind = part.get("type")
+            if kind == "text":
+                text_parts += 1
+                continue
+            if kind == "image_url":
+                media_parts += 1
+                media_bytes += len(_data_url_bytes(part["image_url"]["url"]))
+                continue
+            if encoding == "openai_parts":
+                if kind == "input_audio":
+                    media_parts += 1
+                    media_bytes += len(base64.b64decode(part["input_audio"]["data"]))
+                    continue
+                raise ValueError(
+                    f"the openai dialect has no {kind!r} content part "
+                    "(audio is input_audio; video is not supported)"
+                )
+            if kind in ("audio_url", "video_url"):
+                media_parts += 1
+                media_bytes += len(_data_url_bytes(part[kind]["url"]))
+                continue
+            raise ValueError(f"unsupported content part {kind!r}")
+        return text_parts, media_parts, media_bytes
+
+    # ---- routing --------------------------------------------------------
+
     def do_POST(self) -> None:
-        path = urlparse(self.path).path
+        path = urlparse(self.path).path.removeprefix("/v1")
+        length = int(self.headers.get("content-length", "0"))
+        body = self.rfile.read(length)
+        content_type = self.headers.get("content-type", "")
         try:
-            length = int(self.headers.get("content-length", "0"))
-            payload = json.loads(self.rfile.read(length))
-            if path in {"/images/generations", "/v1/images/generations"}:
+            if path in ("/images/edits", "/audio/transcriptions", "/audio/translations"):
+                fields, files = _parse_multipart(body, content_type)
+                if path == "/images/edits":
+                    self._serve_image_edit(fields, files)
+                else:
+                    self._serve_transcription(fields, files, path)
+                return
+            payload = json.loads(body)
+            if path == "/images/generations":
                 self._serve_image_generation(payload)
-            elif path in {"/audio/speech", "/v1/audio/speech"}:
+            elif path == "/videos/generations" or path == "/videos":
+                self._serve_video_generation(payload)
+            elif path == "/audio/speech":
                 self._serve_speech(payload)
-            elif path in {"/chat/completions", "/v1/chat/completions"}:
+            elif path == "/chat/completions":
                 self._serve_chat(payload)
             else:
                 self._json_error(404, "unsupported mock endpoint")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             self._json_error(400, str(error))
 
+    # ---- surfaces -------------------------------------------------------
+
     def _serve_chat(self, payload: dict[str, object]) -> None:
-        try:
-            messages = payload["messages"]
-            system_prompts = [
-                message["content"] for message in messages if message.get("role") == "system"
-            ]
-            users = [message for message in messages if message.get("role") == "user"]
-            if any(not isinstance(prompt, str) or not prompt for prompt in system_prompts):
-                raise ValueError("system message content must be a non-empty string")
-            if len(users) != 1:
-                raise ValueError("mock requires exactly one user message")
-            content = users[0]["content"]
-            if not isinstance(content, list) or not content:
-                raise ValueError("user message content must be a non-empty list")
-            text_parts = 0
-            media_parts = 0
-            media_bytes = 0
-            for part in content:
-                kind = part.get("type")
-                if kind == "text":
-                    if not part.get("text"):
-                        raise ValueError("empty text part")
-                    text_parts += 1
-                    continue
-                key = kind
-                if kind not in {"image_url", "audio_url", "video_url"}:
-                    raise ValueError(f"unsupported content type {kind!r}")
-                url = part[key]["url"]
-                prefix, encoded = url.split(",", 1)
-                if not prefix.startswith("data:") or ";base64" not in prefix:
-                    raise ValueError("media URL must be an inline base64 data URL")
-                decoded = base64.b64decode(encoded, validate=True)
-                if not decoded:
-                    raise ValueError("empty media payload")
-                media_parts += 1
-                media_bytes += len(decoded)
-            modalities = payload.get("modalities")
-            output_modality = modalities[0] if isinstance(modalities, list) else "text"
-            if output_modality == "text":
-                if media_parts == 0:
-                    raise ValueError("text mock requires at least one media part")
-                max_tokens = int(payload["max_tokens"])
-                if max_tokens <= 0 or payload.get("stream") is not True:
-                    raise ValueError("positive max_tokens and stream=true are required")
-            else:
-                max_tokens = int(payload.get("max_tokens", 0))
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            self._json_error(400, str(error))
-            return
+        self._check_knob_placement(payload)
+        messages = payload["messages"]
+        system_prompts = [m["content"] for m in messages if m.get("role") == "system"]
+        if any(not isinstance(p, str) or not p for p in system_prompts):
+            raise ValueError("system message content must be a non-empty string")
+        text_parts, media_parts, media_bytes = self._collect_media(payload)
+
+        modalities = payload.get("modalities")
+        output_modality = "text"
+        if isinstance(modalities, list) and modalities:
+            output_modality = "audio" if "audio" in modalities else modalities[0]
+        if output_modality == "text":
+            max_tokens = int(payload.get("max_tokens") or payload.get("max_completion_tokens") or 0)
+            # A text-only request is legal: it is what the media preflight sends
+            # as its baseline. Whether media arrived is asserted from the log
+            # rows, not by refusing the request.
+            if max_tokens <= 0 or payload.get("stream") is not True:
+                raise ValueError("positive output-token cap and stream=true are required")
+        else:
+            max_tokens = int(payload.get("max_tokens") or 0)
 
         self.state.begin(
             {
                 "request_id": self.headers.get("x-request-id"),
+                "surface": "chat",
                 "text_parts": text_parts,
                 "media_parts": media_parts,
                 "media_bytes": media_bytes,
                 "max_tokens": max_tokens,
-                "max_output_tokens": payload.get("max_output_tokens"),
+                "max_output_tokens": self._knob(payload, "max_output_tokens"),
                 "temperature": payload.get("temperature"),
-                "thinker_temperature": payload.get("thinker_temperature"),
+                "thinker_temperature": self._knob(payload, "thinker_temperature"),
+                "voice": (payload.get("audio") or {}).get("voice"),
                 "system_prompts": system_prompts,
                 "output_modality": output_modality,
             }
         )
+
         if output_modality == "image":
             self._write_json(
                 {
@@ -159,19 +331,22 @@ class Handler(BaseHTTPRequestHandler):
             )
             self.state.finish()
             return
+
         if output_modality == "audio":
             self._start_stream("text/event-stream")
             for _ in range(3):
-                audio = b"\x01\x00" * 240
-                event = {
-                    "modality": "audio",
-                    "choices": [
-                        {
-                            "delta": {"content": base64.b64encode(audio).decode()},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
+                encoded = base64.b64encode(b"\x01\x00" * 240).decode()
+                if self.state.dialect == "vllm-omni":
+                    event = {
+                        "modality": "audio",
+                        "choices": [{"delta": {"content": encoded}, "finish_reason": None}],
+                    }
+                else:
+                    event = {
+                        "choices": [
+                            {"delta": {"audio": {"id": "a0", "data": encoded}}, "finish_reason": None}
+                        ]
+                    }
                 self._stream_event(event)
                 if self.state.chunk_delay_s:
                     time.sleep(self.state.chunk_delay_s)
@@ -183,58 +358,134 @@ class Handler(BaseHTTPRequestHandler):
 
         self._start_stream("text/event-stream")
         for index in range(max_tokens):
-            event = {
-                "choices": [
-                    {
-                        "delta": {"content": "pizza" if index == 0 else " token"},
-                        "finish_reason": None,
-                    }
-                ]
-            }
-            self._stream_event(event)
+            self._stream_event(
+                {
+                    "choices": [
+                        {
+                            "delta": {"content": f"t{index} "},
+                            "finish_reason": "length" if index == max_tokens - 1 else None,
+                        }
+                    ]
+                }
+            )
             if self.state.chunk_delay_s:
                 time.sleep(self.state.chunk_delay_s)
-        usage = {
-            "choices": [{"delta": {}, "finish_reason": "length"}],
-            "usage": {
-                "prompt_tokens": 256 + text_parts * 8,
-                "completion_tokens": max_tokens,
-                "total_tokens": 256 + text_parts * 8 + max_tokens,
-            },
-        }
-        self.wfile.write(f"data: {json.dumps(usage)}\n\ndata: [DONE]\n\n".encode())
+        # Prompt tokens grow with the media actually decoded, the way a real
+        # server's do. The media preflight reads exactly this to decide whether
+        # the encoding it used was one this dialect's server understands.
+        self._stream_event(
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 8 + media_parts * 11,
+                    "completion_tokens": max_tokens,
+                },
+            }
+        )
+        self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
         self.state.finish()
         self.close_connection = True
 
     def _serve_image_generation(self, payload: dict[str, object]) -> None:
-        prompt = payload.get("prompt")
-        if not isinstance(prompt, str) or not prompt:
+        self._check_knob_placement(payload)
+        if not payload.get("prompt"):
             raise ValueError("image generation requires a prompt")
+        count = int(payload.get("n") or 1)
         self.state.begin(
             {
                 "request_id": self.headers.get("x-request-id"),
-                "text_parts": 1,
-                "media_parts": 0,
-                "media_bytes": 0,
-                "max_tokens": 0,
+                "surface": "images",
                 "output_modality": "image",
+                "count": count,
                 "size": payload.get("size"),
-                "num_inference_steps": payload.get("num_inference_steps"),
+                "steps": self._knob(payload, "num_inference_steps"),
+                "guidance": self._knob(payload, "guidance_scale"),
+                "cfg_text_scale": self._knob(payload, "cfg_text_scale"),
+                "cfg_renorm_type": self._knob(payload, "cfg_renorm_type"),
+                "system_prompts": [],
             }
         )
-        self._write_json({"data": [{"b64_json": base64.b64encode(_PNG).decode()}]})
+        # Honour `n`: a client that folds only data[0] must under-report here.
+        self._write_json(
+            {"data": [{"b64_json": base64.b64encode(_PNG).decode()} for _ in range(count)]}
+        )
+        self.state.finish()
+
+    def _serve_image_edit(self, fields: dict[str, str], files: dict[str, bytes]) -> None:
+        if "image" not in files:
+            raise ValueError("images/edits requires an 'image' file upload")
+        if not fields.get("prompt"):
+            raise ValueError("images/edits requires a prompt")
+        count = int(fields.get("n") or 1)
+        self.state.begin(
+            {
+                "request_id": self.headers.get("x-request-id"),
+                "surface": "image_edits",
+                "output_modality": "image",
+                "count": count,
+                "upload_bytes": len(files["image"]),
+                "steps": fields.get("num_inference_steps"),
+                "cfg_renorm_type": fields.get("cfg_renorm_type"),
+                "system_prompts": [],
+            }
+        )
+        self._write_json(
+            {"data": [{"b64_json": base64.b64encode(_PNG).decode()} for _ in range(count)]}
+        )
+        self.state.finish()
+
+    def _serve_video_generation(self, payload: dict[str, object]) -> None:
+        self._check_knob_placement(payload)
+        frames = int(payload.get("num_frames") or 0)
+        if frames <= 0:
+            raise ValueError("video generation requires positive num_frames")
+        self.state.begin(
+            {
+                "request_id": self.headers.get("x-request-id"),
+                "surface": "videos",
+                "output_modality": "video",
+                "num_frames": frames,
+                "fps": payload.get("fps"),
+                "size": payload.get("size"),
+                "conditioned_on_image": "image" in payload,
+                "conditioned_on_video": "video" in payload,
+                "steps": self._knob(payload, "num_inference_steps"),
+                "system_prompts": [],
+            }
+        )
+        self._write_json({"data": [{"b64_json": base64.b64encode(_MP4).decode()}]})
+        self.state.finish()
+
+    def _serve_transcription(
+        self, fields: dict[str, str], files: dict[str, bytes], path: str
+    ) -> None:
+        if "file" not in files:
+            raise ValueError(f"{path} requires a 'file' audio upload")
+        self.state.begin(
+            {
+                "request_id": self.headers.get("x-request-id"),
+                "surface": path.strip("/").replace("/", "_"),
+                "output_modality": "text",
+                "upload_bytes": len(files["file"]),
+                "response_format": fields.get("response_format"),
+                "system_prompts": [],
+            }
+        )
+        self._write_json({"text": "mock transcript"})
         self.state.finish()
 
     def _serve_speech(self, payload: dict[str, object]) -> None:
+        self._check_knob_placement(payload)
         text = payload.get("input")
         if not isinstance(text, str) or not text:
             raise ValueError("speech requires non-empty input")
-        if payload.get("response_format") != "pcm":
-            raise ValueError("mock speech requires response_format=pcm")
+        if payload.get("response_format") not in ("pcm", "wav"):
+            raise ValueError("mock speech requires response_format pcm or wav")
         self.state.begin(
             {
                 "request_id": self.headers.get("x-request-id"),
+                "surface": "speech",
                 "text_parts": 1,
                 "media_parts": 0,
                 "media_bytes": 0,
@@ -244,6 +495,31 @@ class Handler(BaseHTTPRequestHandler):
                 "system_prompts": [],
             }
         )
+        if payload.get("stream_format") == "sse":
+            # vLLM-Omni's richer speech stream: explicit delta events plus a
+            # terminal usage block, which raw PCM cannot carry at all.
+            self._start_stream("text/event-stream")
+            for _ in range(3):
+                self._stream_event(
+                    {
+                        "type": "speech.audio.delta",
+                        "audio": base64.b64encode(b"\x01\x00" * 240).decode(),
+                        "response_format": "pcm",
+                    }
+                )
+                if self.state.chunk_delay_s:
+                    time.sleep(self.state.chunk_delay_s)
+            self._stream_event(
+                {
+                    "type": "speech.audio.done",
+                    "usage": {"input_tokens": 4, "output_tokens": 360, "total_tokens": 364},
+                }
+            )
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            self.state.finish()
+            self.close_connection = True
+            return
         self._start_stream("audio/pcm")
         for _ in range(3):
             self.wfile.write(b"\x01\x00" * 240)
@@ -253,30 +529,6 @@ class Handler(BaseHTTPRequestHandler):
         self.state.finish()
         self.close_connection = True
 
-    def _start_stream(self, content_type: str) -> None:
-        self.send_response(200)
-        self.send_header("content-type", content_type)
-        self.send_header("cache-control", "no-cache")
-        self.send_header("connection", "close")
-        self.end_headers()
-
-    def _stream_event(self, event: dict[str, object]) -> None:
-        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-        self.wfile.flush()
-
-    def _write_json(self, value: dict[str, object]) -> None:
-        body = json.dumps(value).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -285,9 +537,17 @@ def main() -> None:
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--log-path", type=Path)
     parser.add_argument("--chunk-delay-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--dialect",
+        default="vllm-omni",
+        choices=DIALECTS,
+        help="wire vocabulary to answer in, and to hold the client to",
+    )
     arguments = parser.parse_args()
     server = ThreadingHTTPServer((arguments.host, arguments.port), Handler)
-    server.state = State(arguments.log_path, arguments.chunk_delay_ms)  # type: ignore[attr-defined]
+    server.state = State(  # type: ignore[attr-defined]
+        arguments.log_path, arguments.chunk_delay_ms, arguments.dialect
+    )
     if arguments.ready_file:
         arguments.ready_file.write_text(str(server.server_port))
     print(server.server_port, flush=True)
@@ -295,8 +555,6 @@ def main() -> None:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
-    finally:
-        server.server_close()
 
 
 if __name__ == "__main__":

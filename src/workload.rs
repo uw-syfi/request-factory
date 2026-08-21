@@ -285,6 +285,11 @@ impl WorkloadSummary {
         match self {
             Self::Sessions(_) => true,
             Self::IndependentRequests(_) => false,
+            // A media request carries its own prompt and its own asset; there is
+            // no replayed prefix to hit. What this path must prove instead is
+            // that the server consumed the media at all, which is the media
+            // preflight's job.
+            Self::MultimodalRequests(_) => false,
         }
     }
 

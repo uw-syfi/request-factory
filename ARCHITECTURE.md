@@ -389,6 +389,17 @@ GenRequest {
 }
 ```
 
+`backend/dialect/` owns the axis `wire/` does not: not "which protocol" but
+"which vocabulary". `wire/` still shapes token/text JSON per protocol; a
+[`Dialect`] is a const table naming, for one serving system, where media
+attaches, where model knobs nest, how streamed media is framed, and what each
+semantic knob is called. The trace declares generation in model-neutral terms
+(`steps`, `guidance`, `sample_rate_hz`) plus a `model_params` block namespaced by
+dialect; the dialect renders those into that server's spelling and drops knobs it
+has no name for rather than guessing. Nothing in `dialect/` touches time,
+concurrency, or measurement -- it only renames and re-nests, so the request path
+stays one code path no matter how many servers exist.
+
 `backend/wire/` owns token/text JSON differences among OpenAI, vLLM native-token, and
 SGLang native-token endpoints. `GenerationClient` owns the shared async
 lifecycle:
@@ -496,6 +507,7 @@ execution policy.
 | `executor/` | arrival release, session dependency, admission, request lifecycle |
 | `tokens.rs` | concrete token ids and session-context carry-forward |
 | `backend/wire/` | protocol-specific JSON shaping and parsing |
+| `backend/dialect/` | per-serving-system wire vocabulary: field names, knob placement, media framing |
 | `backend/client.rs` | shared token/text HTTP streaming engine and integrity measurements |
 | `backend/media_client.rs` | generated image/audio transport and modality-neutral measurements |
 | `record.rs` | per-step source-plus-outcome JSONL contract |

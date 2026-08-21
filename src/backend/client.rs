@@ -37,7 +37,7 @@ pub(crate) struct GenerationClient {
 
 impl GenerationClient {
     pub(crate) fn new(args: &Args, tokenizer: Arc<Tokenizer>) -> Result<Self> {
-        let backend = build_backend(args.backend);
+        let backend = build_backend(args.backend, super::dialect_for(&args.dialect)?);
         let endpoint = format!(
             "{}{}",
             args.base_url.trim_end_matches('/'),
@@ -61,7 +61,7 @@ impl GenerationClient {
     }
 
     pub(crate) fn new_chat(args: &Args) -> Result<Self> {
-        let backend = build_backend(BackendKind::OpenaiChat);
+        let backend = build_backend(BackendKind::OpenaiChat, super::dialect_for(&args.dialect)?);
         let endpoint = format!(
             "{}{}",
             args.base_url.trim_end_matches('/'),
@@ -294,7 +294,7 @@ impl GenerationClient {
 
         let response = match response {
             Ok(response) if response.status().is_success() => response,
-            Ok(response) => return fold.fail(format!("HTTP {}", response.status())),
+            Ok(response) => return fold.fail(super::http_failure(response).await),
             Err(err) => return fold.fail(format!("request error: {err}")),
         };
 
