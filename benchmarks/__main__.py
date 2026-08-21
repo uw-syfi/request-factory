@@ -8,12 +8,13 @@ import json
 import os
 import random
 import shutil
+import subprocess
 import sys
 import tarfile
 import urllib.request
 from pathlib import Path
 
-from benchmarks import synthetic
+from benchmarks import seed_tts, synthetic, vbench
 
 FOOD101_URL = "https://data.vision.ee.ethz.ch/cvl/food-101.tar.gz"
 FOOD101_ARCHIVE_BYTES = 4_996_278_331
@@ -37,6 +38,8 @@ def _parser() -> argparse.ArgumentParser:
         "--prompt",
         default="What food is shown in this image? Answer with the dish name only.",
     )
+    vbench.add_parser(subparsers)
+    seed_tts.add_seed_tts_parser(subparsers)
     synthetic.add_parser(subparsers)
     return parser
 
@@ -234,9 +237,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.benchmark == "food101":
             return _materialize_food101(arguments)
+        if arguments.benchmark == "vbench":
+            return vbench.materialize_from_arguments(arguments)
+        if arguments.benchmark == "seed-tts":
+            return seed_tts.materialize_seed_tts(
+                seed_tts.options_from_namespace(arguments)
+            )
         if arguments.benchmark == "synthetic":
             return synthetic.materialize(arguments)
-    except (EOFError, OSError, ValueError, tarfile.TarError) as error:
+    except (
+        EOFError,
+        OSError,
+        ValueError,
+        subprocess.CalledProcessError,
+        tarfile.TarError,
+    ) as error:
         print(f"benchmark error: {error}", file=sys.stderr)
         return 2
     raise AssertionError(arguments.benchmark)

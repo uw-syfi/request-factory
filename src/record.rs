@@ -393,6 +393,7 @@ mod tests {
             tool_wait_after_ms: 5.0,
             slo: Default::default(),
             priority: Default::default(),
+            speculative: Default::default(),
         };
         let value =
             serde_json::to_value(StepLog::session_round(&step, 12, 8, 4, 0, outcome())).unwrap();
@@ -430,6 +431,7 @@ mod tests {
                 e2e_slo_ms: Some(500.0),
             },
             priority: RequestPriority { priority: Some(7) },
+            speculative: Default::default(),
         };
 
         let value =

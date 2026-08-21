@@ -18,7 +18,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::tag::{RequestPriority, RequestSlo};
+use crate::schema::tag::{RequestPriority, RequestSlo, RequestSpeculative};
 use crate::schema::{InputFileSchema, TraceTag};
 
 /// Schema name recorded in the manifest and named on the command line. Consumers
@@ -116,9 +116,11 @@ pub fn load(path: &str, declaration: &InputFileSchema) -> Result<SessionPlans> {
 
     let reads_slo = declaration.carries(TraceTag::Slo);
     let reads_priority = declaration.carries(TraceTag::Priority);
+    let reads_speculative = declaration.carries(TraceTag::Speculative);
     let mut rows: Vec<ExecutionRow> = Vec::new();
     let mut slos: Vec<RequestSlo> = Vec::new();
     let mut priority: Vec<RequestPriority> = Vec::new();
+    let mut speculative: Vec<RequestSpeculative> = Vec::new();
     for (index, record) in reader.records().enumerate() {
         let line = index + 2; // the header occupies line 1
         let record = record.with_context(|| format!("{path}: failed to read line {line}"))?;
@@ -147,10 +149,22 @@ pub fn load(path: &str, declaration: &InputFileSchema) -> Result<SessionPlans> {
             RequestPriority::default()
         };
         priority.push(declared);
+        let declared = if reads_speculative {
+            let declared: RequestSpeculative = record
+                .deserialize(Some(&headers))
+                .context("failed to parse a session-execution-v2 row")?;
+            declared.validate(&format!("{path} line {line}"))?;
+            declared
+        } else {
+            RequestSpeculative::default()
+        };
+        speculative.push(declared);
     }
     validate(&rows).with_context(|| format!("{path} is not a canonical {SCHEMA_NAME} trace"))?;
     let mut sessions: SessionPlans = Vec::new();
-    for ((row, slo), priority) in rows.into_iter().zip(slos).zip(priority) {
+    for (((row, slo), priority), speculative) in
+        rows.into_iter().zip(slos).zip(priority).zip(speculative)
+    {
         let round = SessionRound {
             request_id: row.request_id,
             session_id: row.session_id,
@@ -162,6 +176,7 @@ pub fn load(path: &str, declaration: &InputFileSchema) -> Result<SessionPlans> {
             tool_wait_after_ms: row.tool_wait_after_ms,
             slo,
             priority,
+            speculative,
         };
         match sessions.last_mut() {
             Some((session_id, rounds)) if *session_id == round.session_id => rounds.push(round),
@@ -184,6 +199,7 @@ pub struct SessionRound {
     pub tool_wait_after_ms: f64,
     pub slo: RequestSlo,
     pub priority: RequestPriority,
+    pub speculative: RequestSpeculative,
 }
 
 /// Sessions in file/replay order, each containing rounds in round order.
@@ -420,6 +436,30 @@ mod tests {
             row("b", 0, 250.0, 0, 400),
         ];
         validate(&rows).unwrap();
+    }
+
+    #[test]
+    fn loader_preserves_a_declared_speculative_tag() {
+        let path = std::env::temp_dir().join(format!(
+            "req_frontend_session_speculative_{}.csv",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms,accept_rate\n\
+             session_a_round_000000,a,0,0.000000,0,16,4,0.000000,0.75\n",
+        )
+        .unwrap();
+        let input_file_schema = InputFileSchema::new(
+            crate::schema::InputFileFormat::TextGenerationSessionExecutionV2,
+            vec![TraceTag::Speculative],
+        )
+        .unwrap();
+
+        let sessions = load(path.to_str().unwrap(), &input_file_schema).unwrap();
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(sessions[0].1[0].speculative.accept_rate, Some(0.75));
     }
 
     #[test]

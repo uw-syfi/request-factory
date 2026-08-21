@@ -40,9 +40,9 @@ pub(crate) fn load_workload(
 ) -> Result<ReplayWorkload> {
     reject_unsupported_replay(input_file_schema)?;
     let mut workload = match input_file_schema.input_file_format {
-        InputFileFormat::TextGenerationIndependent => {
-            ReplayWorkload::IndependentRequests(independent::load(path, input_file_schema)?)
-        }
+        InputFileFormat::TextGenerationIndependent => ReplayWorkload::IndependentRequests(
+            independent::load_requests(path, input_file_schema)?,
+        ),
         InputFileFormat::TextGenerationSessionExecutionV2 => {
             ReplayWorkload::Sessions(session::load(path, input_file_schema)?)
         }
@@ -273,6 +273,26 @@ impl WorkloadSummary {
         }
     }
 
+    /// Whether this workload's result depends on server-side prefix reuse.
+    ///
+    /// A session round replays a prefix its earlier rounds already sent, so a
+    /// server that silently fails to report — or to perform — cache hits
+    /// invalidates the measurement outright. Independent requests each seed at
+    /// a distinct pool offset precisely so cross-unit sharing never happens;
+    /// their hit rate is ~0 by construction, and holding them to the session
+    /// requirement would block runs that do not use the feature at all.
+    pub(crate) fn depends_on_prefix_cache(&self) -> bool {
+        match self {
+            Self::Sessions(_) => true,
+            Self::IndependentRequests(_) => false,
+            // A media request carries its own prompt and its own asset; there is
+            // no replayed prefix to hit. What this path must prove instead is
+            // that the server consumed the media at all, which is the media
+            // preflight's job.
+            Self::MultimodalRequests(_) => false,
+        }
+    }
+
     /// Workload units this trace offers — what `--rate` counts.
     ///
     /// A session, not a round: `--rate` rescales session arrivals, and a
@@ -490,6 +510,7 @@ mod tests {
             tool_wait_after_ms: 0.0,
             slo: Default::default(),
             priority: Default::default(),
+            speculative: Default::default(),
         }
     }
 
@@ -607,6 +628,7 @@ mod tests {
             tool_wait_after_ms: 0.0,
             slo: Default::default(),
             priority: Default::default(),
+            speculative: Default::default(),
         };
         let sessions: SessionPlans = vec![("session".to_string(), vec![step])];
 
