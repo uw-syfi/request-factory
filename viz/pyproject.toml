@@ -1,7 +1,7 @@
 [project]
 name = "req-frontend-viz"
 version = "0.1.0"
-description = "Draw what a req-frontend sweep measured. Optional; nothing in the Rust side depends on it."
+description = "Draw what a Request Factory sweep measured. Optional; nothing in the Rust side depends on it."
 requires-python = ">=3.10"
 dependencies = [
     "matplotlib>=3.9",

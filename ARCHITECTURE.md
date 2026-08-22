@@ -1,6 +1,6 @@
-# req-frontend: from input file to replay report
+# Request Factory: from input file to replay report
 
-This document explains `req-frontend`'s own end-to-end data flow: how one run
+This document explains Request Factory's end-to-end data flow: how one run
 declares an input file, parses and validates its rows, builds a replay workload,
 releases requests, talks to a serving backend, and records the result. SLO,
 priority, session, and speculative metadata are local concerns along that path;
@@ -26,7 +26,8 @@ format::<family>::load(path, schema)
   ▼
 typed file contents
   ├─ Vec<IndependentRequest>
-  └─ SessionPlans = Vec<(session_id, Vec<SessionRound>)>
+  ├─ SessionPlans = Vec<(session_id, Vec<SessionRound>)>
+  └─ Vec<RequestSpec>
   ▼
 ReplayWorkload
   │  --max-items, --rate, arrival mode, workload summary
@@ -34,8 +35,8 @@ ReplayWorkload
 executor
   │  arrival wait → admission → prompt construction → context-limit decision
   ▼
-GenerationClient
-  │  backend-specific JSON → HTTP stream → normalized events
+generation/media/realtime client
+  │  dialect-shaped HTTP or WebSocket exchange → normalized events
   ▼
 GenerationResult
   │
@@ -67,7 +68,7 @@ uv run python -m launcher tracegen configs/tracegen.yaml
 uv run python -m launcher selfcheck configs/selfcheck.yaml
 ```
 
-Both tasks share the same nested blocks:
+`run` and `sweep` share the same nested blocks:
 
 ```text
 input       file, complete format, and tags
@@ -300,8 +301,9 @@ create AppState, bounded dispatcher, log channel, optional timeline channel
 the input and workload shaping, not the serving endpoint.
 
 `CorpusCache` can reuse the tokenizer and synthetic corpus across text sweep
-points. The text backend preflight confirms that the server exposes required
-prefix-cache usage before replay. Multimodal replay has no corpus or cache
+points. Session-text replay preflights that the server exposes required
+prefix-cache usage; independent text plans no reuse and skips that gate.
+Multimodal replay has no corpus or cache
 preflight; it validates backend capabilities and prepares immutable assets
 before starting the arrival clock.
 
@@ -316,7 +318,7 @@ of top-level workload tasks and follows one of three paths selected by
 ```text
 wait for request arrival
   → send prevalidated ordered text/media parts
-  → fold the streamed text response through the shared client
+  → observe the selected HTTP or WebSocket output surface
   → StepLog with modalities and asset byte counts
 ```
 
@@ -426,9 +428,11 @@ lifecycle:
 3. normalize wire objects into `StreamEvent`;
 4. fold text, token ids, usage, finish reason, and failures;
 5. check prompt echo and token accounting;
-6. return a backend-neutral result. Generated media uses `media_client.rs`,
-   which normalizes JSON-carried images, base64 chat-audio deltas, and raw PCM
-   streams into first-output, byte, duration, RTF, artifact, and timeline fields.
+6. return a backend-neutral result. HTTP media uses `media_client.rs`, which
+   normalizes JSON/raw image and video responses, chat/speech audio, and ASR text
+   into first-output, byte, duration, RTF, artifact, and timeline fields.
+   `realtime_client.rs` applies the same measurements to dialect-specific
+   WebSocket events.
 
 ```rust
 GenerationResult {
@@ -528,7 +532,7 @@ execution policy.
 | `backend/dialect/` | per-serving-system wire vocabulary: field names, knob placement, media framing |
 | `backend/realtime_client.rs` | the `/realtime` WebSocket: one session per request, same fold as the HTTP media surfaces |
 | `backend/client.rs` | shared token/text HTTP streaming engine and integrity measurements |
-| `backend/media_client.rs` | generated image/audio transport and modality-neutral measurements |
+| `backend/media_client.rs` | image/audio/video/ASR HTTP transport and modality-neutral measurements |
 | `record.rs` | per-step source-plus-outcome JSONL contract |
 | `timeline.rs` | optional per-event recording |
 | `summary.rs` | replay, runtime, timeline, and run-level aggregation |

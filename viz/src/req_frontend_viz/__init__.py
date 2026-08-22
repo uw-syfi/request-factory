@@ -1,4 +1,4 @@
-"""Optional plotting for req-frontend sweeps.
+"""Optional plotting for Request Factory sweeps.
 
 Separate from the Rust side on purpose: a sweep must never fail because a
 plotting dependency is missing, so nothing in `src/` knows this package exists.

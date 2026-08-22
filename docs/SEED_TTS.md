@@ -20,7 +20,7 @@ Use `--include-reference-audio` to emit ordered reference-text, reference-audio,
 and target-text inputs for a backend that implements voice conditioning. The
 reference voice metadata is always retained in `labels.jsonl`, even in M*
 compatibility mode. Quality scoring such as WER and speaker similarity remains
-outside req-frontend's serving-performance scope.
+outside Request Factory's serving-performance scope.
 
 ## Acquire and materialize
 
@@ -88,12 +88,18 @@ For Qwen3-Omni's audio-capable chat API:
 uv run python -m launcher run configs/seed-tts-qwen3-omni.example.yaml
 ```
 
+The checked-in example selects `dialect: mstar`. Use `vllm-omni` or
+`sglang-omni` when that stack serves the model; the dialect controls media
+placement, knob nesting, and streamed-audio event shape.
+
 For Orpheus through M*'s `/v1/audio/speech` service or another conforming
 OpenAI-compatible wrapper:
 
 ```bash
 uv run python -m launcher run configs/seed-tts-orpheus.example.yaml
 ```
+
+This example also selects `mstar`, matching the service named above.
 
 The upstream Canopy Labs Orpheus repository does not itself expose that
 standard HTTP endpoint, so it requires M*'s service or a compatible wrapper.

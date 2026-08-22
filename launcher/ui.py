@@ -12,7 +12,7 @@ from .config import LaunchSpec
 
 def heading(specification: LaunchSpec, config_path: Path, build_type: str) -> None:
     width = 72
-    print("req-frontend / " + specification.task)
+    print("Request Factory / " + specification.task)
     print("=" * width)
     row("config", str(config_path))
     row("build", build_type)

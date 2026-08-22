@@ -1,1 +1,1 @@
-"""Structured operator interface for req-frontend's Rust execution modes."""
+"""Structured operator interface for Request Factory's Rust execution modes."""

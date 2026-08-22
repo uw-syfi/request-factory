@@ -10,6 +10,7 @@ when comparing revisions:
 ```bash
 taskset -c 16-23 cargo bench --features bench-internals --bench dispatch
 taskset -c 16-23 cargo bench --features bench-internals --bench vllm_wire
+taskset -c 16-23 cargo bench --features bench-internals --bench chat_wire
 cargo build --release --features transport-bench --bin loadgen_transport_bench
 taskset -c 16-31,48-63 target/release/loadgen_transport_bench \
   --transport reqwest-pool --endpoint http://127.0.0.1:18080/inference/v1/generate

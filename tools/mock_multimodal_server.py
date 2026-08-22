@@ -1,4 +1,4 @@
-"""CPU-only mock for every multimodal surface req-frontend can drive.
+"""CPU-only mock for every multimodal surface Request Factory can drive.
 
 Serves the seven HTTP surfaces exposed by M*, vLLM-Omni and SGLang-Omni:
 chat completions, image generation, image edits, video generation, speech,

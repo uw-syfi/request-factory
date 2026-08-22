@@ -127,8 +127,9 @@ the other is the failure mode the preflight exists to prevent.
 
 ## Conventions
 
-- Rust tests are inline `#[cfg(test)]` modules next to the code (~165 of them);
-  the top-level `tests/` directory is Python launcher tests only.
+- Rust tests are inline `#[cfg(test)]` modules next to the code. The top-level
+  `tests/` directory covers the launcher, benchmark materializers, mock dialect
+  server, and end-to-end replay surfaces.
 - Comments in this codebase explain *why* a boundary exists, not what the line
   does. Match that register; don't add narration.
 - Commit subjects are `area: what changed`, lowercase, imperative, describing
@@ -138,7 +139,7 @@ the other is the failure mode the preflight exists to prevent.
   `sweep.json` / `selfcheck.json`, and `launcher-config.yaml` + `command.txt`
   snapshotted beside every run.
 - The JSONL record contract is versioned (`src/record.rs`, currently schema
-  v11); changing fields means bumping it and updating the README's output
+  v15); changing fields means bumping it and updating the README's output
   contract section.
 
 ## Keeping the interface in sync

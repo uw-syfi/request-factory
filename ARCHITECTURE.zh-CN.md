@@ -1,6 +1,6 @@
-# req-frontend：从输入文件到 replay 报告
+# Request Factory：从输入文件到 replay 报告
 
-本文解释 `req-frontend` 自己的端到端数据流：一次 run 如何声明输入文件、解析并验证
+本文解释 Request Factory 自己的端到端数据流：一次 run 如何声明输入文件、解析并验证
 rows、构造 replay workload、按时间 release 请求、与 serving backend 交互，最后写出日志与
 汇总。SLO、priority、session 和 speculative 都是这条主线上的局部语义，不是架构主轴。
 
@@ -24,7 +24,8 @@ format::<family>::load(path, schema)
   ▼
 typed file contents
   ├─ Vec<IndependentRequest>
-  └─ SessionPlans = Vec<(session_id, Vec<SessionRound>)>
+  ├─ SessionPlans = Vec<(session_id, Vec<SessionRound>)>
+  └─ Vec<RequestSpec>
   ▼
 ReplayWorkload
   │  --max-items、--rate、arrival mode、workload summary
@@ -32,8 +33,8 @@ ReplayWorkload
 executor
   │  arrival wait → admission → prompt construction → context-limit decision
   ▼
-GenerationClient
-  │  backend-specific JSON → HTTP stream → normalized events
+generation/media/realtime client
+  │  dialect-shaped HTTP 或 WebSocket exchange → normalized events
   ▼
 GenerationResult
   │
@@ -270,8 +271,8 @@ create AppState, bounded dispatcher, log channel, optional timeline channel
 `--dry-run` 在 token corpus 和网络访问前返回，因此它验证的是输入与 workload shaping，
 不是 serving endpoint。
 
-text replay 的 tokenizer 与 synthetic corpus 可由 `CorpusCache` 跨 sweep points 复用，
-backend preflight 在正式 replay 前确认 server 能报告所需的 prefix-cache usage。
+text replay 的 tokenizer 与 synthetic corpus 可由 `CorpusCache` 跨 sweep points 复用。
+只有计划复用 prefix 的 session text replay 执行 cache preflight；independent text 不执行。
 multimodal replay 没有 corpus/cache preflight；它在 arrival clock 前准备 immutable assets。
 
 ## 7. `executor/` 负责 release、dependency 与 admission
@@ -279,6 +280,15 @@ multimodal replay 没有 corpus/cache preflight；它在 arrival clock 前准备
 runner 的 central `JoinSet` dispatcher 最多只启动 concurrency window 内的 top-level
 workload tasks，不会为 trace 中每一行预先停放 task。之后按 `ReplayWorkload` variant
 进入三条执行路径（text independent、text session、multimodal independent）。
+
+### Multimodal independent request
+
+```text
+wait for request arrival
+  → 发送预验证的有序 text/media parts
+  → 观察所选 HTTP 或 WebSocket output surface
+  → 写入带 modalities 与 asset byte counts 的 StepLog
+```
 
 ### Independent request
 
@@ -361,9 +371,10 @@ GenRequest {
 3. 将 wire objects 标准化为 `StreamEvent`；
 4. 折叠 text、token ids、usage、finish reason 与错误；
 5. 检查 prompt echo 和 token accounting；
-6. 返回 backend-neutral `GenerationResult`。生成媒体由 `media_client.rs` 统一
-   JSON image、chat audio delta 与 raw PCM，记录 first-output、bytes、duration、
-   RTF、artifact 和 timeline。
+6. 返回 backend-neutral `GenerationResult`。HTTP media 由 `media_client.rs` 统一
+   JSON/raw image 与 video、chat/speech audio、ASR text，记录 first-output、bytes、
+   duration、RTF、artifact 和 timeline；`realtime_client.rs` 对 dialect-specific
+   WebSocket events 使用相同测量。
 
 ```rust
 GenerationResult {
@@ -458,7 +469,7 @@ timings，并不是 schema loader 或 executor 的 owner。
 | `synthetic.rs` | 按声明的形状生成图像/音频/视频字节（媒体侧的 `tokens.rs`）|
 | `backend/realtime_client.rs` | `/realtime` WebSocket：每个请求一个会话，与 HTTP 媒体面共用同一套测量 |
 | `backend/client.rs` | shared token/text HTTP streaming engine 与 integrity measurements |
-| `backend/media_client.rs` | generated image/audio transport 与 modality-neutral measurements |
+| `backend/media_client.rs` | image/audio/video/ASR HTTP transport 与 modality-neutral measurements |
 | `record.rs` | per-step source + outcome JSONL contract |
 | `timeline.rs` | optional per-event recording |
 | `summary.rs` | replay、runtime、timeline 与 run-level aggregation |

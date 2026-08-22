@@ -4,6 +4,9 @@ input:
 
 server:
   backend: openai-chat
+  # This example targets the M* Qwen3-Omni service. Change both dialect and
+  # model when replaying the same artifact against another serving stack.
+  dialect: mstar
   base_url: http://127.0.0.1:8000/v1
   model: Qwen/Qwen3-Omni-30B-A3B-Instruct
   temperature: 0.0

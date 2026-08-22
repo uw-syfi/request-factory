@@ -1,7 +1,7 @@
 # Food101 image-to-text replay
 
 This adapter materializes the Food-101 images used for BAGEL image-to-text
-serving evaluation into req-frontend's canonical
+serving evaluation into Request Factory's canonical
 `multimodal-independent-v1` artifact. It is a serving-performance workload,
 not an accuracy harness and not a dependency on M*.
 
@@ -43,7 +43,8 @@ and streams text and a final usage event.
 
 ```bash
 uv run python tools/mock_multimodal_server.py \
-  --port 8000 --log-path /tmp/food101-mock.jsonl --chunk-delay-ms 2
+  --dialect vllm --port 8000 \
+  --log-path /tmp/food101-mock.jsonl --chunk-delay-ms 2
 
 uv run python -m launcher run configs/food101.example.yaml
 ```
@@ -65,12 +66,13 @@ server:
   model: THE_SERVED_BAGEL_MODEL_NAME
 ```
 
-No corpus or tokenizer block belongs in this run. req-frontend sends original
+No corpus or tokenizer block belongs in this run. Request Factory sends original
 image bytes and text; the system under test chooses image preprocessing,
 encoded-token expansion, batching, and caching. Prefix-cache preflight and
 prefix-hit summaries remain text-session concerns and are not fabricated for
 this independent image workload.
 
-The current adapter observes streamed text output. The canonical request model
-already represents image/audio/video/tensor outputs, but each needs a concrete
-server protocol and output observer before it can be replayed.
+This benchmark intentionally observes streamed text output. The runtime also
+implements image, audio, and video generation plus transcription, translation,
+and realtime surfaces; tensor output still needs a concrete protocol and
+observer.
