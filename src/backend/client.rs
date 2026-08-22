@@ -17,7 +17,9 @@ use crate::util::{elapsed_ms, ratio, unix_seconds_now};
 use super::integrity::{classify_prompt_echo, PromptEcho};
 use super::stream::StreamAccumulator;
 use super::wire::build_backend;
-use super::{request_build_failure_result, Backend, GenRequest, GenerationResult, Prompt};
+use super::{
+    request_build_failure_result, sse_data_line, Backend, GenRequest, GenerationResult, Prompt,
+};
 
 /// Shared streaming engine. It knows only normalized text-generation inputs and
 /// outcomes; frontend/source identity remains in the executor layer.
@@ -113,6 +115,9 @@ impl GenerationClient {
         let mut fold = StreamAccumulator::new(max_tokens, self.record_timeline);
         self.fold_response(&request_id, payload, send_instant, &mut fold)
             .await;
+        if fold.failure.is_none() && fold.chunk_count == 0 {
+            fold.fail("response stream ended without a parseable SSE event".to_string());
+        }
 
         // Stop the wire-response clock before output re-tokenization and log shaping.
         let response_complete_ms = post_timestamp.map(|_| elapsed_ms(send_instant));
@@ -313,11 +318,9 @@ impl GenerationClient {
                     buffer.extend_from_slice(&chunk);
                     while let Some(idx) = buffer.iter().position(|&b| b == b'\n') {
                         let line_bytes = buffer.split_to(idx + 1);
-                        let line = trim_ascii(&line_bytes);
-                        let Some(data) = line.strip_prefix(b"data: ") else {
+                        let Some(data) = sse_data_line(&line_bytes) else {
                             continue;
                         };
-                        let data = trim_ascii(data);
                         if data == b"[DONE]" {
                             done = true;
                             break;
@@ -343,14 +346,4 @@ impl GenerationClient {
             }
         }
     }
-}
-
-fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
-    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[1..];
-    }
-    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    bytes
 }

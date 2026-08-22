@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -22,13 +22,29 @@ pub(crate) struct MultimodalState {
 }
 
 impl PreparedMultimodalRequest {
-    /// Whether this request sends any media, and so depends on the dialect's
-    /// encoding being one the server actually reads.
-    pub(crate) fn carries_media(&self) -> bool {
-        self.parts
-            .iter()
-            .any(|part| matches!(part, PreparedInputPart::Media { .. }))
+    /// Prepared media this request sends. The runner uses one representative
+    /// value per modality for its preflight, so an audio-only workload is never
+    /// gated on whether its model also happens to accept images.
+    pub(crate) fn media_parts(&self) -> impl Iterator<Item = (Modality, &str)> {
+        self.parts.iter().filter_map(|part| match part {
+            PreparedInputPart::Media { modality, data_url } => Some((*modality, data_url.as_str())),
+            PreparedInputPart::System(_) | PreparedInputPart::Text(_) => None,
+        })
     }
+}
+
+pub(crate) fn representative_media(
+    requests: &[PreparedMultimodalRequest],
+) -> BTreeMap<Modality, String> {
+    let mut probes = BTreeMap::new();
+    for request in requests {
+        for (modality, data_url) in request.media_parts() {
+            probes
+                .entry(modality)
+                .or_insert_with(|| data_url.to_string());
+        }
+    }
+    probes
 }
 
 pub(crate) struct PreparedMultimodalRequest {
@@ -228,4 +244,47 @@ pub(crate) async fn run_multimodal_request(
     let _ = log_tx.send(log).await;
     state.common.stats.record_result(success);
     state.common.stats.record_unit_done();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_preflight_representatives_follow_the_workload_modalities() {
+        let source: RequestSpec = serde_json::from_value(serde_json::json!({
+            "id": "audio-only",
+            "arrival_time_ms": 0.0,
+            "inputs": [{
+                "type": "audio",
+                "synthetic": {"sample_rate_hz": 16000, "duration_ms": 100}
+            }],
+            "outputs": [{"type": "text", "max_tokens": 4}]
+        }))
+        .unwrap();
+        let requests = vec![PreparedMultimodalRequest {
+            source,
+            parts: vec![
+                PreparedInputPart::Text("transcribe".to_string()),
+                PreparedInputPart::Media {
+                    modality: Modality::Audio,
+                    data_url: "data:audio/wav;base64,UklGRg==".to_string(),
+                },
+            ],
+            output: serde_json::from_value(serde_json::json!({
+                "type": "text",
+                "max_tokens": 4
+            }))
+            .unwrap(),
+            asset_bytes: 8,
+        }];
+
+        let probes = representative_media(&requests);
+        assert_eq!(probes.len(), 1);
+        assert_eq!(
+            probes.get(&Modality::Audio).map(String::as_str),
+            Some("data:audio/wav;base64,UklGRg==")
+        );
+        assert!(!probes.contains_key(&Modality::Image));
+    }
 }

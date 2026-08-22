@@ -82,8 +82,11 @@ def _generated_bytes(arguments: argparse.Namespace) -> int:
     if arguments.modality == "audio":
         # 44-byte canonical WAV header plus 16-bit mono samples.
         return 44 + arguments.sample_rate_hz * arguments.duration_ms // 1000 * 2
-    # 28-byte ftyp box plus an 8-byte mdat header around the payload.
-    return 36 + max(arguments.width * arguments.height * 3 // 8, 1) * arguments.frames
+    # Motion JPEG MP4: 603 bytes of ISO BMFF metadata, plus fixed-size padded
+    # JPEG slots. Padding after each JPEG end marker keeps the size exact while
+    # the random pixels' compression ratio varies.
+    frame_slot = arguments.width * arguments.height * 3 * 2 + 2_048
+    return 603 + arguments.frames * frame_slot
 
 
 def _sha256(path: Path) -> str:

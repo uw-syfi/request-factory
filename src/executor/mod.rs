@@ -14,7 +14,9 @@ use crate::util::reaches_context_limit;
 
 pub(crate) use admission::drive_bounded;
 pub(crate) use independent::run_independent_request;
-pub(crate) use multimodal::{prepare_multimodal_requests, run_multimodal_request, MultimodalState};
+pub(crate) use multimodal::{
+    prepare_multimodal_requests, representative_media, run_multimodal_request, MultimodalState,
+};
 pub(crate) use session::run_session;
 
 /// The four run-level decisions a workload-unit executor actually makes.

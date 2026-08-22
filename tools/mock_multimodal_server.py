@@ -94,13 +94,20 @@ class KnobPlacementError(ValueError):
 
 
 class State:
-    def __init__(self, log_path: Path | None, chunk_delay_ms: float, dialect: str) -> None:
+    def __init__(
+        self,
+        log_path: Path | None,
+        chunk_delay_ms: float,
+        dialect: str,
+        sse_space: bool,
+    ) -> None:
         self.dialect = dialect
         self.realtime = REALTIME[dialect]
         self.encoding = ENCODING[dialect]
         self.knob_envelope = KNOB_ENVELOPE[dialect]
         self.log_path = log_path
         self.chunk_delay_s = chunk_delay_ms / 1000.0
+        self.sse_space = sse_space
         self.lock = threading.Lock()
         self.requests = 0
         self.active = 0
@@ -197,7 +204,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _stream_event(self, value: dict[str, object]) -> None:
-        self.wfile.write(f"data: {json.dumps(value)}\n\n".encode())
+        separator = " " if self.state.sse_space else ""
+        self.wfile.write(f"data:{separator}{json.dumps(value)}\n\n".encode())
         self.wfile.flush()
 
     # ---- dialect enforcement --------------------------------------------
@@ -664,18 +672,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve_video_generation(self, payload: dict[str, object]) -> None:
         self._check_knob_placement(payload)
-        frames = int(payload.get("num_frames") or 0)
+        frames = int(self._knob(payload, "num_frames") or 0)
         if frames <= 0:
             raise ValueError("video generation requires positive num_frames")
+        if self.state.dialect == "dynamo" and "image" in payload:
+            raise ValueError("Dynamo image-to-video uses input_reference, not image")
+        if "input_reference" in payload:
+            _data_url_bytes(str(payload["input_reference"]))
         self.state.begin(
             {
                 "request_id": self.headers.get("x-request-id"),
                 "surface": "videos",
                 "output_modality": "video",
                 "num_frames": frames,
-                "fps": payload.get("fps"),
+                "fps": self._knob(payload, "fps"),
                 "size": payload.get("size"),
-                "conditioned_on_image": "image" in payload,
+                "conditioned_on_image": "image" in payload or "input_reference" in payload,
                 "conditioned_on_video": "video" in payload,
                 "steps": self._knob(payload, "num_inference_steps"),
                 "system_prompts": [],
@@ -765,6 +777,11 @@ def main() -> None:
     parser.add_argument("--log-path", type=Path)
     parser.add_argument("--chunk-delay-ms", type=float, default=0.0)
     parser.add_argument(
+        "--sse-no-space",
+        action="store_true",
+        help="Emit the standards-compliant data:VALUE form without the optional space.",
+    )
+    parser.add_argument(
         "--dialect",
         default="vllm-omni",
         choices=DIALECTS,
@@ -773,7 +790,10 @@ def main() -> None:
     arguments = parser.parse_args()
     server = ThreadingHTTPServer((arguments.host, arguments.port), Handler)
     server.state = State(  # type: ignore[attr-defined]
-        arguments.log_path, arguments.chunk_delay_ms, arguments.dialect
+        arguments.log_path,
+        arguments.chunk_delay_ms,
+        arguments.dialect,
+        not arguments.sse_no_space,
     )
     if arguments.ready_file:
         arguments.ready_file.write_text(str(server.server_port))
