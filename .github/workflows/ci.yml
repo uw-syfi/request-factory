@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  required:
+    name: required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.5"
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            viz/uv.lock
+
+      - name: Set up stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Lint all Rust targets and features
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test the default Rust runtime
+        run: cargo test --locked -q
+
+      - name: Test the schema-only Rust library
+        run: cargo test --locked -q --no-default-features
+
+      - name: Install Python development dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Lint Python
+        run: uv run --frozen ruff check .
+
+      - name: Test launcher, benchmarks, and protocol integrations
+        run: uv run --frozen pytest -q
+
+      - name: Install visualization dependencies
+        working-directory: viz
+        run: uv sync --frozen --all-groups
+
+      - name: Test visualizations
+        working-directory: viz
+        run: uv run --frozen pytest -q

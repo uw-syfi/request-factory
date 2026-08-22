@@ -12,9 +12,10 @@ display and without drawing anything.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any
 
 # Latency metrics a request record carries, and which field each reads.
 #
@@ -313,7 +314,7 @@ def load_timeline(path: str | Path) -> Timeline:
     reader may return row groups in any order it likes, which is exactly why the
     writer records `seq` in the first place.
     """
-    import pyarrow.parquet as parquet
+    from pyarrow import parquet
 
     table = parquet.read_table(Path(path))
     return timeline_from_rows(table.to_pylist())
