@@ -26,41 +26,37 @@ client-visible path.
 - Save reproducible run artifacts, including the resolved configuration,
   request logs, summaries, and event timelines.
 
-## Supported benchmarks and modalities
+## Supported modalities and benchmarks
 
-| Workload | Input | Output | What it measures |
-|---|---|---|---|
-| Text trace replay | Text | Text | Independent requests or closed-loop, multi-round sessions |
-| Synthetic multimodal | Image, audio, or video + text | Text | Capacity at controlled media sizes and arrival rates |
-| [Food-101](docs/FOOD101.md) | Image + text | Text | Image-to-text serving performance |
-| [VBench T2I](docs/VBENCH.md) | Text | Image | Text-to-image serving performance |
-| [VBench I2I](docs/VBENCH.md) | Image + text | Image | Image-to-image serving performance |
-| [Seed-TTS](docs/SEED_TTS.md) | Text, optionally reference audio | Audio | Text-to-speech serving performance |
+| Input → output | Example benchmarks and workloads |
+|---|---|
+| Text → text | [TraceLab](https://github.com/uw-syfi/TraceLab) coding-agent traces; synthetic independent requests and multi-round sessions |
+| Image + text → text | [Food-101](docs/FOOD101.md); synthetic image capacity workloads |
+| Audio + text → text | Synthetic audio capacity workloads |
+| Video + text → text | Synthetic video capacity workloads |
+| Text → image | [VBench T2I](docs/VBENCH.md) |
+| Image + text → image | [VBench I2I](docs/VBENCH.md) |
+| Text → audio | [Seed-TTS](docs/SEED_TTS.md) |
+| Audio + text → audio | Seed-TTS with optional reference-audio conditioning |
 
 The included dataset adapters create reproducible load-generator inputs; they
 do not currently score model output quality.
 
 ## Server interfaces
 
-Request Factory separates the API surface from the serving-system dialect.
-`server.backend` selects an endpoint such as chat, image generation, speech, or
-realtime. `server.dialect` selects the exact request and response format used by
-the server.
+Request Factory supports:
 
-| `server.dialect` | Multimodal request format | Model parameters | Supported OpenAI-shaped surfaces |
-|---|---|---|---|
-| `openai` | OpenAI content parts | Standard fields | Chat, images, image edits, video, speech, transcription, translation, realtime |
-| `vllm` | URL-based media parts | Flat fields | Chat, speech, transcription, translation |
-| `vllm-omni` | URL-based media parts | Nested under `extra_body` | Chat, images, image edits, video, speech, realtime |
-| `sglang-omni` | Top-level `images`, `audios`, and `videos` arrays | Flat fields | Chat, speech, transcription, translation, realtime |
-| `mstar` | URL-based media parts | Flat fields | Chat, images, image edits, video, speech |
-| `dynamo` | URL-based media parts | Nested under `nvext` | Chat, images, speech |
+- OpenAI-compatible text, chat, image, video, speech, transcription,
+  translation, and realtime APIs.
+- vLLM's OpenAI-compatible and native token interfaces, including vLLM-Omni.
+- SGLang's native token interface and SGLang-Omni APIs.
+- M* and NVIDIA Dynamo multimodal APIs.
 
-Text replay also supports OpenAI-compatible completions, vLLM's native token
-endpoint, and SGLang's native token endpoint. Request Factory validates the
-selected surface and dialect before a run so incompatible combinations fail
-early. See the [configuration reference](docs/CONFIGURATION.md) for backend
-names and options.
+Multimodal servers often use different payload fields and streaming events for
+the same API surface. Request Factory provides dialect profiles for OpenAI,
+vLLM, vLLM-Omni, SGLang-Omni, M*, and Dynamo, and validates incompatible
+combinations before a run. See the
+[configuration reference](docs/CONFIGURATION.md) for details.
 
 ## Quick start
 
