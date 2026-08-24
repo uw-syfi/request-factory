@@ -88,9 +88,6 @@ are available in [`configs/`](configs/).
 - Benchmark guides: [Food-101](docs/FOOD101.md), [VBench](docs/VBENCH.md), and
   [Seed-TTS](docs/SEED_TTS.md)
 
-The project is publicly named **Request Factory**. Some compatibility-sensitive
-package, binary, and module names still use `req-frontend` or `req_frontend`.
-
 ## License
 
 [Apache License 2.0](LICENSE)
