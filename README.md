@@ -63,7 +63,9 @@ combinations before a run. See the
 - A Rust toolchain
 - A running inference server and its matching tokenizer
 
-For an OpenAI-compatible vLLM server:
+### vLLM
+
+Start an OpenAI-compatible vLLM server:
 
 ```bash
 python -m vllm.entrypoints.cli.main serve MODEL \
@@ -75,7 +77,9 @@ python -m vllm.entrypoints.cli.main serve MODEL \
 Use `server.backend: openai` and
 `server.base_url: http://127.0.0.1:8000/v1` in the run configuration.
 
-For SGLang's native token interface:
+### SGLang
+
+Start SGLang's native token interface:
 
 ```bash
 python -m sglang.launch_server \
@@ -87,6 +91,8 @@ python -m sglang.launch_server \
 
 Use `server.backend: sglang-tokens` and
 `server.base_url: http://127.0.0.1:30000` in the run configuration.
+
+### Run Request Factory
 
 Clone the repository, then copy the example run configuration:
 
