@@ -61,24 +61,13 @@ combinations before a run. See the
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/)
 - A Rust toolchain
-- A running inference server and its matching tokenizer
 
-Clone the repository:
+### 1. Start an LLM serving system
 
-```bash
-git clone https://github.com/uw-syfi/request-factory.git
-cd request-factory
-```
+Choose one of these serving options with a model that supports at least a 45K
+token context window.
 
-The examples below replay the first session from the bundled
-[TraceLab](https://github.com/uw-syfi/TraceLab) coding-agent workload. It
-preserves the session's round order, prompt and output lengths, prefix reuse,
-and tool waits. Use a model with a context window of at least 45K tokens for
-this sample.
-
-### vLLM
-
-Start an OpenAI-compatible vLLM server:
+#### Option A: vLLM
 
 ```bash
 python -m vllm.entrypoints.cli.main serve MODEL \
@@ -87,8 +76,34 @@ python -m vllm.entrypoints.cli.main serve MODEL \
   --enable-prompt-tokens-details
 ```
 
-Save this configuration as `configs/run.local.yaml`, replacing `MODEL` with the
-same model ID or local path:
+#### Option B: SGLang
+
+```bash
+python -m sglang.launch_server \
+  --model-path MODEL \
+  --host 0.0.0.0 --port 30000 \
+  --skip-tokenizer-init \
+  --stream-output
+```
+
+### 2. Run Request Factory
+
+Clone the repository:
+
+```bash
+git clone https://github.com/uw-syfi/request-factory.git
+cd request-factory
+```
+
+The quick start replays the first session from the bundled
+[TraceLab](https://github.com/uw-syfi/TraceLab) coding-agent workload,
+preserving its round order, prompt and output lengths, prefix reuse, and tool
+waits.
+
+Save the configuration matching your server as `configs/run.local.yaml` and
+replace `MODEL` with the same model ID or local path.
+
+#### vLLM configuration
 
 ```yaml
 input:
@@ -112,20 +127,7 @@ output:
   directory: ../out/vllm
 ```
 
-### SGLang
-
-Start SGLang's native token interface:
-
-```bash
-python -m sglang.launch_server \
-  --model-path MODEL \
-  --host 0.0.0.0 --port 30000 \
-  --skip-tokenizer-init \
-  --stream-output
-```
-
-Save this configuration as `configs/run.local.yaml`, replacing `MODEL` with the
-same model ID or local path:
+#### SGLang configuration
 
 ```yaml
 input:
@@ -149,9 +151,7 @@ output:
   directory: ../out/sglang
 ```
 
-### Run Request Factory
-
-After saving either configuration, validate it without contacting the server:
+Validate the configuration without contacting the server:
 
 ```bash
 uv run python -m launcher run configs/run.local.yaml --dry-run
