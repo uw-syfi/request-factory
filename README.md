@@ -63,6 +63,13 @@ combinations before a run. See the
 - A Rust toolchain
 - A running inference server and its matching tokenizer
 
+Clone the repository:
+
+```bash
+git clone https://github.com/uw-syfi/request-factory.git
+cd request-factory
+```
+
 ### vLLM
 
 Start an OpenAI-compatible vLLM server:
@@ -74,8 +81,29 @@ python -m vllm.entrypoints.cli.main serve MODEL \
   --enable-prompt-tokens-details
 ```
 
-Use `server.backend: openai` and
-`server.base_url: http://127.0.0.1:8000/v1` in the run configuration.
+Save this configuration as `configs/run.local.yaml`, replacing `MODEL` with the
+same model ID or local path:
+
+```yaml
+input:
+  trace: ../examples/session_execution_v2_example.csv
+  format: text-generation-session-execution-v2
+
+corpus:
+  text_file: ../README.md
+  tokenizer: MODEL
+
+server:
+  backend: openai
+  base_url: http://127.0.0.1:8000/v1
+  model: MODEL
+
+replay:
+  max_concurrency: 8
+
+output:
+  directory: ../out/vllm
+```
 
 ### SGLang
 
@@ -89,22 +117,33 @@ python -m sglang.launch_server \
   --stream-output
 ```
 
-Use `server.backend: sglang-tokens` and
-`server.base_url: http://127.0.0.1:30000` in the run configuration.
+Save this configuration as `configs/run.local.yaml`, replacing `MODEL` with the
+same model ID or local path:
+
+```yaml
+input:
+  trace: ../examples/session_execution_v2_example.csv
+  format: text-generation-session-execution-v2
+
+corpus:
+  text_file: ../README.md
+  tokenizer: MODEL
+
+server:
+  backend: sglang-tokens
+  base_url: http://127.0.0.1:30000
+  model: MODEL
+
+replay:
+  max_concurrency: 8
+
+output:
+  directory: ../out/sglang
+```
 
 ### Run Request Factory
 
-Clone the repository, then copy the example run configuration:
-
-```bash
-git clone https://github.com/uw-syfi/request-factory.git
-cd request-factory
-cp configs/run.example.yaml configs/run.local.yaml
-```
-
-Edit `configs/run.local.yaml` with your server URL, served model name,
-tokenizer, corpus, and output directory. Validate the configuration without
-contacting the server:
+After saving either configuration, validate it without contacting the server:
 
 ```bash
 uv run python -m launcher run configs/run.local.yaml --dry-run
