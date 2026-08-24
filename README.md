@@ -70,6 +70,12 @@ git clone https://github.com/uw-syfi/request-factory.git
 cd request-factory
 ```
 
+The examples below replay the first session from the bundled
+[TraceLab](https://github.com/uw-syfi/TraceLab) coding-agent workload. It
+preserves the session's round order, prompt and output lengths, prefix reuse,
+and tool waits. Use a model with a context window of at least 45K tokens for
+this sample.
+
 ### vLLM
 
 Start an OpenAI-compatible vLLM server:
@@ -100,6 +106,7 @@ server:
 
 replay:
   max_concurrency: 8
+  max_items: 1
 
 output:
   directory: ../out/vllm
@@ -136,6 +143,7 @@ server:
 
 replay:
   max_concurrency: 8
+  max_items: 1
 
 output:
   directory: ../out/sglang
