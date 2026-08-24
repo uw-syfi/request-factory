@@ -26,6 +26,42 @@ client-visible path.
 - Save reproducible run artifacts, including the resolved configuration,
   request logs, summaries, and event timelines.
 
+## Supported benchmarks and modalities
+
+| Workload | Input | Output | What it measures |
+|---|---|---|---|
+| Text trace replay | Text | Text | Independent requests or closed-loop, multi-round sessions |
+| Synthetic multimodal | Image, audio, or video + text | Text | Capacity at controlled media sizes and arrival rates |
+| [Food-101](docs/FOOD101.md) | Image + text | Text | Image-to-text serving performance |
+| [VBench T2I](docs/VBENCH.md) | Text | Image | Text-to-image serving performance |
+| [VBench I2I](docs/VBENCH.md) | Image + text | Image | Image-to-image serving performance |
+| [Seed-TTS](docs/SEED_TTS.md) | Text, optionally reference audio | Audio | Text-to-speech serving performance |
+
+The included dataset adapters create reproducible load-generator inputs; they
+do not currently score model output quality.
+
+## Server interfaces
+
+Request Factory separates the API surface from the serving-system dialect.
+`server.backend` selects an endpoint such as chat, image generation, speech, or
+realtime. `server.dialect` selects the exact request and response format used by
+the server.
+
+| `server.dialect` | Multimodal request format | Model parameters | Supported OpenAI-shaped surfaces |
+|---|---|---|---|
+| `openai` | OpenAI content parts | Standard fields | Chat, images, image edits, video, speech, transcription, translation, realtime |
+| `vllm` | URL-based media parts | Flat fields | Chat, speech, transcription, translation |
+| `vllm-omni` | URL-based media parts | Nested under `extra_body` | Chat, images, image edits, video, speech, realtime |
+| `sglang-omni` | Top-level `images`, `audios`, and `videos` arrays | Flat fields | Chat, speech, transcription, translation, realtime |
+| `mstar` | URL-based media parts | Flat fields | Chat, images, image edits, video, speech |
+| `dynamo` | URL-based media parts | Nested under `nvext` | Chat, images, speech |
+
+Text replay also supports OpenAI-compatible completions, vLLM's native token
+endpoint, and SGLang's native token endpoint. Request Factory validates the
+selected surface and dialect before a run so incompatible combinations fail
+early. See the [configuration reference](docs/CONFIGURATION.md) for backend
+names and options.
+
 ## Quick start
 
 ### Prerequisites
