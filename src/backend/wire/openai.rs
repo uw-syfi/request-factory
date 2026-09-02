@@ -32,6 +32,10 @@ impl Backend for OpenAiCompletionsBackend {
             // Echo the generated token ids (recent vLLM) so we carry the real output forward
             // exactly. Older servers ignore this; we fall back to re-encoding the output text.
             "return_token_ids": true,
+            // Generated ids are needed for exact session carry-forward; prompt ids are not.
+            // Keep the two controls explicit so a long prompt is never serialized into the
+            // first streaming response. vLLM ignores this SGLang extension.
+            "return_prompt_token_ids": false,
         });
         if req.stream {
             // Ask for the trailing usage chunk: server token counts and prefix-cache details
@@ -77,5 +81,26 @@ impl Backend for OpenAiCompletionsBackend {
             finish_reason,
             usage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_and_prompt_token_id_controls_are_separate() {
+        let backend = OpenAiCompletionsBackend;
+        let payload = backend.build_payload(&GenRequest {
+            model: "model",
+            request_id: "req-1",
+            prompt: Prompt::Tokens(&[11, 22, 33]),
+            max_tokens: 4,
+            temperature: 0.0,
+            stream: true,
+        });
+
+        assert_eq!(payload["return_token_ids"], true);
+        assert_eq!(payload["return_prompt_token_ids"], false);
     }
 }
