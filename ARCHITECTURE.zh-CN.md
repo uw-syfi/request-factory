@@ -395,6 +395,10 @@ session     → native independent layout 的 session-related columns
 speculative → accept_rate
 ```
 
+`accept_rate` 保留原有 scalar 写法，用于 geometric acceptance chain。同一个 CSV
+单元格也可以写成带引号的 JSON 数组，每个 draft position 对应一个条件概率；这样无需
+固定深度的多列合同，也能原样携带真实测得的非 geometric acceptance 分布。
+
 它们互不替代。特别地，priority 是 scheduling hint，不属于 SLO；SLO 的三个 metric 也逐
 request、逐 metric 独立声明。根目录 `slo.rs` 只在执行后比较 declared bounds 与 measured
 timings，并不是 schema loader 或 executor 的 owner。

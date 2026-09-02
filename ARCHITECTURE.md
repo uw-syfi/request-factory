@@ -422,6 +422,11 @@ session     → session-related columns for the native independent layout
 speculative → accept_rate
 ```
 
+`accept_rate` keeps its original scalar form for a geometric acceptance chain.
+The same CSV cell may instead contain a quoted JSON array with one conditional
+probability per draft position; this preserves measured non-geometric
+speculative acceptance without adding a fixed-depth set of columns.
+
 They do not imply one another. Priority is a scheduling hint, not an SLO, and
 the three SLO metrics are declared independently per request. Root-level
 `slo.rs` compares declared bounds with measured timings after execution; it

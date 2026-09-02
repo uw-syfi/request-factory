@@ -9,11 +9,24 @@
 /// Every supported backend is expected to stream disjoint deltas. Folding a
 /// cumulative chunk as if it were a delta would multiply the output and wreck
 /// the TPOT denominator, so the shared engine treats this as a hard failure.
-/// The first chunk is exempt because an empty accumulator prefixes anything.
-pub(super) fn restates_accumulated_output(accumulated: &[u32], incoming: &[u32]) -> bool {
+///
+/// Prefix equality alone is insufficient evidence: a legitimate multi-token
+/// delta can happen to start with the same ids already emitted. SGLang also
+/// reports a running completion count on each chunk, so a cumulative chunk is
+/// identified only when that count equals the incoming chunk length. For a
+/// disjoint delta it instead equals `accumulated.len() + incoming.len()`.
+/// vLLM token events do not carry usage and therefore cannot trip this
+/// SGLang-specific protocol guard. The first chunk remains exempt because an
+/// empty accumulator prefixes anything.
+pub(super) fn restates_accumulated_output(
+    accumulated: &[u32],
+    incoming: &[u32],
+    reported_completion_tokens: Option<usize>,
+) -> bool {
     !accumulated.is_empty()
         && incoming.len() > accumulated.len()
         && incoming.starts_with(accumulated)
+        && reported_completion_tokens == Some(incoming.len())
 }
 
 /// Verdict on generated token ids that outnumber the server's completion count.
@@ -65,16 +78,36 @@ mod tests {
     #[test]
     fn cumulative_streaming_is_detected_but_real_deltas_are_not() {
         // A cumulative chunk repeats everything delivered so far and then adds.
-        assert!(restates_accumulated_output(&[1, 2, 3], &[1, 2, 3, 4]));
+        assert!(restates_accumulated_output(
+            &[1, 2, 3],
+            &[1, 2, 3, 4],
+            Some(4)
+        ));
         // A disjoint delta does not, even when it happens to start with the
-        // same id the accumulator did.
-        assert!(!restates_accumulated_output(&[1, 2, 3], &[4, 5]));
-        assert!(!restates_accumulated_output(&[1, 2, 3], &[1, 9]));
+        // same ids the accumulator did. Its running completion count includes
+        // both the old output and the incoming delta.
+        assert!(!restates_accumulated_output(
+            &[1, 2, 3],
+            &[1, 2, 3, 4],
+            Some(7)
+        ));
+        assert!(!restates_accumulated_output(&[1, 2, 3], &[4, 5], Some(5)));
+        assert!(!restates_accumulated_output(&[1, 2, 3], &[1, 9], Some(5)));
+        // vLLM token events carry no running usage object.
+        assert!(!restates_accumulated_output(
+            &[1, 2, 3],
+            &[1, 2, 3, 4],
+            None
+        ));
         // Re-sending the identical array without growing is not the cumulative
         // pattern this guard is for, and must not be misread as one.
-        assert!(!restates_accumulated_output(&[1, 2, 3], &[1, 2, 3]));
+        assert!(!restates_accumulated_output(
+            &[1, 2, 3],
+            &[1, 2, 3],
+            Some(3)
+        ));
         // The first chunk is exempt: an empty accumulator prefixes anything.
-        assert!(!restates_accumulated_output(&[], &[1, 2, 3]));
+        assert!(!restates_accumulated_output(&[], &[1, 2, 3], Some(3)));
     }
 
     #[test]

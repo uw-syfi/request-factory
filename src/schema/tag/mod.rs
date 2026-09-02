@@ -63,4 +63,4 @@ impl TraceTag {
 pub use priority::{RequestPriority, DEFAULT_PRIORITY};
 pub use session::RequestSession;
 pub use slo::RequestSlo;
-pub use speculative::{DecodingStrategy, RequestSpeculative};
+pub use speculative::{AcceptanceProfile, DecodingStrategy, RequestSpeculative};

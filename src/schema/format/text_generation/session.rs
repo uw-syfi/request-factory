@@ -459,7 +459,10 @@ mod tests {
         let sessions = load(path.to_str().unwrap(), &input_file_schema).unwrap();
         std::fs::remove_file(path).ok();
 
-        assert_eq!(sessions[0].1[0].speculative.accept_rate, Some(0.75));
+        assert_eq!(
+            sessions[0].1[0].speculative.accept_rate,
+            Some(crate::schema::AcceptanceProfile::Uniform(0.75))
+        );
     }
 
     #[test]

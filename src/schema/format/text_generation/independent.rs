@@ -154,7 +154,10 @@ mod tests {
 
         assert_eq!(rows[0].session.session_id.as_deref(), Some("session-a"));
         assert_eq!(rows[0].session.prefix_kv, Some(8));
-        assert_eq!(rows[0].speculative.accept_rate, Some(0.75));
+        assert_eq!(
+            rows[0].speculative.accept_rate,
+            Some(crate::schema::AcceptanceProfile::Uniform(0.75))
+        );
     }
 
     #[test]

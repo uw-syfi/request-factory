@@ -110,8 +110,19 @@ impl StreamAccumulator {
         let carried_finish_reason = event.finish_reason.is_some();
 
         // Checked before the ids are folded in: appending a cumulative chunk
-        // would multiply the output and there would be no way back.
-        if restates_accumulated_output(&self.output_token_ids, &token_ids) {
+        // would multiply the output and there would be no way back. Prefix
+        // equality is not enough because vLLM can emit legitimate multi-token
+        // speculative deltas; require the running completion count carried by
+        // SGLang's per-chunk usage object as protocol evidence.
+        let reported_completion_tokens = event
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.completion_tokens);
+        if restates_accumulated_output(
+            &self.output_token_ids,
+            &token_ids,
+            reported_completion_tokens,
+        ) {
             self.fail(format!(
                 "server streamed cumulative output: a chunk repeated all {} tokens delivered so \
                  far. Launch SGLang with --stream-output (renamed --incremental-streaming-output \
@@ -208,6 +219,20 @@ mod tests {
         }
     }
 
+    fn tokens_with_completion(ids: &[u32], completion_tokens: usize) -> StreamEvent {
+        StreamEvent {
+            text_delta: None,
+            token_ids: Some(ids.to_vec()),
+            finish_reason: None,
+            usage: Some(Usage {
+                prompt_tokens: None,
+                completion_tokens: Some(completion_tokens),
+                total_tokens: None,
+                cached_prompt_tokens: None,
+            }),
+        }
+    }
+
     fn usage(
         prompt: Option<usize>,
         completion: Option<usize>,
@@ -273,10 +298,10 @@ mod tests {
     #[test]
     fn a_cumulative_chunk_breaks_the_stream_before_it_is_folded_in() {
         let mut fold = StreamAccumulator::new(8, false);
-        feed(&mut fold, tokens(&[1, 2, 3]), 10.0);
+        feed(&mut fold, tokens_with_completion(&[1, 2, 3], 3), 10.0);
 
         assert_eq!(
-            fold.absorb(tokens(&[1, 2, 3, 4]), 20.0),
+            fold.absorb(tokens_with_completion(&[1, 2, 3, 4], 4), 20.0),
             ControlFlow::Break(())
         );
         // The offending chunk is not appended: the accumulator still holds
@@ -341,13 +366,23 @@ mod tests {
     #[test]
     fn a_rejected_cumulative_chunk_is_not_an_arrival() {
         let mut fold = StreamAccumulator::new(8, true);
-        feed(&mut fold, tokens(&[1, 2, 3]), 10.0);
-        let _ = fold.absorb(tokens(&[1, 2, 3, 4]), 20.0);
+        feed(&mut fold, tokens_with_completion(&[1, 2, 3], 3), 10.0);
+        let _ = fold.absorb(tokens_with_completion(&[1, 2, 3, 4], 4), 20.0);
 
         // The chunk was refused, so it never happened as far as the record is
         // concerned -- recording it would put tokens on the timeline that the
         // output does not contain.
         assert_eq!(fold.timeline.len(), 1);
+    }
+
+    #[test]
+    fn a_vllm_multi_token_delta_that_repeats_a_prefix_is_not_cumulative() {
+        let mut fold = StreamAccumulator::new(8, false);
+        feed(&mut fold, tokens(&[7]), 10.0);
+        feed(&mut fold, tokens(&[7, 9]), 20.0);
+
+        assert_eq!(fold.output_token_ids, vec![7, 7, 9]);
+        assert!(fold.failure.is_none());
     }
 
     #[test]
