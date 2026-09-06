@@ -143,35 +143,9 @@ impl Serialize for AcceptanceProfile {
     }
 }
 
-fn deserialize_accept_rate<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<AcceptanceProfile>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<AcceptanceProfile>::deserialize(deserializer)
-}
-
-fn serialize_accept_rate<S>(
-    profile: &Option<AcceptanceProfile>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match profile {
-        None => serializer.serialize_none(),
-        Some(profile) => serializer.serialize_some(profile),
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RequestSpeculative {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_accept_rate",
-        serialize_with = "serialize_accept_rate"
-    )]
+    #[serde(default)]
     pub accept_rate: Option<AcceptanceProfile>,
 }
 
@@ -229,6 +203,36 @@ mod tests {
             row.speculative.accept_rate,
             Some(AcceptanceProfile::ByPosition(vec![0.9, 0.7, 0.5, 0.4, 0.6]))
         );
+    }
+
+    #[test]
+    fn optional_profiles_round_trip_through_csv_and_json() {
+        for profile in [
+            None,
+            Some(AcceptanceProfile::Uniform(0.75)),
+            Some(AcceptanceProfile::ByPosition(vec![0.9, 0.7, 0.5, 0.4, 0.6])),
+        ] {
+            let row = RequestSpeculative {
+                accept_rate: profile,
+            };
+            let json = serde_json::to_string(&row).unwrap();
+            assert_eq!(
+                serde_json::from_str::<RequestSpeculative>(&json).unwrap(),
+                row
+            );
+            let mut writer = csv::Writer::from_writer(Vec::new());
+            writer.serialize(&row).unwrap();
+            let bytes = writer.into_inner().unwrap();
+            let mut reader = csv::Reader::from_reader(bytes.as_slice());
+            assert_eq!(
+                reader
+                    .deserialize::<RequestSpeculative>()
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+                row
+            );
+        }
     }
 
     #[test]
