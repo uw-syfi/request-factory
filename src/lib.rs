@@ -47,6 +47,8 @@ mod tokens;
 #[cfg(feature = "runtime")]
 mod util;
 #[cfg(feature = "runtime")]
+mod warmup;
+#[cfg(feature = "runtime")]
 mod workload;
 
 #[cfg(feature = "runtime")]

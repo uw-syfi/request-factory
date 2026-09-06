@@ -97,6 +97,40 @@ pub async fn run_once(args: Args) -> Result<RunSummary> {
 /// The cache is the caller's, so a sweep decides how long it lives and nothing
 /// global outlives a run that did not ask for it.
 pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<RunSummary> {
+    validate(&args)?;
+    if args.warmup && !args.dry_run {
+        // Verify management endpoints before sending warmup requests.
+        crate::warmup::reset_after_drain(&args).await?;
+        // A saturated replay can entirely miss the single-request decode path.
+        for serial in [true, false] {
+            let mut warmup = args.clone();
+            warmup.warmup = false;
+            warmup.measurement_gate = false;
+            let phase = if serial { "warmup.serial" } else { "warmup" };
+            warmup.log_path = format!("{}.{phase}.jsonl", args.log_path);
+            warmup.summary_path = Some(format!("{}.{phase}.summary.json", args.log_path));
+            warmup.timeline_path = format!("{}.{phase}.parquet", args.log_path);
+            warmup.arrival_mode = ArrivalMode::Saturated;
+            warmup.rate = None;
+            if serial {
+                warmup.max_items = Some(1);
+                warmup.max_concurrency = Some(1);
+            }
+            eprintln!("[replay] {phase} started");
+            let summary = run_pass(warmup, corpus, true).await?;
+            if !summary.complete_for_warmup() {
+                return Err(anyhow!(
+                    "{phase} must finish successfully before measurement"
+                ));
+            }
+            crate::warmup::reset_after_drain(&args).await?;
+        }
+        eprintln!("[replay] warmup drained; prefix cache reset");
+    }
+    run_pass(args, corpus, false).await
+}
+
+async fn run_pass(args: Args, corpus: &mut CorpusCache, is_warmup: bool) -> Result<RunSummary> {
     // Per-process, and idempotent: a sweep calling this once per point costs
     // nothing, and forgetting it once would cap a large run at the default
     // descriptor limit.
@@ -116,6 +150,9 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
     // second rather than after a corpus has been tokenized.
     let objective = slo_source::resolve(&args.trace, args.slo.as_deref())?;
     let mut workload = load_workload(&args.trace, &declaration, args.max_items)?;
+    if is_warmup {
+        crate::warmup::limit_independent_decode(&mut workload);
+    }
     let unit_label = workload.unit_label();
     report_arrival_rate(&args, &mut workload, unit_label)?;
 
@@ -172,7 +209,8 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
     // rate would silently read as zero. Dry-run returns earlier and never reaches here.
     // Only workloads that actually reuse prefixes are held to this; see
     // `WorkloadSummary::depends_on_prefix_cache`.
-    if workload_summary.depends_on_prefix_cache() {
+    // A warmup already checked this same workload before the cache reset.
+    if workload_summary.depends_on_prefix_cache() && !args.warmup {
         // Probe the TAIL of the pool: workload unit 0 seeds at offset 0, so a head
         // probe would warm its first prompt and fabricate a cache hit there.
         //
@@ -212,6 +250,9 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
         (None, None)
     };
 
+    if args.measurement_gate {
+        crate::warmup::measurement_gate().await?;
+    }
     let state = Arc::new(AppState {
         policy: RunPolicy::from_args(&args),
         client,
@@ -313,6 +354,9 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
 /// Reject argument combinations that are contradictory rather than merely
 /// unusual, before anything is loaded or any request is sent.
 fn validate(args: &Args) -> Result<()> {
+    if args.warmup && args.max_items == Some(0) {
+        return Err(anyhow!("warmup requires a non-empty workload"));
+    }
     if args.max_concurrency == Some(0) {
         return Err(anyhow!("--max-concurrency must be greater than 0"));
     }

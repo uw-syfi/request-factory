@@ -10,6 +10,27 @@ none of them is the architecture's organizing axis.
 
 `runner::run_once_reusing` is the wiring root:
 
+With `--warmup`, it first replays one workload unit serially, then the complete
+selected workload using the same corpus with saturated arrivals. Independent
+requests retain every prompt shape but cap warmup output at 32 tokens; session
+outputs remain intact because they define subsequent prefixes. Measurement
+reloads the original workload with its full output lengths and arrival policy.
+The serial primer covers single-request decode, which a saturated replay can
+miss entirely. Each
+stage drains and resets the prefix cache. JSONL, summary and timeline use
+`.warmup.serial.*` and `.warmup.*` paths
+derived from `--log-path`. Every planned step must succeed with the requested
+output length. The frontend then waits for `/load` to reach zero and calls
+`/reset_prefix_cache`; failures stop the run. This currently requires the vLLM
+management endpoints and load tracking. Compiled kernels and CUDA graphs survive
+the reset. Measurement creates fresh request state and writes the ordinary paths.
+
+An optional controller gate (`--measurement-gate`) emits
+`REQ_FRONTEND_MEASUREMENT_READY_V1` on stdout after preparation and before request
+release. The controller must write `continue` to stdin. Alignment uses this boundary
+to snapshot counters and log position and start NSYS after warmup. Standalone
+runs omit the gate. Dry-run performs neither warmup nor the gate.
+
 ```text
 YAML config
   │ launcher: validate → resolve paths → build argv

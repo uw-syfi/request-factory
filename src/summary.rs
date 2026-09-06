@@ -364,6 +364,17 @@ pub struct RunMetrics {
 }
 
 impl RunSummary {
+    pub(crate) fn complete_for_warmup(&self) -> bool {
+        let common = match &self.replay {
+            ReplaySummary::Sessions { common, .. }
+            | ReplaySummary::IndependentRequests { common } => common,
+        };
+        self.workload.total_steps() > 0
+            && common.success_steps == self.workload.total_steps()
+            && common.failed_steps == 0
+            && common.output_mismatch_steps == 0
+    }
+
     pub fn metrics(&self) -> RunMetrics {
         let common = match &self.replay {
             ReplaySummary::Sessions { common, .. }

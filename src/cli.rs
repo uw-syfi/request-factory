@@ -21,6 +21,14 @@ pub enum BackendKind {
     about = "Typed trace workload runner for OpenAI-compatible inference servers"
 )]
 pub struct Args {
+    /// Warm input shapes with short independent decodes, then reset prefix cache before measurement.
+    #[arg(long)]
+    pub warmup: bool,
+
+    /// Notify a controller on stdout before measurement and await "continue" on stdin.
+    #[arg(long, hide = true)]
+    pub measurement_gate: bool,
+
     /// Source CSV interpreted by --input-file-format.
     #[arg(long)]
     pub trace: String,
