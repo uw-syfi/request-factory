@@ -441,7 +441,15 @@ slo         → ttft_slo_ms, tpot_slo_ms, e2e_slo_ms
 priority    → priority
 session     → session-related columns for the native independent layout
 speculative → accept_rate
+placement   → target_worker
 ```
+
+`target_worker` names the replica a request must run on, as an index into the
+consumer's own replica list. This crate cannot check it: it does not know the
+topology the trace will be replayed against. A blank cell is a third state —
+the trace declines to place that request and the consumer's own placement
+policy decides — so a consumer that requires a placement must refuse the blank
+rather than read it as replica 0.
 
 `accept_rate` keeps its original scalar form for a geometric acceptance chain.
 The same CSV cell may instead contain a quoted JSON array with one conditional

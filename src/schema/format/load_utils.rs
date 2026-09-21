@@ -9,7 +9,8 @@ use serde::de::DeserializeOwned;
 use std::ops::Deref;
 
 use crate::schema::{
-    InputFileSchema, RequestPriority, RequestSession, RequestSlo, RequestSpeculative, TraceTag,
+    InputFileSchema, RequestPlacement, RequestPriority, RequestSession, RequestSlo,
+    RequestSpeculative, TraceTag,
 };
 
 pub trait IndependentRow: DeserializeOwned {
@@ -23,6 +24,7 @@ pub struct ParsedIndependentRow<Row> {
     pub slo: RequestSlo,
     pub priority: RequestPriority,
     pub speculative: RequestSpeculative,
+    pub placement: RequestPlacement,
 }
 
 impl<Row> Deref for ParsedIndependentRow<Row> {
@@ -85,6 +87,13 @@ pub fn load<Row: IndependentRow>(
             &at,
         )?;
         speculative.validate(&at)?;
+        let placement: RequestPlacement = deserialize_tag(
+            &record,
+            &headers,
+            input_file_schema.carries(TraceTag::Placement),
+            &at,
+        )?;
+        placement.validate(&at)?;
 
         rows.push(ParsedIndependentRow {
             row,
@@ -92,6 +101,7 @@ pub fn load<Row: IndependentRow>(
             slo,
             priority,
             speculative,
+            placement,
         });
     }
     Ok(rows)

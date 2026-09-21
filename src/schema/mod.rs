@@ -15,6 +15,6 @@ pub use family::{
 pub use format::InputFileFormat;
 pub use input_file_schema::InputFileSchema;
 pub use tag::{
-    AcceptanceProfile, DecodingStrategy, RequestPriority, RequestSession, RequestSlo,
-    RequestSpeculative, TraceTag,
+    AcceptanceProfile, DecodingStrategy, RequestPlacement, RequestPriority, RequestSession,
+    RequestSlo, RequestSpeculative, TraceTag,
 };

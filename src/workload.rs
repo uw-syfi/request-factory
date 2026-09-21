@@ -411,6 +411,7 @@ mod tests {
             slo: Default::default(),
             priority: Default::default(),
             speculative: Default::default(),
+            placement: Default::default(),
         }
     }
 
@@ -529,6 +530,7 @@ mod tests {
             slo: Default::default(),
             priority: Default::default(),
             speculative: Default::default(),
+            placement: Default::default(),
         };
         let sessions: SessionPlans = vec![("session".to_string(), vec![step])];
 

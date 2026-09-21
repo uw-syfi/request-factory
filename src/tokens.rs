@@ -206,6 +206,7 @@ mod tests {
             slo: Default::default(),
             priority: Default::default(),
             speculative: Default::default(),
+            placement: Default::default(),
         }
     }
 

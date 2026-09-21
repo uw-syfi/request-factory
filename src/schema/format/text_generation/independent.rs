@@ -161,6 +161,48 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_placement_is_read_per_row_and_may_be_blank() {
+        // A blank cell is a third state, not worker 0: it says the trace
+        // declines to place this request, which is what lets one file mix
+        // pinned and policy-placed rows.
+        let path = write(
+            "placement",
+            "id,arrival_time,input_len,output_len,target_worker\n\
+             req-1,0,16,4,3\n\
+             req-2,10,16,4,\n",
+        );
+        let input_file_schema = InputFileSchema::new(
+            InputFileFormat::TextGenerationIndependent,
+            vec![TraceTag::Placement],
+        )
+        .unwrap();
+
+        let rows = load(path.to_str().unwrap(), &input_file_schema).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(rows[0].placement.target_worker, Some(3));
+        assert!(rows[1].placement.is_empty());
+    }
+
+    #[test]
+    fn an_undeclared_placement_column_is_refused() {
+        let path = write(
+            "placement-undeclared",
+            "id,arrival_time,input_len,output_len,target_worker\nreq-1,0,16,4,3\n",
+        );
+
+        let error = load(
+            path.to_str().unwrap(),
+            &InputFileSchema::text_generation_independent(),
+        )
+        .unwrap_err()
+        .to_string();
+        std::fs::remove_file(&path).ok();
+
+        assert!(error.contains("target_worker"), "{error}");
+    }
+
+    #[test]
     fn a_declared_column_that_is_missing_is_refused_before_any_row_is_read() {
         let path = write(
             "missing",
