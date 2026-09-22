@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use tokio::time::timeout;
 
+use base64::Engine as _;
+use std::path::PathBuf;
+
 use crate::cli::Args;
 use crate::record::{GenerationOutcome, ServerUsageLog};
 use crate::util::{elapsed_ms, ratio, unix_seconds_now};
@@ -32,6 +35,10 @@ pub(crate) struct GenerationClient {
     temperature: f64,
     stream_idle_timeout_secs: u64,
     record_timeline: bool,
+    /// Where each request's routed experts are written. `Some` turns the run
+    /// non-streaming: the routing is one array for the whole generation, so it
+    /// can only ride on a completed body.
+    routed_experts_dir: Option<PathBuf>,
     pub(super) backend: Box<dyn Backend>,
 }
 
@@ -48,6 +55,13 @@ impl GenerationClient {
             .tcp_nodelay(true)
             .timeout(Duration::from_secs(3600))
             .build()?;
+        let routed_experts_dir = args.routed_experts_dir.as_ref().map(PathBuf::from);
+        if let Some(directory) = &routed_experts_dir {
+            // Once, here, rather than per request: a run that cannot write its
+            // captures should fail before it spends a server's worth of GPU
+            // time producing them.
+            std::fs::create_dir_all(directory)?;
+        }
         Ok(Self {
             endpoint,
             client,
@@ -56,6 +70,7 @@ impl GenerationClient {
             temperature: args.temperature,
             stream_idle_timeout_secs: args.stream_idle_timeout_secs,
             record_timeline: args.timeline,
+            routed_experts_dir,
             backend,
         })
     }
@@ -71,13 +86,19 @@ impl GenerationClient {
 
         // Submit raw token ids: no client-side decode, so even million-token prompts cost nothing
         // here and the server's prefix-cache keys match the exact ids we built.
+        let capturing_routes = self.routed_experts_dir.is_some();
         let payload = self.backend.build_payload(&GenRequest {
             model: &self.model,
             request_id: &request_id,
             prompt,
             max_tokens,
             temperature: self.temperature,
-            stream: true,
+            stream: !capturing_routes,
+            // The last prompt token, not the first generated one: its forward is
+            // the step that produced token 0, so starting a row earlier is what
+            // makes every later row attributable to an accepted token.
+            routed_experts_prompt_start: capturing_routes
+                .then(|| prompt.token_len().saturating_sub(1)),
         });
 
         let post_timestamp = Some(unix_seconds_now());
@@ -85,8 +106,13 @@ impl GenerationClient {
         let send_instant = Instant::now();
 
         let mut fold = StreamAccumulator::new(max_tokens, self.record_timeline);
-        self.fold_response(&request_id, &payload, send_instant, &mut fold)
-            .await;
+        if let Some(directory) = &self.routed_experts_dir {
+            self.fold_body(&request_id, &payload, send_instant, &mut fold, directory)
+                .await;
+        } else {
+            self.fold_response(&request_id, &payload, send_instant, &mut fold)
+                .await;
+        }
 
         // Stop the wire-response clock before output re-tokenization and log shaping.
         let response_complete_ms = post_timestamp.map(|_| elapsed_ms(send_instant));
@@ -298,6 +324,72 @@ impl GenerationClient {
                     ))
                 }
             }
+        }
+    }
+
+    /// Drive one request as a single non-streaming response and persist the
+    /// routed experts it carries.
+    ///
+    /// The routing is one array covering the whole generation, so no chunk
+    /// could carry it and there is nothing to fold incrementally. The response
+    /// still goes through the same `parse_event`, which is already specified
+    /// over "a stream chunk or a full body", so the outcome this produces is
+    /// the same shape the streaming path produces -- minus the per-event times,
+    /// which do not exist here. That is the price of the capture, and the
+    /// reason it is a pass of its own.
+    async fn fold_body(
+        &self,
+        request_id: &str,
+        payload: &Value,
+        send_instant: Instant,
+        fold: &mut StreamAccumulator,
+        directory: &std::path::Path,
+    ) {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header("x-request-id", request_id)
+            .json(payload)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => return fold.fail(format!("HTTP {}", response.status())),
+            Err(err) => return fold.fail(format!("request error: {err}")),
+        };
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(err) => return fold.fail(format!("response error: {err}")),
+        };
+        let value: Value = match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(err) => return fold.fail(format!("response is not JSON: {err}")),
+        };
+        // A single body is the whole stream, so there is no continuation to
+        // break out of; the accumulator's stop signal has nothing left to stop.
+        let _ = fold.absorb(self.backend.parse_event(&value), elapsed_ms(send_instant));
+
+        let Some(encoded) = self.backend.routed_experts(&value) else {
+            // Not a warning: a capture that silently produced no routes would
+            // be discovered only as an empty corpus, a whole GPU run later.
+            return fold.fail(
+                "response carries no routed_experts; start the server with \
+                 --enable-return-routed-experts"
+                    .to_string(),
+            );
+        };
+        // Written through verbatim. The payload is already a `.npy` file, so
+        // the packer reads the server's own array rather than one this process
+        // re-encoded and could have transposed.
+        match base64::engine::general_purpose::STANDARD.decode(encoded) {
+            Ok(routes) => {
+                if let Err(err) =
+                    std::fs::write(directory.join(format!("{request_id}.npy")), routes)
+                {
+                    fold.fail(format!("writing routed experts: {err}"));
+                }
+            }
+            Err(err) => fold.fail(format!("routed_experts is not base64: {err}")),
         }
     }
 }

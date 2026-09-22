@@ -151,6 +151,18 @@ pub struct Args {
     #[arg(long, default_value = "session_runner_timeline.parquet")]
     pub timeline_path: String,
 
+    /// Capture each request's routed experts into this directory.
+    ///
+    /// Turns the run non-streaming: the server returns the whole generation's
+    /// routing as one array on the completed response body, so there is no
+    /// chunk that could carry it. That costs this run its per-event timeline,
+    /// which is why capturing routes is a pass of its own rather than something
+    /// the timing pass also does.
+    ///
+    /// Requires a server started with `--enable-return-routed-experts`.
+    #[arg(long)]
+    pub routed_experts_dir: Option<String>,
+
     /// Service-level objective for this run: `ttft_ms=500,tpot_ms=50`.
     ///
     /// Per-metric upper bounds. The summary reports the fraction of steps that

@@ -43,6 +43,7 @@ default = ["runtime"]
 # consumer takes `default-features = false`.
 runtime = [
     "dep:arrow-array",
+    "dep:base64",
     "dep:arrow-schema",
     "dep:bytes",
     "dep:clap",
@@ -69,6 +70,10 @@ serde_json = "1.0"
 # strings, which is exactly what dictionary encoding and RLE are for.
 arrow-array = { version = "55", optional = true }
 arrow-schema = { version = "55", optional = true }
+# The routed-experts capture: the server returns one `.npy` per request,
+# base64 in the JSON body. Decoding is all this is for -- the array itself is
+# written through verbatim, so nothing here has to understand its layout.
+base64 = { version = "0.22", optional = true }
 parquet = { version = "55", default-features = false, features = ["arrow", "zstd"], optional = true }
 bytes = { version = "1.5", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }

@@ -58,6 +58,11 @@ pub(crate) struct GenRequest<'a> {
     pub(crate) max_tokens: usize,
     pub(crate) temperature: f64,
     pub(crate) stream: bool,
+    /// Position the server should start recording routed experts at. `Some`
+    /// only on a routing capture, and then it is the *last prompt token*, so
+    /// row 0 of the returned array is a forward the generation extends rather
+    /// than the first generated token.
+    pub(crate) routed_experts_prompt_start: Option<usize>,
 }
 
 /// Server-reported token accounting, normalized across wire formats.
@@ -88,6 +93,12 @@ pub(crate) trait Backend: Send + Sync {
     fn build_payload(&self, req: &GenRequest) -> Value;
     /// Normalize one response JSON object (a stream chunk or a full body).
     fn parse_event(&self, value: &Value) -> StreamEvent;
+    /// The base64 `.npy` of this generation's routed experts, when the protocol
+    /// carries one. Whole-response by nature, so only a non-streaming body can
+    /// have it; a backend that cannot ask for it says so by not overriding.
+    fn routed_experts<'a>(&self, _value: &'a Value) -> Option<&'a str> {
+        None
+    }
 }
 
 /// Backend result shared by every text-generation source. Source identity stays

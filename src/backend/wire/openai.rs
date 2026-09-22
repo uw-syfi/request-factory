@@ -42,7 +42,22 @@ impl Backend for OpenAiCompletionsBackend {
             // are the whole point of this runner.
             payload["stream_options"] = serde_json::json!({"include_usage": true});
         }
+        if let Some(start) = req.routed_experts_prompt_start {
+            // The instrumented fork records from this position onward. Pointing
+            // it at the last prompt token costs one row and buys the property
+            // that every later row is a forward some generated token caused.
+            payload["routed_experts_prompt_start"] = serde_json::json!(start);
+        }
         payload
+    }
+
+    fn routed_experts<'a>(&self, value: &'a Value) -> Option<&'a str> {
+        value
+            .get("choices")?
+            .as_array()?
+            .first()?
+            .get("routed_experts")?
+            .as_str()
     }
 
     fn parse_event(&self, value: &Value) -> StreamEvent {
@@ -98,9 +113,43 @@ mod tests {
             max_tokens: 4,
             temperature: 0.0,
             stream: true,
+            routed_experts_prompt_start: None,
         });
 
         assert_eq!(payload["return_token_ids"], true);
+        assert!(payload.get("routed_experts_prompt_start").is_none());
         assert_eq!(payload["return_prompt_token_ids"], false);
+    }
+
+    #[test]
+    fn a_routed_experts_capture_asks_for_one_unstreamed_response() {
+        let backend = OpenAiCompletionsBackend;
+        let payload = backend.build_payload(&GenRequest {
+            model: "model",
+            request_id: "req-1",
+            prompt: Prompt::Tokens(&[11, 22, 33]),
+            max_tokens: 4,
+            temperature: 0.0,
+            stream: false,
+            routed_experts_prompt_start: Some(2),
+        });
+
+        // The routes ride on the final response, so the run gives up its
+        // per-event timeline for the whole body.
+        assert_eq!(payload["stream"], false);
+        assert!(payload.get("stream_options").is_none());
+        assert_eq!(payload["routed_experts_prompt_start"], 2);
+    }
+
+    #[test]
+    fn routed_experts_are_read_off_the_first_choice() {
+        let backend = OpenAiCompletionsBackend;
+        let body = serde_json::json!({"choices": [{"routed_experts": "AAEC"}]});
+
+        assert_eq!(backend.routed_experts(&body), Some("AAEC"));
+        assert_eq!(
+            backend.routed_experts(&serde_json::json!({"choices": [{"text": "hi"}]})),
+            None
+        );
     }
 }

@@ -85,6 +85,7 @@ mod tests {
             max_tokens: 4,
             temperature: 0.0,
             stream: true,
+            routed_experts_prompt_start: None,
         });
 
         assert_eq!(backend.endpoint_suffix(), "/inference/v1/generate");

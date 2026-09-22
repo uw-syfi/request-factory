@@ -57,6 +57,7 @@ impl GenerationClient {
             max_tokens: 1,
             temperature: 0.0,
             stream: true,
+            routed_experts_prompt_start: None,
         });
         let response = self
             .client

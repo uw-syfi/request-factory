@@ -118,6 +118,7 @@ mod tests {
             max_tokens: 16,
             temperature: 0.0,
             stream: true,
+            routed_experts_prompt_start: None,
         });
 
         assert_eq!(backend.endpoint_suffix(), "/generate");
