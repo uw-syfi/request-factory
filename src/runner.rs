@@ -103,19 +103,7 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
         crate::warmup::reset_after_drain(&args).await?;
         // A saturated replay can entirely miss the single-request decode path.
         for serial in [true, false] {
-            let mut warmup = args.clone();
-            warmup.warmup = false;
-            warmup.measurement_gate = false;
-            let phase = if serial { "warmup.serial" } else { "warmup" };
-            warmup.log_path = format!("{}.{phase}.jsonl", args.log_path);
-            warmup.summary_path = Some(format!("{}.{phase}.summary.json", args.log_path));
-            warmup.timeline_path = format!("{}.{phase}.parquet", args.log_path);
-            warmup.arrival_mode = ArrivalMode::Saturated;
-            warmup.rate = None;
-            if serial {
-                warmup.max_items = Some(1);
-                warmup.max_concurrency = Some(1);
-            }
+            let (phase, warmup) = warmup_args(&args, serial);
             eprintln!("[replay] {phase} started");
             let summary = run_pass(warmup, corpus, true).await?;
             if !summary.complete_for_warmup() {
@@ -128,6 +116,28 @@ pub async fn run_once_reusing(args: Args, corpus: &mut CorpusCache) -> Result<Ru
         eprintln!("[replay] warmup drained; prefix cache reset");
     }
     run_pass(args, corpus, false).await
+}
+
+/// The arguments of one warmup phase: the measured replay's, reshaped to warm
+/// input shapes and writing nothing the measurement's consumers read.
+fn warmup_args(args: &Args, serial: bool) -> (&'static str, Args) {
+    let mut warmup = args.clone();
+    warmup.warmup = false;
+    warmup.measurement_gate = false;
+    let phase = if serial { "warmup.serial" } else { "warmup" };
+    warmup.log_path = format!("{}.{phase}.jsonl", args.log_path);
+    warmup.summary_path = Some(format!("{}.{phase}.summary.json", args.log_path));
+    warmup.timeline_path = format!("{}.{phase}.parquet", args.log_path);
+    // A warmup can truncate a request the measurement then skips, and the
+    // packer reads every file in this directory as a measured request.
+    warmup.routed_experts_dir = None;
+    warmup.arrival_mode = ArrivalMode::Saturated;
+    warmup.rate = None;
+    if serial {
+        warmup.max_items = Some(1);
+        warmup.max_concurrency = Some(1);
+    }
+    (phase, warmup)
 }
 
 async fn run_pass(args: Args, corpus: &mut CorpusCache, is_warmup: bool) -> Result<RunSummary> {
@@ -414,5 +424,37 @@ fn client_runtime_summary(sampled_global_queue_depth_peak: usize) -> ClientRunti
     ClientRuntimeSummary {
         tokio_worker_threads: tokio::runtime::Handle::current().metrics().num_workers(),
         sampled_global_queue_depth_peak,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn a_warmup_writes_no_routes_the_measurement_would_pack() {
+        let args = Args::try_parse_from([
+            "runner",
+            "--trace",
+            "trace.csv",
+            "--text-file",
+            "corpus.txt",
+            "--tokenizer",
+            "tokenizer",
+            "--model",
+            "model",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--routed-experts-dir",
+            "routes",
+        ])
+        .unwrap();
+
+        for serial in [true, false] {
+            let (phase, warmup) = warmup_args(&args, serial);
+            assert_eq!(warmup.routed_experts_dir, None, "{phase}");
+        }
+        assert_eq!(args.routed_experts_dir.as_deref(), Some("routes"));
     }
 }
