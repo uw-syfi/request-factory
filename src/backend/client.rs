@@ -36,7 +36,11 @@ pub(crate) struct GenerationClient {
 
 impl GenerationClient {
     pub(crate) fn new(args: &Args, tokenizer: Arc<Tokenizer>) -> Result<Self> {
-        let backend = build_backend(args.backend, super::dialect_for(&args.dialect)?);
+        let backend = build_backend(
+            args.backend,
+            super::dialect_for(&args.dialect)?,
+            args.omit_body_request_id,
+        );
         let endpoint = format!(
             "{}{}",
             args.base_url.trim_end_matches('/'),
@@ -60,7 +64,11 @@ impl GenerationClient {
     }
 
     pub(crate) fn new_chat(args: &Args) -> Result<Self> {
-        let backend = build_backend(BackendKind::OpenaiChat, super::dialect_for(&args.dialect)?);
+        let backend = build_backend(
+            BackendKind::OpenaiChat,
+            super::dialect_for(&args.dialect)?,
+            args.omit_body_request_id,
+        );
         let endpoint = format!(
             "{}{}",
             args.base_url.trim_end_matches('/'),

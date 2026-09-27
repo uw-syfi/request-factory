@@ -95,6 +95,12 @@ pub struct Args {
     #[arg(long, default_value_t = 0.0)]
     pub temperature: f64,
 
+    /// Leave SGLang's `rid` out of `openai` completion bodies; the request id
+    /// still travels in the `x-request-id` header. For servers that refuse
+    /// unknown body fields instead of ignoring them.
+    #[arg(long)]
+    pub omit_body_request_id: bool,
+
     /// Limit top-level workload units (sessions or independent requests).
     #[arg(long, alias = "max-sessions")]
     pub max_items: Option<usize>,

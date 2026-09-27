@@ -207,7 +207,7 @@ mod tests {
         // Observed against a real SGLang server: its OpenAI layer returns a
         // usage block with no cached-token field on any flag, so telling an
         // operator to set a vLLM flag sends them somewhere that cannot help.
-        let openai = OpenAiCompletionsBackend.prefix_cache_remedy();
+        let openai = OpenAiCompletionsBackend { send_rid: true }.prefix_cache_remedy();
         assert!(openai.contains("sglang-tokens"), "{openai}");
         assert!(
             openai.contains("--enable-prompt-tokens-details"),

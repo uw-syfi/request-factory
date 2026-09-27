@@ -18,9 +18,15 @@ pub(super) use sglang::SglangTokensBackend;
 pub(super) use vllm::VllmTokensBackend;
 
 /// Build the backend adapter selected on the command line.
-pub(crate) fn build_backend(kind: BackendKind, dialect: &'static Dialect) -> Box<dyn Backend> {
+pub(crate) fn build_backend(
+    kind: BackendKind,
+    dialect: &'static Dialect,
+    omit_body_request_id: bool,
+) -> Box<dyn Backend> {
     match kind {
-        BackendKind::Openai => Box::new(OpenAiCompletionsBackend),
+        BackendKind::Openai => Box::new(OpenAiCompletionsBackend {
+            send_rid: !omit_body_request_id,
+        }),
         BackendKind::VllmTokens => Box::new(VllmTokensBackend),
         BackendKind::SglangTokens => Box::new(SglangTokensBackend),
         BackendKind::OpenaiChat => Box::new(OpenAiChatBackend(dialect)),
