@@ -96,6 +96,12 @@ preserved in `terminal.log`; the default terminal view shows build, replay
 progress, final workload/success/throughput/latency/cache metrics, and artifact
 paths.
 
+While a run executes, `session_runner` prints a status line every 500 ms and a
+`progress | elapsed_s=.. rounds_done=a/b sessions_done=c/d output_tokens=e`
+line every 5 s and once at the end (`requests_done` for independent-request
+traces). The request log, timeline and summary are written only at exit, so a
+parent that kills the run on a deadline can read only these lines.
+
 ## 3. Startup declares the whole input file
 
 A CSV header cannot determine its own meaning. The same `input_len` can mean an
