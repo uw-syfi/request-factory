@@ -85,9 +85,10 @@ pub(crate) async fn run_session(
             outcome,
         );
         let success = log.outcome.is_success();
+        let output_tokens = log.outcome.output_len_actual;
         let _ = log_tx.send(log).await;
 
-        state.common.stats.record_result(success);
+        state.common.stats.record_result(success, output_tokens);
         if context_limit_skipped || (!success && state.common.policy.stop_session_on_error) {
             break;
         }

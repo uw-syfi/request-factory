@@ -64,8 +64,9 @@ pub(crate) async fn run_independent_request(
     let log =
         StepLog::independent_request(&request, prompt_len, arrival_release_lag_ms, result.outcome);
     let success = log.outcome.is_success();
+    let output_tokens = log.outcome.output_len_actual;
     let _ = log_tx.send(log).await;
-    state.common.stats.record_result(success);
+    state.common.stats.record_result(success, output_tokens);
     state.common.stats.record_unit_done();
 }
 
