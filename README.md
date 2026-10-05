@@ -417,6 +417,11 @@ rather than reported by whatever made it; a generator cannot mis-state them.
 Between them and `parameters`, the manifest is a complete recipe: given the same
 inputs, the flags it records regenerate the trace byte for byte.
 
+`tracegen describe` prints every generator's arguments as JSON (`name`, `flag`,
+`help`, `required`, `default`, `choices`), read from the same parser, and the
+`input_file_format` a consumer declares to read the trace, for a program that
+builds the command line itself.
+
 #### Drawing a trace instead of recording one
 
 ```yaml

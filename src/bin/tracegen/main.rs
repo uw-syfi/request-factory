@@ -27,7 +27,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde::Serialize;
 
 use generator::Registry;
@@ -35,17 +35,28 @@ use req_frontend::schema::format::text_generation::session as v2;
 use req_frontend::schema::format::text_generation::session::{
     ExecutionRow, MILLISECOND_DECIMALS, SCHEMA_NAME,
 };
+use req_frontend::schema::InputFileFormat;
 
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
     about = "Generate a canonical session-execution-v2 trace",
+    long_about = None,
     subcommand_help_heading = "Generators"
 )]
 struct Args {
     #[command(subcommand)]
-    generator: Registry,
+    command: Command,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    #[command(flatten)]
+    Generate(Registry),
+    /// Print every generator's arguments as JSON, for a program that builds
+    /// the command line instead of a person reading `--help`.
+    Describe,
 }
 
 /// Everything needed to explain, and reproduce, one canonical trace.
@@ -108,8 +119,14 @@ impl Manifest {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
-    let generator = args.generator.selected();
+    let registry = match Args::parse().command {
+        Command::Generate(registry) => registry,
+        Command::Describe => {
+            println!("{}", serde_json::to_string_pretty(&describe())?);
+            return Ok(());
+        }
+    };
+    let generator = registry.selected();
 
     let generated = generator.generate()?;
     let manifest = Manifest::derive(generator.name(), &generated.rows, generated.record);
@@ -148,6 +165,52 @@ fn main() -> Result<()> {
         plan_path.display()
     );
     Ok(())
+}
+
+/// Each generator's arguments as clap declares them: what `describe` prints.
+///
+/// Read from the parser itself, so a knob a generator adds is described the
+/// moment it can be passed, with the help text and default `--help` shows.
+fn describe() -> serde_json::Value {
+    let command = Args::command();
+    let generators: Vec<serde_json::Value> = command
+        .get_subcommands()
+        .filter(|generator| generator.get_name() != "describe")
+        .map(|generator| {
+            let arguments: Vec<serde_json::Value> = generator
+                .get_arguments()
+                .filter(|argument| argument.get_long().is_some())
+                .map(|argument| {
+                    serde_json::json!({
+                        "name": argument.get_id().as_str(),
+                        "flag": format!("--{}", argument.get_long().unwrap_or_default()),
+                        "help": argument.get_help().map(ToString::to_string),
+                        "required": argument.is_required_set(),
+                        "default": argument
+                            .get_default_values()
+                            .first()
+                            .map(|value| value.to_string_lossy().into_owned()),
+                        "choices": argument
+                            .get_possible_values()
+                            .iter()
+                            .map(|value| value.get_name().to_string())
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "name": generator.get_name(),
+                "about": generator.get_about().map(ToString::to_string),
+                "arguments": arguments,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "schema": SCHEMA_NAME,
+        // The input file format a consumer declares to read what this writes.
+        "input_file_format": InputFileFormat::TextGenerationSessionExecutionV2.name(),
+        "generators": generators,
+    })
 }
 
 fn sibling(path: &Path, name: &str) -> PathBuf {
@@ -289,6 +352,41 @@ mod tests {
         let manifest = Manifest::derive("test", &[], record.clone());
 
         assert_eq!(manifest.parameters, record);
+    }
+
+    /// A program builds a generator's command line from `describe`, so every
+    /// flag the parser takes must be listed, with its default.
+    #[test]
+    fn describe_lists_each_generators_flags_with_their_defaults() {
+        let described = describe();
+        let generators = described["generators"].as_array().unwrap();
+        let names: Vec<&str> = generators
+            .iter()
+            .map(|generator| generator["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["coding-session", "synthetic"]);
+        assert_eq!(
+            described["input_file_format"],
+            "text-generation-session-execution-v2"
+        );
+
+        let synthetic = &generators[1]["arguments"];
+        let argument = |name: &str| {
+            synthetic
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|argument| argument["name"] == name)
+                .unwrap_or_else(|| panic!("no {name}"))
+                .clone()
+        };
+        assert_eq!(argument("input_len")["flag"], "--input-len");
+        assert_eq!(argument("input_len")["default"], "lognormal:1024,0.8");
+        assert_eq!(argument("out")["required"], true);
+        assert_eq!(
+            argument("arrival_pattern")["choices"],
+            serde_json::json!(["poisson", "constant"])
+        );
     }
 
     #[test]
