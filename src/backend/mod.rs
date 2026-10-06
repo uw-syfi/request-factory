@@ -145,6 +145,22 @@ fn error_detail(body: &str) -> Option<String> {
     Some(detail.chars().take(300).collect())
 }
 
+/// Read one Server-Sent Events `data` field.
+///
+/// The space after the colon is optional in the SSE grammar. Keeping this in
+/// one helper prevents text and generated-audio streams from disagreeing about
+/// which compliant servers they can read.
+pub(crate) fn sse_data_line(mut line: &[u8]) -> Option<&[u8]> {
+    while line.first().is_some_and(u8::is_ascii_whitespace) {
+        line = &line[1..];
+    }
+    while line.last().is_some_and(u8::is_ascii_whitespace) {
+        line = &line[..line.len() - 1];
+    }
+    let value = line.strip_prefix(b"data:")?;
+    Some(value.strip_prefix(b" ").unwrap_or(value))
+}
+
 /// Shape role-aware, interleaved input parts the way one dialect expects them.
 ///
 /// Covers the whole input half of the request body, not just `messages`,
@@ -616,7 +632,7 @@ pub(crate) fn request_build_failure_result(
 
 #[cfg(test)]
 mod error_body_tests {
-    use super::error_detail;
+    use super::{error_detail, sse_data_line};
 
     #[test]
     fn an_error_envelope_is_unwrapped_to_its_message() {
@@ -645,6 +661,16 @@ mod error_body_tests {
     fn an_empty_body_adds_nothing_to_the_status() {
         assert!(error_detail("").is_none());
         assert!(error_detail("   \n ").is_none());
+    }
+
+    #[test]
+    fn sse_data_accepts_the_optional_space_after_the_colon() {
+        assert_eq!(sse_data_line(b"data:{\"x\":1}\n"), Some(&b"{\"x\":1}"[..]));
+        assert_eq!(
+            sse_data_line(b"data: {\"x\":1}\r\n"),
+            Some(&b"{\"x\":1}"[..])
+        );
+        assert_eq!(sse_data_line(b": keepalive\n"), None);
     }
 
     #[test]

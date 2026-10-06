@@ -9,8 +9,8 @@ input:
   format: multimodal-independent-v1
 
 server:
-  # Image editing and video generation are M* surfaces; ASR is served by
-  # vLLM-Omni and SGLang-Omni but not by M*. See the surface table in README.md.
+  # Image editing is an M* surface; video generation is served by M* and
+  # Dynamo. ASR is served by vLLM and SGLang-Omni but not by M*. See README.md.
   backend: openai-videos
   dialect: mstar
   base_url: http://127.0.0.1:8000/v1

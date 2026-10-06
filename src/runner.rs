@@ -15,8 +15,9 @@ use tokio::sync::mpsc;
 use crate::backend::{GenerationClient, MediaClient, RealtimeClient};
 use crate::cli::Args;
 use crate::executor::{
-    drive_bounded, prepare_multimodal_requests, run_independent_request, run_multimodal_request,
-    run_session, status_task, CommonState, MultimodalState, RunPolicy, Stats, TextGenerationState,
+    drive_bounded, prepare_multimodal_requests, representative_media, run_independent_request,
+    run_multimodal_request, run_session, status_task, CommonState, MultimodalState, RunPolicy,
+    Stats, TextGenerationState,
 };
 use crate::record::StepLog;
 use crate::release::ArrivalMode;
@@ -358,14 +359,20 @@ async fn run_multimodal(
     };
     // Media encoding is the one thing every serving system spells differently,
     // and a server that does not recognize the field answers the text alone.
-    // Verify it consumed an image before measuring a workload built on them.
-    if args.backend == crate::cli::BackendKind::OpenaiChat
-        && prepared.iter().any(|request| request.carries_media())
-    {
-        GenerationClient::new_chat(args)?
-            .preflight_media_registered()
-            .await
-            .context("media preflight failed")?;
+    // Verify every media modality in the workload using bytes the workload
+    // itself prepared. Probing an unrelated image would reject audio-only and
+    // video-only models before their actual requests ever ran.
+    if args.backend == crate::cli::BackendKind::OpenaiChat {
+        let probes = representative_media(&prepared);
+        if !probes.is_empty() {
+            let client = GenerationClient::new_chat(args)?;
+            for (modality, data_url) in probes {
+                client
+                    .preflight_media_registered(modality, &data_url)
+                    .await
+                    .with_context(|| format!("{modality:?} media preflight failed"))?;
+            }
+        }
     }
 
     let state = Arc::new(MultimodalState {

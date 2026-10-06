@@ -14,7 +14,8 @@ use crate::schema::Modality;
 /// distinguishable from the workload in the server's logs as well as ours.
 const PREFLIGHT_REQUEST_ID: &str = "req-frontend-preflight";
 
-/// A small valid PNG, used only to ask a server whether it saw an image.
+/// A small valid PNG retained as a unit-test fixture for media validity.
+#[cfg(test)]
 const PROBE_PNG_BASE64: &str = concat!(
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAB20lEQVR42tXOhzoQAACF0T9KWtqlpb0XKpXQ0NaS",
     "toZEEy1JUtqlRVvRRor2QDtFU4uW0F7aigZfeY57nuCAoVGxkqXLVTStZla7XsMmzc1bWbW36dilW0+Hfo6Dho4Y",
@@ -37,27 +38,39 @@ impl GenerationClient {
     /// `sglang-omni` encoding returned 26 prompt tokens where the same trace
     /// under `vllm` returned 37, with every request marked SUCCESS.
     ///
-    /// So: send the same text twice, once with an image, and require the
-    /// server's own prompt-token count to move. This is the media counterpart of
-    /// the prefix-cache preflight, and it fails for the same reason -- a number
-    /// the tool cannot verify is worse than no number.
-    pub(crate) async fn preflight_media_registered(&self) -> Result<()> {
-        let text = PreparedInputPart::Text("Describe this image.".to_string());
-        let image = PreparedInputPart::Media {
-            modality: Modality::Image,
-            data_url: format!("data:image/png;base64,{PROBE_PNG_BASE64}"),
+    /// So: send the same text twice, once with a representative media value
+    /// from the workload, and require the server's own prompt-token count to
+    /// move. Using the workload's modality matters: probing an image before an
+    /// audio-only model would reject a valid run for an unrelated capability.
+    pub(crate) async fn preflight_media_registered(
+        &self,
+        modality: Modality,
+        data_url: &str,
+    ) -> Result<()> {
+        let prompt = match modality {
+            Modality::Image => "Describe this image.",
+            Modality::Audio => "Describe this audio.",
+            Modality::Video => "Describe this video.",
+            Modality::Text | Modality::Tensor => {
+                return Err(anyhow!("media preflight cannot probe {modality:?}"))
+            }
+        };
+        let text = PreparedInputPart::Text(prompt.to_string());
+        let media_part = PreparedInputPart::Media {
+            modality,
+            data_url: data_url.to_string(),
         };
         let text_only = [text.clone()];
-        let with_image = [text, image];
+        let with_media = [text, media_part];
 
         let bare = self
             .post_probe(Prompt::Parts(&text_only))
             .await
             .context("media preflight: text-only probe failed")?;
         let media = self
-            .post_probe(Prompt::Parts(&with_image))
+            .post_probe(Prompt::Parts(&with_media))
             .await
-            .context("media preflight: probe carrying an image failed")?;
+            .with_context(|| format!("media preflight: probe carrying {modality:?} failed"))?;
 
         let (Some(bare), Some(media)) = (
             bare.and_then(|usage| usage.prompt_tokens),
@@ -66,7 +79,7 @@ impl GenerationClient {
             // Nothing to compare. Say so rather than implying a check ran.
             eprintln!(
                 "media preflight | server reported no prompt-token counts; cannot verify that \
-                 it consumed the media. Check server.dialect against the server's own docs."
+                 it consumed {modality:?}. Check server.dialect against the server's own docs."
             );
             return Ok(());
         };
@@ -74,8 +87,8 @@ impl GenerationClient {
             return Ok(());
         }
         Err(anyhow!(
-            "media preflight: the server's prompt-token count did not change when an image was \
-             added ({bare} without, {media} with), so it is ignoring the media this dialect \
+            "media preflight: the server's prompt-token count did not change when {modality:?} \
+             was added ({bare} without, {media} with), so it is ignoring the media this dialect \
              sends and the run would measure a text-only workload. The encoding is almost \
              certainly wrong for this server -- check --dialect."
         ))

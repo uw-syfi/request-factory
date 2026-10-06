@@ -318,7 +318,7 @@ def test_video_generation_returns_base64_and_needs_frames(mock: Mock) -> None:
     assert "num_frames" in body["error"]
 
 
-@pytest.mark.parametrize("mock", ["sglang-omni"], indirect=True)
+@pytest.mark.parametrize("mock", ["vllm"], indirect=True)
 def test_transcription_and_translation_return_text(mock: Mock) -> None:
     for path in ("/audio/transcriptions", "/audio/translations"):
         status, body = mock.post_multipart(

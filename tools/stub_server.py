@@ -30,6 +30,8 @@ class Stub:
         prefill_delay_ms: float,
         tokens_per_chunk: int,
         capacity: int,
+        protocol: str,
+        sse_space: bool,
     ) -> None:
         self.chunk_delay_s = chunk_delay_ms / 1000.0
         # Separate from the inter-chunk gap, and paid once before the first
@@ -38,6 +40,8 @@ class Stub:
         # confused the two would still agree with the server.
         self.prefill_delay_s = prefill_delay_ms / 1000.0
         self.tokens_per_chunk = tokens_per_chunk
+        self.protocol = protocol
+        self.sse_space = sse_space
         # A server with no capacity limit never saturates, so a sweep against it
         # has no knee to find. With one, the knee is arithmetic:
         #   capacity / (output_len * chunk_delay_s) requests per second.
@@ -88,8 +92,16 @@ class Stub:
 
     async def serve(self, writer: asyncio.StreamWriter, body: bytes) -> None:
         request = json.loads(body) if body else {}
-        prompt_ids = request.get("token_ids") or []
-        max_tokens = int(request.get("sampling_params", {}).get("max_tokens", 1))
+        sampling = request.get("sampling_params", {})
+        if self.protocol == "vllm":
+            prompt_ids = request.get("token_ids") or []
+            max_tokens = int(sampling.get("max_tokens", 1))
+        elif self.protocol == "sglang":
+            prompt_ids = request.get("input_ids") or []
+            max_tokens = int(sampling.get("max_new_tokens", 1))
+        else:
+            prompt_ids = request.get("prompt") or []
+            max_tokens = int(request.get("max_tokens", 1))
 
         cached = self.remember(prompt_ids)
         # The two-call probe is a capability check, not workload warmup. Once
@@ -124,7 +136,21 @@ class Stub:
                 await asyncio.sleep(self.chunk_delay_s)
             count = min(self.tokens_per_chunk, max_tokens - emitted)
             ids = list(range(emitted, emitted + count))
-            await self.send_event(writer, {"choices": [{"index": 0, "token_ids": ids}]})
+            if self.protocol == "sglang":
+                event = {
+                    "output_ids": ids,
+                    "meta_info": {
+                        "prompt_tokens": len(prompt_ids),
+                        "completion_tokens": emitted + count,
+                        "cached_tokens": cached,
+                    },
+                }
+            else:
+                choice = {"index": 0, "token_ids": ids}
+                if self.protocol == "openai":
+                    choice["text"] = "x" * count
+                event = {"choices": [choice]}
+            await self.send_event(writer, event)
             generated_ids.extend(ids)
             emitted += count
 
@@ -136,9 +162,18 @@ class Stub:
         if not reset_after_response:
             self.store(prompt_ids + generated_ids)
 
-        await self.send_event(
-            writer,
-            {
+        if self.protocol == "sglang":
+            terminal = {
+                "output_ids": [],
+                "meta_info": {
+                    "prompt_tokens": len(prompt_ids),
+                    "completion_tokens": emitted,
+                    "cached_tokens": cached,
+                    "finish_reason": {"type": "length"},
+                },
+            }
+        else:
+            terminal = {
                 "choices": [{"index": 0, "token_ids": [], "finish_reason": "length"}],
                 "usage": {
                     "prompt_tokens": len(prompt_ids),
@@ -148,8 +183,8 @@ class Stub:
                     # this server as one that reports prefix-cache hits at all.
                     "prompt_tokens_details": {"cached_tokens": cached},
                 },
-            },
-        )
+            }
+        await self.send_event(writer, terminal)
         await self.send_chunk(writer, b"data: [DONE]\n\n")
         await self.send_chunk(writer, b"")
         await writer.drain()
@@ -195,7 +230,8 @@ class Stub:
         self.seen_prefixes.update(self.prefix_hashes(token_ids))
 
     async def send_event(self, writer: asyncio.StreamWriter, payload: dict) -> None:
-        await self.send_chunk(writer, f"data: {json.dumps(payload)}\n\n".encode())
+        separator = " " if self.sse_space else ""
+        await self.send_chunk(writer, f"data:{separator}{json.dumps(payload)}\n\n".encode())
 
     async def send_chunk(self, writer: asyncio.StreamWriter, payload: bytes) -> None:
         writer.write(f"{len(payload):X}\r\n".encode() + payload + b"\r\n")
@@ -219,6 +255,17 @@ async def main() -> None:
     )
     parser.add_argument("--tokens-per-chunk", type=int, default=1)
     parser.add_argument(
+        "--protocol",
+        choices=("vllm", "sglang", "openai"),
+        default="vllm",
+        help="Request and streamed-response vocabulary to enforce.",
+    )
+    parser.add_argument(
+        "--sse-no-space",
+        action="store_true",
+        help="Emit the standards-compliant data:VALUE form without the optional space.",
+    )
+    parser.add_argument(
         "--capacity",
         type=int,
         default=0,
@@ -236,6 +283,8 @@ async def main() -> None:
         args.prefill_delay_ms,
         args.tokens_per_chunk,
         args.capacity,
+        args.protocol,
+        not args.sse_no_space,
     )
     server = await asyncio.start_server(stub.handle, args.host, args.port)
     print(f"stub listening on http://{args.host}:{args.port}", flush=True)

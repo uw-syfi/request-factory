@@ -230,13 +230,13 @@ The trace declares the *shape*; the engine generates the bytes at load time,
 alongside asset reads and before the replay clock starts. A trace describing
 50 MB of media stays a few kilobytes on disk.
 
-**Content is real, not random bytes.** Images are valid 8-bit RGB PNGs and audio
-is valid mono PCM16 WAV — correct headers, correct checksums, random pixels and
-samples. A server that decodes its inputs accepts them, which matters because
-otherwise the run measures error handling rather than inference. Video is a
-well-formed MP4 box tree with a random `mdat` payload: enough for upload-path
-and throughput measurement, **not** enough for a server that decodes frames —
-use a recorded asset for that.
+**Content is real, not random bytes.** Images are valid 8-bit RGB PNGs, audio is
+valid mono PCM16 WAV, and video is valid Motion JPEG MP4 — correct headers,
+checksums or indexes, and deterministic random pixels and samples. A server that
+decodes its inputs accepts them, which matters because otherwise the run
+measures error handling rather than inference. Fixed-size padded JPEG samples
+keep byte sizing exact; use recorded assets when codec or compression behavior
+is itself part of the measurement.
 
 **`seed` controls uniqueness.** Pin it and every request carries byte-identical
 media, and the generator hands out one shared buffer. Omit it and each request
@@ -261,8 +261,8 @@ over OpenAI-shaped paths and no two agree on how to say it:
 
 | Axis | `openai` | `vllm` / `vllm-omni` | `sglang-omni` | `mstar` | `dynamo` |
 |---|---|---|---|---|---|
-| Audio input | `input_audio{data,format}` | `audio_url{url}` | top-level `audios[]` | `audio_url{url}` | — |
-| Video input | not supported | `video_url{url}` | top-level `videos[]` | `video_url{url}` | — |
+| Audio input | `input_audio{data,format}` | `audio_url{url}` | top-level `audios[]` | `audio_url{url}` | `audio_url{url}` |
+| Video input | not supported | `video_url{url}` | top-level `videos[]` | `video_url{url}` | `video_url{url}` |
 | Audio output request | `modalities:["text","audio"]` | `["audio"]` accepted | `["text","audio"]` | `["text","audio"]` | `["text","audio"]` |
 | Streamed audio | `delta.audio.data` | chunk-level `"modality":"audio"` | `delta.audio.data` | `delta.audio.data` | `delta.audio.data` |
 | Model knobs | none accepted | nested in `extra_body` | flat | flat | nested in `nvext` |
@@ -299,10 +299,13 @@ them, and only that dialect's namespace is ever sent:
                   "vllm-omni": {"cfg_img_scale": 2.0}}}
 ```
 
-The rows below were probed against live servers, not inferred: vLLM-Omni
+The rows below were checked against live servers or the serving system's
+current protocol documentation: vLLM-Omni
 answers `/v1/images/edits` and `/v1/videos` but has no transcription route at
 all, and its `/v1/videos/sync` takes `multipart/form-data` and returns the MP4
-as the response body, where M* takes JSON and returns base64.
+as the response body, where M* takes JSON and returns base64. Dynamo serves
+`/v1/videos`, nests sampling controls in `nvext`, and calls an image-to-video
+source `input_reference`.
 
 ¹ Realtime is model-dependent on the omni stacks: a vLLM-Omni serving a
 TTS-only model answers `/v1/realtime` with 404, and an SGLang-Omni serving
@@ -319,10 +322,10 @@ surface is rejected at startup rather than discovered as a 404 mid-run:
 | `/chat/completions` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `/images/generations` | ✅ | — | ✅ | — | ✅ | ✅ |
 | `/images/edits` | ✅ | — | ✅ | — | ✅ | — |
-| `/videos` | ✅ | — | ✅ | — | ✅ | — |
+| `/videos` | ✅ | — | ✅ | — | ✅ | ✅ |
 | `/audio/speech` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `/audio/transcriptions` | ✅ | ✅ | — | ✅ | — | — |
-| `/audio/translations` | ✅ | ✅ | — | ✅ | — | — |
+| `/audio/translations` | ✅ | ✅ | — | — | — | — |
 | `/realtime` (WebSocket) | ✅ | — | ✅¹ | ✅¹ | — | — |
 
 Adding a serving system is a profile plus registry entries in
