@@ -92,7 +92,15 @@ impl ExecutionRow {
 /// prefix is this client's, not the dataset's, which matters because published
 /// sessions are often bare integers that say nothing about what they identify.
 pub fn request_id(session_id: &str, round_idx: usize) -> String {
-    format!("session_{session_id}_round_{round_idx:06}")
+    let mut id = String::new();
+    write_request_id(&mut id, session_id, round_idx);
+    id
+}
+
+/// [`request_id`] into a caller's buffer, so a check over millions of rows
+/// allocates nothing per row.
+fn write_request_id(out: &mut String, session_id: &str, round_idx: usize) {
+    let _ = write!(out, "session_{session_id}_round_{round_idx:06}");
 }
 
 /// Read a canonical file, rejecting anything that is not canonical.
@@ -223,8 +231,10 @@ pub fn validate(rows: &[ExecutionRow]) -> Result<()> {
         );
     }
 
-    let mut seen_request_ids: HashSet<&str> = HashSet::new();
+    // Request ids need no set of their own: each must equal the canonical id of
+    // its (session, round), and the checks below make every such pair unique.
     let mut finished_sessions: HashSet<&str> = HashSet::new();
+    let mut canonical_id = String::new();
     let mut current_session: Option<&str> = None;
     let mut current_arrival = f64::NEG_INFINITY;
     let mut previous_block_arrival = f64::NEG_INFINITY;
@@ -237,9 +247,6 @@ pub fn validate(rows: &[ExecutionRow]) -> Result<()> {
         }
         if row.session_id.is_empty() {
             bail!("line {line}: session_id is empty");
-        }
-        if !seen_request_ids.insert(row.request_id.as_str()) {
-            bail!("line {line}: duplicate request_id {:?}", row.request_id);
         }
         if !row.arrival_time_ms.is_finite() || row.arrival_time_ms < 0.0 {
             bail!(
@@ -320,11 +327,13 @@ pub fn validate(rows: &[ExecutionRow]) -> Result<()> {
             }
         }
 
-        if row.request_id != request_id(&row.session_id, row.round_idx) {
+        canonical_id.clear();
+        write_request_id(&mut canonical_id, &row.session_id, row.round_idx);
+        if row.request_id != canonical_id {
             bail!(
                 "line {line}: request_id {:?} does not match the canonical form {:?}",
                 row.request_id,
-                request_id(&row.session_id, row.round_idx)
+                canonical_id
             );
         }
     }
