@@ -6,7 +6,7 @@ use crate::schema::{RequestPriority, RequestSlo};
 use crate::slo::SloMeasurement;
 use crate::util::prefix_hit_rate;
 
-const STEP_LOG_SCHEMA_VERSION: u32 = 11;
+const STEP_LOG_SCHEMA_VERSION: u32 = 12;
 
 /// One JSONL record: a typed source plus measurements shared by text generation.
 ///
@@ -129,10 +129,19 @@ pub(crate) struct GenerationOutcome {
     /// usage object remain optional when that server does not expose the metric.
     pub(crate) server_usage: Option<ServerUsageLog>,
     pub(crate) finish_reason: Option<String>,
-    /// Wall-clock seconds when the request entered the client.
+    /// Wall-clock seconds when the request was handed to the HTTP client, after
+    /// its body was built and serialized; for a request that was never sent,
+    /// when the client decided to skip it.
     pub(crate) submit_timestamp: f64,
-    /// Wall-clock seconds immediately before HTTP send; absent if never sent.
+    /// Wall-clock seconds immediately before HTTP send, after the body was
+    /// serialized; absent if never sent. The same stamp as `submit_timestamp`
+    /// for a sent request, and the origin of every `*_ms` boundary below.
     pub(crate) post_timestamp: Option<f64>,
+    /// Client time spent building and serializing the request body, from the
+    /// request entering the client to the send stamp. Excluded from TTFT and
+    /// from the submit/post stamps; included in `total_duration_ms`. Absent if
+    /// never sent.
+    pub(crate) body_build_ms: Option<f64>,
     /// Wall-clock seconds when the response completed or the request was skipped.
     pub(crate) complete_timestamp: f64,
     /// Legacy TTFT measured from HTTP send to the first non-empty text event.
@@ -289,8 +298,9 @@ mod tests {
             echoed_prompt_tokens: 0,
             server_usage: None,
             finish_reason: Some("length".to_string()),
-            submit_timestamp: 1.0,
+            submit_timestamp: 1.1,
             post_timestamp: Some(1.1),
+            body_build_ms: Some(0.5),
             complete_timestamp: 1.2,
             first_token_ms: Some(10.0),
             first_token_id_ms: Some(10.0),
@@ -328,7 +338,7 @@ mod tests {
             serde_json::to_value(StepLog::session_round(&step, 12, 8, 4, 0, outcome())).unwrap();
 
         assert_eq!(value["source"]["type"], "session_round");
-        assert_eq!(value["schema_version"], 11);
+        assert_eq!(value["schema_version"], 12);
         // A trace that declared no `slo` tag leaves no trace of it in the record:
         // absent, not null, so a reader can tell "the file had no such column"
         // from "the row left it blank".

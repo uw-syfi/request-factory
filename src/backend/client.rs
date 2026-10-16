@@ -5,6 +5,7 @@
 use anyhow::Result;
 use bytes::BytesMut;
 use futures::StreamExt;
+use reqwest::header::CONTENT_TYPE;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -81,13 +82,12 @@ impl GenerationClient {
         prompt: Prompt<'_>,
         max_tokens: usize,
     ) -> GenerationResult {
-        let submit_timestamp = unix_seconds_now();
         let start = Instant::now();
 
-        // Submit raw token ids: no client-side decode, so even million-token prompts cost nothing
-        // here and the server's prefix-cache keys match the exact ids we built.
+        // Submit raw token ids: no client-side decode, so the server's prefix-cache keys match
+        // the exact ids we built.
         let capturing_routes = self.routed_experts_dir.is_some();
-        let payload = self.backend.build_payload(&GenRequest {
+        let body = self.prepare_body(&GenRequest {
             model: &self.model,
             request_id: &request_id,
             prompt,
@@ -100,17 +100,23 @@ impl GenerationClient {
             routed_experts_prompt_start: capturing_routes
                 .then(|| prompt.token_len().saturating_sub(1)),
         });
+        let body_build_ms = elapsed_ms(start);
 
-        let post_timestamp = Some(unix_seconds_now());
+        // Every clock starts here, after the body is ready for the wire. Submit
+        // and post are one stamp: nothing the client does sits between them any
+        // more, and TTFT (`send_instant`) has the same origin.
+        let sent_at = unix_seconds_now();
+        let submit_timestamp = sent_at;
+        let post_timestamp = Some(sent_at);
         // Monotonic anchor at the send instant: TTFT is measured from here.
         let send_instant = Instant::now();
 
         let mut fold = StreamAccumulator::new(max_tokens, self.record_timeline);
         if let Some(directory) = &self.routed_experts_dir {
-            self.fold_body(&request_id, &payload, send_instant, &mut fold, directory)
+            self.fold_body(&request_id, body, send_instant, &mut fold, directory)
                 .await;
         } else {
-            self.fold_response(&request_id, &payload, send_instant, &mut fold)
+            self.fold_response(&request_id, body, send_instant, &mut fold)
                 .await;
         }
 
@@ -231,6 +237,7 @@ impl GenerationClient {
                 finish_reason,
                 submit_timestamp,
                 post_timestamp,
+                body_build_ms: Some(body_build_ms),
                 complete_timestamp: unix_seconds_now(),
                 first_token_ms: first_text_ms,
                 first_token_id_ms,
@@ -252,6 +259,18 @@ impl GenerationClient {
         }
     }
 
+    /// Build this request's body and serialize it to the bytes that go on the wire.
+    ///
+    /// Done before any timestamp is taken, and just in time rather than ahead of
+    /// the request's due time: a 512k-token prompt is a ~3.5 MB body plus a JSON
+    /// tree several times that size, and a trace full of them prebuilt would hold
+    /// all of it at once. Encoding a body that size takes milliseconds of client
+    /// work, which must not land inside TTFT. The JSON tree is dropped here too,
+    /// before the stamp, for the same reason.
+    fn prepare_body(&self, request: &GenRequest) -> Vec<u8> {
+        encode_body(&self.backend.build_payload(request))
+    }
+
     /// Send one request and drive its response into `fold`.
     ///
     /// Owns the transport — connection, SSE framing, idle timeout — and nothing
@@ -261,17 +280,11 @@ impl GenerationClient {
     async fn fold_response(
         &self,
         request_id: &str,
-        payload: &Value,
+        body: Vec<u8>,
         send_instant: Instant,
         fold: &mut StreamAccumulator,
     ) {
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .header("x-request-id", request_id)
-            .json(payload)
-            .send()
-            .await;
+        let response = self.post_body(request_id, body).send().await;
 
         let response = match response {
             Ok(response) if response.status().is_success() => response,
@@ -327,6 +340,16 @@ impl GenerationClient {
         }
     }
 
+    /// The POST for one prepared body: the same request `RequestBuilder::json`
+    /// would make, minus the encoding it would do after the send stamp.
+    fn post_body(&self, request_id: &str, body: Vec<u8>) -> reqwest::RequestBuilder {
+        self.client
+            .post(&self.endpoint)
+            .header("x-request-id", request_id)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+    }
+
     /// Drive one request as a single non-streaming response and persist the
     /// routed experts it carries.
     ///
@@ -340,18 +363,12 @@ impl GenerationClient {
     async fn fold_body(
         &self,
         request_id: &str,
-        payload: &Value,
+        body: Vec<u8>,
         send_instant: Instant,
         fold: &mut StreamAccumulator,
         directory: &std::path::Path,
     ) {
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .header("x-request-id", request_id)
-            .json(payload)
-            .send()
-            .await;
+        let response = self.post_body(request_id, body).send().await;
         let response = match response {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => return fold.fail(format!("HTTP {}", response.status())),
@@ -391,5 +408,146 @@ impl GenerationClient {
             }
             Err(err) => fold.fail(format!("routed_experts is not base64: {err}")),
         }
+    }
+}
+
+/// Serialize one request body exactly as `RequestBuilder::json` would.
+fn encode_body(payload: &Value) -> Vec<u8> {
+    // A `Value` always serializes: its map keys are strings by construction,
+    // which is the only way `to_vec` on it can fail.
+    serde_json::to_vec(payload).expect("a serde_json::Value always serializes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn client(base_url: &str) -> GenerationClient {
+        let args = Args::try_parse_from([
+            "runner",
+            "--trace",
+            "trace.csv",
+            "--text-file",
+            "corpus.txt",
+            "--tokenizer",
+            "tokenizer",
+            "--model",
+            "model",
+            "--backend",
+            "vllm-tokens",
+            "--base-url",
+            base_url,
+        ])
+        .unwrap();
+        GenerationClient::new(&args, Arc::new(Tokenizer::new(WordLevel::default()))).unwrap()
+    }
+
+    fn request<'a>(prompt_ids: &'a [u32]) -> GenRequest<'a> {
+        GenRequest {
+            model: "model",
+            request_id: "r0",
+            prompt: Prompt::Tokens(prompt_ids),
+            max_tokens: 1,
+            temperature: 0.0,
+            stream: true,
+            routed_experts_prompt_start: None,
+        }
+    }
+
+    /// The prepared body must be the request `RequestBuilder::json` would have
+    /// sent: same bytes, same content type. Only where the encoding happens moved.
+    #[test]
+    fn prepared_body_is_the_request_json_would_send() {
+        let client = client("http://127.0.0.1:9");
+        let prompt_ids: Vec<u32> = (0..1000).collect();
+        let payload = client.backend.build_payload(&request(&prompt_ids));
+
+        let via_json = client
+            .client
+            .post(&client.endpoint)
+            .json(&payload)
+            .build()
+            .unwrap();
+        let prepared = client
+            .post_body("r0", client.prepare_body(&request(&prompt_ids)))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            prepared.body().and_then(reqwest::Body::as_bytes),
+            via_json.body().and_then(reqwest::Body::as_bytes),
+        );
+        assert_eq!(
+            prepared.headers().get(CONTENT_TYPE),
+            via_json.headers().get(CONTENT_TYPE),
+        );
+        assert_eq!(prepared.headers()["x-request-id"], "r0");
+    }
+
+    /// Submit and post are one stamp taken after the body is ready, so the time
+    /// spent building it is visible as `body_build_ms` and nowhere in TTFT.
+    #[tokio::test]
+    async fn stamps_are_taken_after_the_body_is_serialized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 65536];
+                let read = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            while request.len() < header_end + length {
+                let mut chunk = [0u8; 65536];
+                let read = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let received_at = unix_seconds_now();
+            let events = "data: {\"choices\":[{\"index\":0,\"token_ids\":[7]}]}\n\n\
+                          data: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{events}",
+                events.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            (request[header_end..].to_vec(), received_at)
+        });
+
+        let client = client(&url);
+        // Large enough that encoding takes a measurable time.
+        let prompt_ids: Vec<u32> = (0..200_000).map(|i| i * 7 % 150_000).collect();
+        let entered = unix_seconds_now();
+        let result = client
+            .run_step("r0".to_string(), Prompt::Tokens(&prompt_ids), 1)
+            .await;
+        let (body, received_at) = server.await.unwrap();
+        let outcome = result.outcome;
+
+        assert_eq!(outcome.status, "SUCCESS", "{:?}", outcome.error);
+        assert_eq!(body, client.prepare_body(&request(&prompt_ids)));
+        let build_ms = outcome.body_build_ms.unwrap();
+        assert!(build_ms > 0.0);
+        assert_eq!(outcome.post_timestamp, Some(outcome.submit_timestamp));
+        // The stamp follows the build: entry plus the build time cannot be later
+        // than it (allowing for `elapsed_ms`'s 0.01 ms rounding).
+        assert!(outcome.submit_timestamp * 1e3 >= entered * 1e3 + build_ms - 0.01);
+        assert!(outcome.submit_timestamp <= received_at);
+        assert!(outcome.total_duration_ms >= build_ms + outcome.first_token_id_ms.unwrap() - 0.02);
     }
 }
