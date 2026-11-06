@@ -25,8 +25,9 @@ pub(crate) async fn run_session(
 ) {
     wait_for_session_arrival(&state, &steps).await;
     // Bound to this scope on purpose: the session owns its slot for every round
-    // and every tool wait below, and gives it up only when the whole
-    // conversation ends. That is the contract VibeSim's session ledger mirrors.
+    // and every tool wait between rounds, and gives it up when its last round
+    // completes (no tool wait after the last round). That is the contract
+    // VibeSim's session ledger mirrors (`CapacityLimit::on_completion`).
     let _concurrency_permit = state.acquire_capacity_slot(session_ordinal).await;
 
     let token_provider = match TokenProvider::new(
@@ -42,7 +43,8 @@ pub(crate) async fn run_session(
     };
     let mut prompt_builder = PromptBuilder::new(token_provider);
 
-    for step in steps {
+    let last_round = steps.len().saturating_sub(1);
+    for (round, step) in steps.into_iter().enumerate() {
         let PromptBuild {
             prompt_ids,
             derived_prefix_len,
@@ -99,7 +101,9 @@ pub(crate) async fn run_session(
         // region of the next prefix matches what the server cached and stays cache-hittable.
         prompt_builder.commit_output(prompt_ids, output_ids);
 
-        if step.tool_wait_after_ms > 0.0 {
+        // A tool wait only delays the next round; after the last round there is
+        // none, so the session ends here and its slot frees at once.
+        if round < last_round && step.tool_wait_after_ms > 0.0 {
             tokio::time::sleep(Duration::from_secs_f64(step.tool_wait_after_ms / 1000.0)).await;
         }
     }

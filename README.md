@@ -846,11 +846,19 @@ this zero-fill cannot mean "the server never reports cache detail at all".
 
 ## Output contracts
 
-### Per-request JSONL — schema v11
+### Per-request JSONL — schema v12
 
 `--log-path` receives one typed record per attempted request. Session and
 independent-request source data are tagged variants rather than one sparse
 object.
+
+v12 moves `submit_timestamp` and `post_timestamp` to after the request body is
+built and serialized, and adds `outcome.body_build_ms`, the client time that
+work took. Before v12, `submit_timestamp` was taken before the body was built
+and the body was serialized after `post_timestamp`, so a 512k-token prompt
+carried about 4 ms of JSON encoding inside `first_token_id_ms` and more between
+the two stamps. The request on the wire is unchanged. See
+[Timing boundaries](#timing-boundaries).
 
 v11 replaces the single per-row completion deadline with metric-specific
 `declared_ttft_slo_ms`, `declared_tpot_slo_ms`, and `declared_e2e_slo_ms`.
@@ -885,11 +893,11 @@ described under [Request backends](#request-backends). Consumers reading
 Abbreviated session example:
 
 <details>
-<summary><b>View a schema-v11 session record</b></summary>
+<summary><b>View a schema-v12 session record</b></summary>
 
 ```json
 {
-  "schema_version": 11,
+  "schema_version": 12,
   "source": {
     "type": "session_round",
     "data": {
@@ -1318,14 +1326,31 @@ uv run pytest                      # the transforms; the plots are checked by ey
 
 ### Timing boundaries
 
+Every request is built in full before any clock starts. The client builds the
+JSON body and serializes it to bytes when the request is due, then takes one
+wall-clock stamp, used as both `submit_timestamp` and `post_timestamp`, and a
+monotonic send instant that every `*_ms` boundary below is measured from. Body
+encoding is client work that grows with the prompt (about 4 ms for 525k token
+IDs), so it is kept out of TTFT and reported on its own as `body_build_ms`.
+
+The body is serialized when the request is due, not ahead of it. Prebuilding
+would hold a whole trace's bodies at once, several megabytes each at 512k
+tokens, and a session round cannot be built before the round it follows has
+returned. The send therefore leaves `body_build_ms` after the scheduled
+arrival, as it did before; `arrival_release_lag_ms` still measures the release
+itself.
+
 | Metric | Definition |
 |---|---|
+| `submit_timestamp` | Wall-clock seconds at the send stamp, after the body is serialized. For a request that was never sent, when the client skipped it. |
+| `post_timestamp` | The same stamp as `submit_timestamp` for a sent request; absent if the request was never sent. |
+| `body_build_ms` | Request entry to the send stamp: building the JSON body and serializing it. Not part of any boundary below except `total_duration_ms`. |
 | `first_token_id_ms` | HTTP send to the first event carrying generated token IDs. |
 | `first_token_ms` | HTTP send to first non-empty text event; retained as a legacy/fallback boundary. |
 | `token_delivery_tpot_ms` | First-to-last token-ID event span divided by tokens delivered after the first event. |
 | `response_complete_ms` | HTTP send to SSE `[DONE]` or EOF, before output re-tokenization and log shaping. |
 | `terminal_tail_ms` | Response-completion time after the last token-ID event. |
-| `total_duration_ms` | Full client step from request entry through response processing and bookkeeping. |
+| `total_duration_ms` | Full client step from request entry through response processing and bookkeeping, `body_build_ms` included. |
 
 Canonical summary TTFT prefers `first_token_id_ms` and falls back to
 `first_token_ms` only when token IDs are unavailable. The summary exposes

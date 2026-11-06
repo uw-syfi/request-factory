@@ -130,6 +130,7 @@ pub(crate) fn context_limit_skip_result(
             finish_reason: None,
             submit_timestamp: unix_seconds_now(),
             post_timestamp: None,
+            body_build_ms: None,
             complete_timestamp: unix_seconds_now(),
             first_token_ms: None,
             first_token_id_ms: None,

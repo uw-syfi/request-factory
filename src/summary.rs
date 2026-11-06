@@ -574,6 +574,7 @@ mod tests {
             finish_reason: None,
             submit_timestamp,
             post_timestamp: Some(submit_timestamp),
+            body_build_ms: Some(0.0),
             complete_timestamp,
             first_token_ms,
             first_token_id_ms: first_token_ms,

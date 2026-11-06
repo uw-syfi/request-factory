@@ -375,7 +375,7 @@ GenRequest {
 SGLang native-token endpoints. `GenerationClient` owns the shared async
 lifecycle:
 
-1. build and send a payload;
+1. build the payload and serialize it to bytes, then stamp and send it;
 2. consume the response stream;
 3. normalize wire objects into `StreamEvent`;
 4. fold text, token ids, usage, finish reason, and failures;
@@ -391,7 +391,9 @@ GenerationResult {
 ```
 
 This layer observes submission, send, first text/token id, last token id, and
-response-completion clocks. TTFT, TPOT, E2E, and arrival-release lag are derived
+response-completion clocks. Submission and send are one stamp, taken after the
+body is serialized, so body encoding stays out of TTFT; it is recorded as
+`body_build_ms`. TTFT, TPOT, E2E, and arrival-release lag are derived
 from explicit clocks in the outcome; they do not organize the whole pipeline.
 
 ## 10. Results flow into logs and summary

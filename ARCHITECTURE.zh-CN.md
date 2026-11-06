@@ -330,7 +330,7 @@ GenRequest {
 `backend/wire/` 负责 OpenAI、vLLM native token endpoint 和 SGLang native token endpoint
 之间的 JSON 差异。`GenerationClient` 负责共享 async lifecycle：
 
-1. 构造并发送 payload；
+1. 构造 payload 并序列化为 bytes，然后打时间戳并发送；
 2. 持续读取 stream；
 3. 将 wire objects 标准化为 `StreamEvent`；
 4. 折叠 text、token ids、usage、finish reason 与错误；
@@ -346,6 +346,8 @@ GenerationResult {
 ```
 
 这里测量 submit、send、first text/token-id、last token-id 和 response completion 等 clock。
+submit 与 send 是同一个时间戳，在 body 序列化之后才取，因此 body 编码不计入 TTFT；
+它单独记录为 `body_build_ms`。
 TTFT、TPOT、E2E 与 arrival release lag 都从这些明确 clock 推导；它们是 outcome 的一部分，
 不是控制整个架构的中心对象。
 
