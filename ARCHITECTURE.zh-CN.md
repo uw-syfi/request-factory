@@ -393,7 +393,13 @@ slo         → ttft_slo_ms, tpot_slo_ms, e2e_slo_ms
 priority    → priority
 session     → native independent layout 的 session-related columns
 speculative → accept_rate
+placement   → target_worker
 ```
+
+`target_worker` 指定该请求必须落在哪个 replica 上，取值是消费方自己那份 replica
+列表的下标。本 crate 无法校验它：它并不知道 trace 将被重放到什么拓扑上。空单元格
+是第三种状态 —— trace 放弃为该请求指定落点，由消费方自己的 placement policy 决定
+—— 所以要求必须有落点的消费方应当拒绝空值，而不是把它读成 replica 0。
 
 `accept_rate` 保留原有 scalar 写法，用于 geometric acceptance chain。同一个 CSV
 单元格也可以写成带引号的 JSON 数组，每个 draft position 对应一个条件概率；这样无需
