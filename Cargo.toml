@@ -50,6 +50,7 @@ runtime = [
     "dep:fdlimit",
     "dep:futures",
     "dep:hf-hub",
+    "dep:openssl",
     "dep:parquet",
     "dep:reqwest",
     "dep:tokenizers",
@@ -80,6 +81,11 @@ clap = { version = "4.5", features = ["derive"], optional = true }
 fdlimit = { version = "0.3", optional = true }
 futures = { version = "0.3", optional = true }
 hf-hub = { version = "0.3", optional = true }
+# reqwest and hf-hub reach TLS through native-tls, i.e. OpenSSL. Build it from
+# source and link it statically, so a binary built on one host runs on another
+# whose system OpenSSL is older: the public site builds `tracegen` on a
+# workstation and runs it in an Ubuntu 24.04 image (OpenSSL 3.0).
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 reqwest = { version = "0.11", features = ["json", "stream"], optional = true }
 tokenizers = { version = "0.21", optional = true }
 tokio = { version = "1.36", features = ["full"], optional = true }
