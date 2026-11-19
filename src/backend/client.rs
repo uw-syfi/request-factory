@@ -113,6 +113,7 @@ impl GenerationClient {
         let mut fold = StreamAccumulator::new(max_tokens, self.record_timeline);
         self.fold_response(&request_id, payload, send_instant, &mut fold)
             .await;
+        fold.resolve_restatement();
 
         // Stop the wire-response clock before output re-tokenization and log shaping.
         let response_complete_ms = post_timestamp.map(|_| elapsed_ms(send_instant));

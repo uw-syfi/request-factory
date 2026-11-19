@@ -60,6 +60,15 @@ pub(super) struct StreamAccumulator {
     /// Set when the stream itself is unusable. `None` means nothing went wrong
     /// *during* the fold; later checks may still fail the round.
     pub(super) failure: Option<String>,
+    /// Tokens delivered before the first chunk that began with all of them.
+    ///
+    /// Such a chunk is either a cumulative restatement or a delta that happens
+    /// to repeat the output so far. The second is ordinary under speculative
+    /// decoding: a multi-token chunk after a one-token first chunk starts with
+    /// that token whenever the model emits it twice (indentation, repeated
+    /// punctuation). The chunk is folded as a delta and the verdict waits for
+    /// the server's completion count ([`Self::resolve_restatement`]).
+    restated_after: Option<usize>,
     record_timeline: bool,
 }
 
@@ -93,6 +102,7 @@ impl StreamAccumulator {
             record_timeline,
             finish_reason: None,
             failure: None,
+            restated_after: None,
         }
     }
 
@@ -109,16 +119,14 @@ impl StreamAccumulator {
         let carried_usage = event.usage.is_some();
         let carried_finish_reason = event.finish_reason.is_some();
 
-        // Checked before the ids are folded in: appending a cumulative chunk
-        // would multiply the output and there would be no way back.
-        if restates_accumulated_output(&self.output_token_ids, &token_ids) {
-            self.fail(format!(
-                "server streamed cumulative output: a chunk repeated all {} tokens delivered so \
-                 far. Launch SGLang with --stream-output (renamed --incremental-streaming-output \
-                 in newer builds) so chunks are disjoint deltas.",
-                self.output_token_ids.len(),
-            ));
-            return ControlFlow::Break(());
+        // A chunk that begins with everything delivered so far is folded as a
+        // delta and judged at the end of the stream, against the server's own
+        // completion count: a cumulative stream overshoots it, a delta stream
+        // that repeated a token matches it.
+        if self.restated_after.is_none()
+            && restates_accumulated_output(&self.output_token_ids, &token_ids)
+        {
+            self.restated_after = Some(self.output_token_ids.len());
         }
 
         if !token_ids.is_empty() {
@@ -170,6 +178,31 @@ impl StreamAccumulator {
             });
         }
         ControlFlow::Continue(())
+    }
+
+    /// Decide a chunk that began with all the tokens delivered before it.
+    ///
+    /// Called once the stream has ended. The round fails as cumulative output
+    /// unless the server reported a completion count equal to the delta-folded
+    /// id count; with no completion count there is no way to tell the two
+    /// apart, and a number the runner cannot verify is worse than none.
+    pub(super) fn resolve_restatement(&mut self) {
+        let Some(before) = self.restated_after else {
+            return;
+        };
+        if self.usage.completion_tokens == Some(self.output_token_ids.len()) {
+            return;
+        }
+        self.fail(format!(
+            "server streamed cumulative output: a chunk repeated all {before} tokens delivered \
+             before it, and the {} ids folded as deltas do not match the server's completion \
+             count ({}). Launch SGLang with --stream-output (renamed \
+             --incremental-streaming-output in newer builds) so chunks are disjoint deltas.",
+            self.output_token_ids.len(),
+            self.usage
+                .completion_tokens
+                .map_or_else(|| "not reported".to_string(), |n| n.to_string()),
+        ));
     }
 
     /// Record a transport- or protocol-level failure. The first one wins: later
@@ -273,18 +306,48 @@ mod tests {
     }
 
     #[test]
-    fn a_cumulative_chunk_breaks_the_stream_before_it_is_folded_in() {
+    fn a_cumulative_stream_fails_against_the_completion_count() {
         let mut fold = StreamAccumulator::new(8, false);
-        feed(&mut fold, tokens(&[1, 2, 3]), 10.0);
+        feed(&mut fold, tokens(&[1]), 10.0);
+        feed(&mut fold, tokens(&[1, 2]), 20.0);
+        feed(&mut fold, tokens(&[1, 2, 3]), 30.0);
+        feed(&mut fold, usage(Some(8), Some(3), None), 40.0);
+        fold.resolve_restatement();
+        let failure = fold.failure.expect("cumulative output must fail the round");
+        assert!(failure.contains("cumulative output"), "{failure}");
+        assert!(failure.contains("completion count (3)"), "{failure}");
+    }
 
-        assert_eq!(
-            fold.absorb(tokens(&[1, 2, 3, 4]), 20.0),
-            ControlFlow::Break(())
-        );
-        // The offending chunk is not appended: the accumulator still holds
-        // exactly what was legitimately delivered.
-        assert_eq!(fold.output_token_ids, vec![1, 2, 3]);
-        assert!(fold.failure.unwrap().contains("cumulative output"));
+    #[test]
+    fn a_speculative_delta_repeating_the_first_token_is_not_cumulative() {
+        // MTP: one token from the prefill step, then a verify step's accepted
+        // run that starts with the same token (the model emitted it twice).
+        let mut fold = StreamAccumulator::new(8, false);
+        feed(&mut fold, tokens(&[220]), 10.0);
+        feed(&mut fold, tokens(&[220, 220, 7, 9]), 20.0);
+        feed(&mut fold, tokens(&[11]), 30.0);
+        feed(&mut fold, usage(Some(8), Some(6), None), 40.0);
+        fold.resolve_restatement();
+        assert_eq!(fold.failure, None);
+        assert_eq!(fold.output_token_ids, vec![220, 220, 220, 7, 9, 11]);
+    }
+
+    #[test]
+    fn a_restating_chunk_without_a_completion_count_still_fails() {
+        let mut fold = StreamAccumulator::new(8, false);
+        feed(&mut fold, tokens(&[5]), 10.0);
+        feed(&mut fold, tokens(&[5, 6]), 20.0);
+        fold.resolve_restatement();
+        assert!(fold.failure.unwrap().contains("not reported"));
+    }
+
+    #[test]
+    fn a_stream_with_no_restating_chunk_needs_no_count() {
+        let mut fold = StreamAccumulator::new(8, false);
+        feed(&mut fold, tokens(&[5]), 10.0);
+        feed(&mut fold, tokens(&[6, 5]), 20.0);
+        fold.resolve_restatement();
+        assert_eq!(fold.failure, None);
     }
 
     #[test]
@@ -344,18 +407,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn a_rejected_cumulative_chunk_is_not_an_arrival() {
-        let mut fold = StreamAccumulator::new(8, true);
-        feed(&mut fold, tokens(&[1, 2, 3]), 10.0);
-        let _ = fold.absorb(tokens(&[1, 2, 3, 4]), 20.0);
-
-        // The chunk was refused, so it never happened as far as the record is
-        // concerned -- recording it would put tokens on the timeline that the
-        // output does not contain.
-        assert_eq!(fold.timeline.len(), 1);
     }
 
     #[test]
