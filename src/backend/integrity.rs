@@ -6,9 +6,10 @@
 /// Whether a streamed chunk restates the whole output so far instead of
 /// carrying only new tokens.
 ///
-/// Every supported backend is expected to stream disjoint deltas. Folding a
-/// cumulative chunk as if it were a delta would multiply the output and wreck
-/// the TPOT denominator, so the shared engine treats this as a hard failure.
+/// Every supported backend is expected to stream disjoint deltas. A chunk that
+/// begins with all the tokens delivered before it is only a suspicion: a
+/// multi-token delta (speculative decoding) can repeat them by coincidence. The
+/// stream fold decides it at the end, against the server's completion count.
 /// The first chunk is exempt because an empty accumulator prefixes anything.
 pub(super) fn restates_accumulated_output(accumulated: &[u32], incoming: &[u32]) -> bool {
     !accumulated.is_empty()
